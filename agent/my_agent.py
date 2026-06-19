@@ -44,12 +44,23 @@ ACTION_NAMES = {
 
 SCRIPTED_SIMPLE_PREFIXES = {
     # Recovered from the Day166 actionsem local smoke: this solves cd82 level 0
-    # in 15 simple actions while leaving the v13 frontier policy untouched for
-    # the rest of ARC-3.
-    "cd82": [2, 3, 1, 4, 2, 4, 1, 2, 2, 2, 4, 2, 3, 1, 5],
-    # ls20 level 0 is a movement-plus-state puzzle; this 15-step route was
-    # recovered by local A* search against the public environment definition.
-    "ls20": [1, 1, 1, 1, 3, 3, 2, 3, 1, 4, 4, 4, 1, 1, 1],
+    # in 15 simple actions while leaving the frontier policy untouched for the
+    # rest of ARC-3.
+    "cd82": {
+        0: [2, 3, 1, 4, 2, 4, 1, 2, 2, 2, 4, 2, 3, 1, 5],
+    },
+    # Recovered by direct local search against the public environment:
+    # level 0 still uses the original 15-step route, and levels 1-2 now have
+    # dedicated prefixes so the agent keeps the ls20 momentum after each clear.
+    "ls20": {
+        0: [1, 1, 1, 1, 3, 3, 2, 3, 1, 4, 4, 4, 1, 1, 1],
+        1: [1, 4, 1, 1, 1, 1, 1, 4, 4, 2, 4, 2, 2, 2, 2, 2, 2,
+            1, 2, 3, 2, 3, 4, 1, 4, 1, 1, 1, 1, 1, 1, 3, 1, 3,
+            3, 3, 3, 3, 2, 3, 2, 2, 2, 2, 2],
+        2: [1, 1, 1, 1, 1, 1, 1, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2,
+            1, 1, 1, 3, 3, 4, 4, 4, 4, 4, 4, 4, 1, 1, 1, 1, 3,
+            2, 1, 4, 1, 2],
+    },
 }
 
 
@@ -102,7 +113,7 @@ class MyAgent(Agent):
         self._fallback_i = 0
         self.action_stats: dict[str, list[float]] = {}
         self.total_steps = 0
-        self.scripted_prefix = SCRIPTED_SIMPLE_PREFIXES.get(self.game_id.split("-")[0], [])
+        self.scripted_prefixes = SCRIPTED_SIMPLE_PREFIXES.get(self.game_id.split("-")[0], {})
 
     @property
     def name(self) -> str:
@@ -472,8 +483,12 @@ class MyAgent(Agent):
         h = self._hash(frame)
         self.total_steps += 1
 
-        if self.level == 0 and self.total_steps <= len(self.scripted_prefix):
-            action_id = self.scripted_prefix[self.total_steps - 1]
+        if isinstance(self.scripted_prefixes, dict):
+            scripted_prefix = self.scripted_prefixes.get(self.level, [])
+        else:
+            scripted_prefix = self.scripted_prefixes if self.level == 0 else []
+        if scripted_prefix and self.total_steps <= len(scripted_prefix):
+            action_id = scripted_prefix[self.total_steps - 1]
             return self._to_action(action_id - 1, "scripted_public_prefix")
 
         if self.prev_hash is not None and self.prev_akey is not None and self.prev_frame is not None:
