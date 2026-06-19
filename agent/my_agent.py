@@ -75,6 +75,7 @@ class Node:
         self.edges: dict[int, str] = {}
         self.changed: dict[int, bool] = {}
         self.novel: dict[int, bool] = {}
+        self.reset_edges: set[int] = set()
         self.reopen_count = 0
 
 
@@ -107,6 +108,7 @@ class MyAgent(Agent):
         self.prev_frame: np.ndarray | None = None
         self.prev_hash: str | None = None
         self.prev_akey: int | None = None
+        self.level_start_hash: str | None = None
 
         self.pending_expected: str | None = None
         self.pending_src: str | None = None
@@ -304,6 +306,7 @@ class MyAgent(Agent):
     def _record(self, prev_frame: np.ndarray, prev_hash: str, akey: int, curr_hash: str) -> None:
         changed = curr_hash != prev_hash
         novel = changed and curr_hash not in self.visited
+        is_reset = self.level_start_hash is not None and curr_hash == self.level_start_hash and prev_hash != curr_hash
         if changed:
             self.visited.add(curr_hash)
             self.no_change_streak = 0
@@ -321,6 +324,8 @@ class MyAgent(Agent):
             node.edges[akey] = curr_hash
             node.changed[akey] = changed
             node.novel[akey] = novel
+            if is_reset:
+                node.reset_edges.add(akey)
 
     def _plan_to_frontier(self, start_hash: str, limit: int = 2500) -> deque[tuple[int, str]] | None:
         parents: dict[str, tuple[str, int] | None] = {start_hash: None}
@@ -470,6 +475,7 @@ class MyAgent(Agent):
             self.no_change_streak = 0
             self.sweeps_cleared = 0
             self.total_steps = 0
+            self.level_start_hash = None
 
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
             self.plan.clear()
@@ -487,6 +493,8 @@ class MyAgent(Agent):
         frame = self._raw(latest_frame)
         h = self._hash(frame)
         self.total_steps += 1
+        if self.level_start_hash is None:
+            self.level_start_hash = h
 
         if isinstance(self.scripted_prefixes, dict):
             scripted_prefix = self.scripted_prefixes.get(self.level, [])
@@ -531,6 +539,9 @@ class MyAgent(Agent):
                 node.reopen_count += 1
                 untried = [k for k in node.cands if k not in node.tried]
         if untried:
+            non_reset = [k for k in untried if k not in node.reset_edges]
+            if non_reset:
+                untried = non_reset
             akey = self._score_untried(frame, node, untried)
             self._set_pending(frame, h, akey)
             return self._to_action(akey, "explore_untried")
@@ -552,6 +563,9 @@ class MyAgent(Agent):
             self.no_change_streak = 0
 
         keys = node.cands or list(range(N_SIMPLE))
+        non_reset_keys = [k for k in keys if k not in node.reset_edges]
+        if non_reset_keys:
+            keys = non_reset_keys
         akey = max(keys, key=lambda k: (self._tabular_prior(frame, k), self._stable_jitter(h, k)))
         self._set_pending(frame, h, akey)
         return self._to_action(akey, "resample_exhausted")
