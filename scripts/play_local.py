@@ -29,10 +29,11 @@ import arc_agi
 from arc_agi import OperationMode
 
 
-def load_my_agent_class():
+def load_my_agent_class(agent_path: Path | None = None):
     """Import MyAgent from agent/my_agent.py via importlib."""
+    path = agent_path or (ROOT / "agent" / "my_agent.py")
     spec = importlib.util.spec_from_file_location(
-        "user_agent_module", ROOT / "agent" / "my_agent.py"
+        "user_agent_module", path
     )
     if spec is None or spec.loader is None:
         raise SystemExit("Could not load agent/my_agent.py")
@@ -55,6 +56,8 @@ def main() -> None:
                    help="List available games and exit.")
     p.add_argument("--render", default=None, choices=[None, "terminal"],
                    help="Optional terminal rendering each step.")
+    p.add_argument("--agent-path", default=None,
+                   help="Optional path to an alternate agent file for local A/B smoke.")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -85,7 +88,7 @@ def main() -> None:
         print(f"No --game specified; playing all {len(game_ids)} games "
               f"(this is what Kaggle does in competition rerun).\n")
 
-    MyAgentCls = load_my_agent_class()
+    MyAgentCls = load_my_agent_class(Path(args.agent_path) if args.agent_path else None)
     if hasattr(MyAgentCls, "MAX_ACTIONS"):
         MyAgentCls.MAX_ACTIONS = min(MyAgentCls.MAX_ACTIONS, args.max_steps)
 
@@ -111,7 +114,7 @@ def main() -> None:
         final = agent.frames[-1]
         per_game.append((game_id, final.state, final.levels_completed,
                          agent.action_counter))
-        print(f"  → state={final.state}, levels_completed={final.levels_completed}, "
+        print(f"  -> state={final.state}, levels_completed={final.levels_completed}, "
               f"actions={agent.action_counter}")
 
     sc = arc.get_scorecard()
