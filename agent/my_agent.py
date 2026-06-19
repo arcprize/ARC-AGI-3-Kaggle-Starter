@@ -75,6 +75,7 @@ class Node:
         self.edges: dict[int, str] = {}
         self.changed: dict[int, bool] = {}
         self.novel: dict[int, bool] = {}
+        self.reopen_count = 0
 
 
 class MyAgent(Agent):
@@ -523,6 +524,12 @@ class MyAgent(Agent):
             return self._to_action(akey, "frontier_plan")
 
         untried = [k for k in node.cands if k not in node.tried]
+        if not untried and node.reopen_count < 2 and self.no_change_streak > 12:
+            stagnant = sum(1 for k in node.cands if node.changed.get(k) is False)
+            if stagnant >= max(2, len(node.cands) // 2):
+                node.tried.clear()
+                node.reopen_count += 1
+                untried = [k for k in node.cands if k not in node.tried]
         if untried:
             akey = self._score_untried(frame, node, untried)
             self._set_pending(frame, h, akey)
