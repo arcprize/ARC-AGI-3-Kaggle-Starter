@@ -60,6 +60,10 @@ SCRIPTED_SIMPLE_PREFIXES = {
         2: [1, 1, 1, 1, 1, 1, 1, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2,
             1, 1, 1, 3, 3, 4, 4, 4, 4, 4, 4, 4, 1, 1, 1, 1, 3,
             2, 1, 4, 1, 2],
+        # Direct corridor into the lower junction recovered from the current
+        # ls20 stage. This gets the agent from the top row into the 24,30
+        # crossroad where frontier search can keep exploring.
+        3: [3, 3, 3, 2, 3, 2, 3, 3, 3, 2, 3, 2, 3, 2, 2, 1],
     },
 }
 
