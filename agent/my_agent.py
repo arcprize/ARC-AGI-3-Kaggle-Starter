@@ -64,6 +64,13 @@ SCRIPTED_SIMPLE_PREFIXES = {
         # ls20 stage. This gets the agent from the top row into the 24,30
         # crossroad where frontier search can keep exploring.
         3: [3, 3, 3, 2, 3, 2, 3, 3, 3, 2, 3, 2, 3, 2, 2, 1],
+        # Exact level 4 route recovered from local state search. This reaches
+        # the level-completion latch at (54, 10) with the target shape/color/
+        # rotation values, then one final ACTION1 advances the game.
+        4: [1, 3, 1, 1, 1, 1, 3, 3, 3, 3, 1, 3, 1, 2,
+            2, 2, 2, 2, 2, 4, 2, 2, 4, 1, 4, 1, 2, 4, 4, 1,
+            4, 4, 1, 1, 3, 3, 3, 4, 3, 4, 3, 4, 4, 4,
+            3, 2, 2, 4, 2, 2, 2, 2, 2, 2, 2, 1],
     },
 }
 
