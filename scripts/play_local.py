@@ -2,7 +2,7 @@
 
 This is the fast inner-loop: no Docker, no Kaggle round-trip. Uses the
 `arc-agi` PyPI package to host the game engine and the ARC-AGI-3-Agents
-framework's `Agent.main()` loop to drive it — exactly what the Kaggle
+framework's `Agent.main()` loop to drive it exactly like the Kaggle
 gateway does, just in-process.
 
 Usage:
@@ -111,7 +111,7 @@ def main() -> None:
         final = agent.frames[-1]
         per_game.append((game_id, final.state, final.levels_completed,
                          agent.action_counter))
-        print(f"  → state={final.state}, levels_completed={final.levels_completed}, "
+        print(f"  -> state={final.state}, levels_completed={final.levels_completed}, "
               f"actions={agent.action_counter}")
 
     sc = arc.get_scorecard()

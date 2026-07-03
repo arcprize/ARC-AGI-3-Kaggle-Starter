@@ -1,15 +1,10 @@
-"""Your ARC-AGI-3 agent. This is the *only* file you should normally edit.
+"""Thin ARC wrapper around the reusable Hyperon + local-LLM executive core.
 
 `scripts/build_notebook.py` splices the contents of this file into the
-Kaggle submission notebook, so your local dev loop and your Kaggle
-submission stay in lock-step:
+Kaggle submission notebook, so local verification and submission stay in
+lock-step:
 
-    [edit my_agent.py] → [make play-local] → [make submit]
-
-The default body below is a port of the Stochastic Goose / random_agent
-sample — a known-good baseline that produces a valid submission and
-proves your end-to-end pipeline works. Replace `choose_action` with your
-real strategy.
+    [edit my_agent.py] -> [make play-local] -> [make submit]
 
 Contract (enforced by the ARC-AGI-3-Agents framework):
   - Subclass `agents.agent.Agent`.
@@ -19,69 +14,98 @@ Contract (enforced by the ARC-AGI-3-Agents framework):
 """
 from __future__ import annotations
 
-import random
-import time
+import os
 from typing import Any
 
 from arcengine import FrameData, GameAction, GameState
 
-# When run inside the ARC-AGI-3-Agents framework (locally or on Kaggle)
-# the `agents` package is on sys.path, so this import resolves.
 from agents.agent import Agent
+from agi_core.adapters.arc import ArcAdapter
+from agi_core.config import RuntimeConfig
+from agi_core.executive import Executive, ExecutiveRuntime
+from agi_core.knowledge.hyperon_bridge import HyperonBridge
+from agi_core.llm.llama_cpp_backend import LlamaCppBackend
+from agi_core.memory import EpisodicMemory
+from agi_core.specialists.critic import ProposalCritic
+from agi_core.specialists.llm import LLMSpecialist
+from agi_core.specialists.reactive import ReactiveSpecialist
+from agi_core.specialists.symbolic import SymbolicSpecialist
 
 
 class MyAgent(Agent):
-    """Picks legal actions uniformly at random. Replace with your strategy."""
+    """ARC-facing wrapper around the reusable executive runtime."""
 
-    # Upper bound on actions per game; the framework also enforces global limits.
     MAX_ACTIONS = 80
+    DEBUG_DECISIONS = os.environ.get("AGI_DEBUG_DECISIONS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Seed per game_id so replays from the same game are reproducible but
-        # different games explore independently.
-        seed = int(time.time() * 1_000_000) + hash(self.game_id) % 1_000_000
-        random.seed(seed)
+        config = RuntimeConfig.from_env()
+        adapter = ArcAdapter(
+            game_action_cls=GameAction,
+            default_game_id=self.game_id,
+            deterministic_action=config.deterministic_fallback_action,
+        )
+        memory = EpisodicMemory()
+        hyperon = HyperonBridge(
+            rules_path=config.hyperon_rules_path,
+            learning_path=config.hyperon_learning_path,
+            trained_priors_db_path=config.trained_priors_db_path,
+            project_root=config.project_root,
+            enabled=config.hyperon_enabled,
+            skip_probe=config.hyperon_skip_probe,
+            probe_timeout_seconds=config.hyperon_probe_timeout_seconds,
+        )
+        llm_backend = LlamaCppBackend(config.effective_model_path())
+        executive = Executive(
+            config=config,
+            reactive=ReactiveSpecialist(),
+            symbolic=SymbolicSpecialist(),
+            llm=LLMSpecialist(),
+            critic=ProposalCritic(),
+        )
+        self.runtime = ExecutiveRuntime(
+            adapter=adapter,
+            executive=executive,
+            memory=memory,
+            hyperon=hyperon,
+            llm_backend=llm_backend,
+            config=config,
+        )
+        self.runtime.bind_game(self.game_id)
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}"
+        return f"{super().name}.executive.{self.MAX_ACTIONS}"
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        # Stop once we win. Don't stop on GAME_OVER — we want to RESET and retry.
+        # Stop once we win. Do not stop on GAME_OVER because reset is a valid recovery action.
         return latest_frame.state is GameState.WIN
 
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
-        # First call or after a death → reset the level.
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            return GameAction.RESET
+        self.runtime.bind_game(self.game_id)
+        decision = self.runtime.decide(frames, latest_frame)
+        if self.DEBUG_DECISIONS:
+            self._log_decision(decision)
+        return self.runtime.adapter.to_game_action(decision)
 
-        # ── Per-game strategy fork ───────────────────────────────────────────
-        # By default every game uses the same uniformly-random strategy in the
-        # `else` branch below. This `if` shows ONE example of giving a single
-        # game its own heuristic: on LS20 we bias the random pick so ACTION4
-        # is twice as likely as any other action. Add more `elif` branches to
-        # specialize other games.
-        #
-        # `self.game_id` is set by the framework. It may be the short id
-        # ("ls20") or include a version suffix ("ls20-9607627b"), so we
-        # compare on the prefix to be safe.
-        candidate_actions = [a for a in GameAction if a is not GameAction.RESET]
-        if self.game_id.split("-")[0] == "ls20":
-            weights = [2 if a is GameAction.ACTION4 else 1 for a in candidate_actions]
-            action = random.choices(candidate_actions, weights=weights, k=1)[0]
-        else:
-            action = random.choice(candidate_actions)
-        # ────────────────────────────────────────────────────────────────────
-
-        if action.is_complex():
-            # ACTION6 takes (x, y) coordinates on a 64×64 grid.
-            action.set_data(
-                {"x": random.randint(0, 63), "y": random.randint(0, 63)}
+    def _log_decision(self, decision) -> None:
+        top_proposals = []
+        for proposal in list(decision.proposals or [])[:3]:
+            top_proposals.append(
+                f"{proposal.action_name}:{proposal.score:.3f}/{proposal.source}"
             )
-            action.reasoning = {"why": "random complex action"}
-        else:
-            action.reasoning = f"random simple action: {action.value}"
-        return action
+        subgoal = f" subgoal={decision.subgoal}" if decision.subgoal else ""
+        reason = f" reason={decision.reason}" if decision.reason else ""
+        proposals = f" top=[{', '.join(top_proposals)}]" if top_proposals else ""
+        print(
+            f"decision action={decision.action_name} source={decision.source}"
+            f" conf={decision.confidence:.3f}{subgoal}{reason}{proposals}"
+        )

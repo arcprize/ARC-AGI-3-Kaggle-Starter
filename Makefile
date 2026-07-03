@@ -46,7 +46,7 @@ setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 	fi
 	@# Slim agents/__init__.py so we don't need langgraph/langsmith/smolagents/etc.
 	@# (Same trick the official Stochastic Goose sample uses on Kaggle.)
-	@$(VENV_PY) scripts/slim_framework.py
+	@$(VENV_PY) scripts/slim_framework_safe.py
 	@echo ""
 	@echo "Setup complete. Try:  make play-local"
 

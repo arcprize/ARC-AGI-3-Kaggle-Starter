@@ -14,9 +14,27 @@ logs.log
 
 # Generated artefacts
 notebooks/submission.ipynb
+notebooks/runtime_bundle/
 reference/
+agi_core/knowledge/rules/arc_learned.json
+training_artifacts/
+
+# Optional local AGI assets
+models/*.gguf
+third_party/hyperon/*.whl
+third_party/wheels/*.whl
+arc_agi_3_public_demo_human_testing.zip
+# Local test scratch space
+tmp_test_build_notebook_*/
+tmp_test_build_notebook/
+tmp*/
 
 # OS / editors
 .DS_Store
 .idea/
 .vscode/
+/third_party
+/.tmp
+/.pip-cache/http-v2
+/.vs
+/models

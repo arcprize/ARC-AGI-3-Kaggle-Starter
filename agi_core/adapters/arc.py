@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+from typing import Any
+
+from agi_core.training import runtime_frame_signature
+from agi_core.types import ActionDecision, Observation
+
+
+class ArcAdapter:
+    """Normalizes ARC frames and maps executive decisions to GameAction."""
+
+    def __init__(
+        self,
+        game_action_cls: Any,
+        default_game_id: str = "",
+        deterministic_action: str = "ACTION1",
+    ) -> None:
+        self._game_action_cls = game_action_cls
+        self._game_id = default_game_id
+        self._default_legal_actions = self._discover_default_actions()
+        if deterministic_action in self._default_legal_actions:
+            self._deterministic_action = deterministic_action
+        elif self._default_legal_actions:
+            self._deterministic_action = self._default_legal_actions[0]
+        else:
+            self._deterministic_action = "RESET"
+
+    def bind_game(self, game_id: str) -> None:
+        self._game_id = game_id
+
+    def observe(self, frames: list[Any], latest_frame: Any) -> Observation:
+        game_state = self._normalize_name(self._get_attr(latest_frame, "state"))
+        legal_actions = self._extract_legal_actions(latest_frame, game_state)
+        return Observation(
+            game_id=self._game_id or str(self._get_attr(latest_frame, "game_id", "")),
+            step_index=max(len(frames) - 1, 0),
+            game_state=game_state,
+            levels_completed=int(
+                self._get_attr(latest_frame, "levels_completed", "level", default=0) or 0
+            ),
+            last_action=self._normalize_name(
+                self._get_attr(latest_frame, "last_action", "action")
+            ),
+            legal_actions=legal_actions,
+            raw_frame_ref=latest_frame,
+            derived_features={
+                "frame_count": len(frames),
+                "legal_actions": list(legal_actions),
+                "frame_signature": runtime_frame_signature(latest_frame),
+            },
+        )
+
+    def legal_actions(self, observation: Observation) -> list[str]:
+        return list(observation.legal_actions)
+
+    def fallback_action_name(self, observation: Observation) -> str:
+        if observation.game_state in {"NOT_PLAYED", "GAME_OVER"}:
+            return "RESET"
+        legal_actions = [name for name in observation.legal_actions if name != "RESET"]
+        if legal_actions:
+            if self._deterministic_action in legal_actions:
+                return self._deterministic_action
+            return legal_actions[0]
+        return "RESET"
+
+    def fallback_decision(self, observation: Observation) -> ActionDecision:
+        action_name = self.fallback_action_name(observation)
+        return ActionDecision(
+            action_name=action_name,
+            source="fallback",
+            confidence=0.05,
+            reason="deterministic adapter fallback",
+            metadata=self._default_metadata_for(action_name),
+            used_fallback=True,
+        )
+
+    def to_game_action(self, decision: ActionDecision) -> Any:
+        action_name = (decision.action_name or "RESET").upper()
+        action = self._game_action_cls[action_name]
+        if hasattr(action, "is_complex") and action.is_complex():
+            metadata = decision.metadata or {}
+            x = int(metadata.get("x", 32))
+            y = int(metadata.get("y", 32))
+            if hasattr(action, "set_data"):
+                action.set_data({"x": x, "y": y})
+            if hasattr(action, "reasoning"):
+                action.reasoning = {
+                    "source": decision.source,
+                    "subgoal": decision.subgoal,
+                    "reason": decision.reason,
+                }
+        elif hasattr(action, "reasoning"):
+            action.reasoning = (
+                f"{decision.source}: {decision.reason}"
+                if decision.reason
+                else decision.source
+            )
+        return action
+
+    def _discover_default_actions(self) -> list[str]:
+        action_names: list[str] = []
+        try:
+            for action in self._game_action_cls:
+                name = self._normalize_name(action)
+                if name:
+                    action_names.append(name)
+        except TypeError:
+            pass
+        if not action_names:
+            action_names = [
+                "RESET",
+                "ACTION1",
+                "ACTION2",
+                "ACTION3",
+                "ACTION4",
+                "ACTION5",
+                "ACTION6",
+            ]
+        return [name for name in action_names if name != "RESET"]
+
+    def _default_metadata_for(self, action_name: str) -> dict[str, Any]:
+        if action_name == "ACTION6":
+            return {"x": 32, "y": 32}
+        return {}
+
+    def _extract_legal_actions(self, latest_frame: Any, game_state: str) -> list[str]:
+        explicit = self._extract_explicit_actions(latest_frame)
+        if explicit:
+            return explicit
+        if game_state in {"NOT_PLAYED", "GAME_OVER"}:
+            return ["RESET"]
+        return list(self._default_legal_actions)
+
+    def _extract_explicit_actions(self, latest_frame: Any) -> list[str]:
+        for name in ("legal_actions", "available_actions", "valid_actions", "actions"):
+            value = getattr(latest_frame, name, None)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                normalized = self._normalize_name(value)
+                return [normalized] if normalized else []
+            try:
+                actions = [self._normalize_name(item) for item in value]
+            except TypeError:
+                continue
+            actions = [item for item in actions if item]
+            if actions:
+                return actions
+        return []
+
+    def _get_attr(self, obj: Any, *names: str, default: Any = None) -> Any:
+        for name in names:
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        return default
+
+    def _normalize_name(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return str(value).upper()
+        if isinstance(value, int):
+            if value == 0:
+                return "RESET"
+            return f"ACTION{value}"
+        if hasattr(value, "name"):
+            return str(value.name).upper()
+        text = str(value).strip()
+        if not text:
+            return None
+        if "." in text:
+            text = text.split(".")[-1]
+        return text.upper()
