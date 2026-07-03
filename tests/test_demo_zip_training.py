@@ -7,9 +7,10 @@ import unittest
 import zipfile
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 import agi_core.training.demo_zip as demo_zip_module
-from agi_core.storage import load_best_prior_bucket
+from agi_core.storage import load_best_prior_bucket, load_memory_bundle
 from agi_core.training import (
     RecordingMeta,
     build_action_prior_artifact,
@@ -209,6 +210,93 @@ class DemoZipTrainingTests(unittest.TestCase):
             with closing(sqlite3.connect(output_path)) as connection:
                 metadata = dict(connection.execute("SELECT key, value FROM metadata"))
             self.assertEqual(metadata["steps_used"], "3")
+            self.assertEqual(metadata["offline_memory_records"], "3")
+            memory_bundle = load_memory_bundle(
+                output_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature=compute_frame_signature([[[1, 2], [3, 5]]]) or "",
+                subgoal=None,
+                legal_actions=["ACTION1", "ACTION2"],
+            )
+            self.assertTrue(memory_bundle["recent_records"])
+
+    def test_custom_terminal_state_names_drive_demo_zip_outcome_helpers(self) -> None:
+        step = demo_zip_module.TrainingStep(
+            game_id="ls20-9607627b",
+            recording_guid="demo",
+            step_index=1,
+            timestamp="2026-01-01T00:00:00+00:00",
+            frame=None,
+            available_actions=["ACTION1"],
+            action_id=1,
+            action_name="ACTION1",
+            action_data={},
+            levels_completed=0,
+            state="ACTIVE",
+            win_levels=2,
+            full_reset=False,
+            frame_signature="sig-a",
+        )
+        win_step = demo_zip_module.TrainingStep(
+            game_id="ls20-9607627b",
+            recording_guid="demo",
+            step_index=2,
+            timestamp="2026-01-01T00:00:01+00:00",
+            frame=None,
+            available_actions=["ACTION1"],
+            action_id=1,
+            action_name="ACTION1",
+            action_data={},
+            levels_completed=0,
+            state="DONE",
+            win_levels=2,
+            full_reset=False,
+            frame_signature="sig-b",
+        )
+        lose_step = demo_zip_module.TrainingStep(
+            game_id="ls20-9607627b",
+            recording_guid="demo",
+            step_index=3,
+            timestamp="2026-01-01T00:00:02+00:00",
+            frame=None,
+            available_actions=["RESET"],
+            action_id=0,
+            action_name="RESET",
+            action_data={},
+            levels_completed=0,
+            state="LOSE",
+            win_levels=2,
+            full_reset=False,
+            frame_signature="sig-c",
+        )
+
+        env = {
+            "AGI_RESET_STATE_NAMES": "READY,LOSE",
+            "AGI_WIN_STATE_NAME": "DONE",
+        }
+        demo_zip_module._terminal_state_config.cache_clear()
+        with patch.dict("os.environ", env, clear=False):
+            self.assertEqual(
+                demo_zip_module._infer_step_outcome(step, win_step),
+                "progress",
+            )
+            self.assertEqual(
+                demo_zip_module._infer_step_outcome(step, lose_step),
+                "failed",
+            )
+            self.assertTrue(demo_zip_module._is_meaningful_reset(lose_step))
+            self.assertEqual(
+                demo_zip_module._infer_training_subgoal(
+                    step=lose_step,
+                    next_step=win_step,
+                    future_steps=[],
+                    outcome="failed",
+                    stall_streak=0,
+                ),
+                "re-enter-level",
+            )
+        demo_zip_module._terminal_state_config.cache_clear()
 
     def test_build_action_prior_artifact_respects_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -257,6 +345,23 @@ class DemoZipTrainingTests(unittest.TestCase):
                 ["ACTION1", "ACTION2"],
             )
             self.assertEqual(serial_bucket, parallel_bucket)
+            serial_memory_bundle = load_memory_bundle(
+                serial_output_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature=compute_frame_signature([[[1, 2], [3, 5]]]) or "",
+                subgoal=None,
+                legal_actions=["ACTION1", "ACTION2"],
+            )
+            parallel_memory_bundle = load_memory_bundle(
+                parallel_output_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature=compute_frame_signature([[[1, 2], [3, 5]]]) or "",
+                subgoal=None,
+                legal_actions=["ACTION1", "ACTION2"],
+            )
+            self.assertEqual(serial_memory_bundle, parallel_memory_bundle)
 
     def test_parallel_training_merges_multiple_recordings_for_same_game(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

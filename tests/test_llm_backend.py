@@ -71,13 +71,13 @@ class FakeTransformersModel:
         path: str,
         local_files_only: bool = True,
         low_cpu_mem_usage: bool = False,
-        dtype=None,
+        torch_dtype=None,
     ):
         cls.last_from_pretrained_kwargs = {
             "path": path,
             "local_files_only": local_files_only,
             "low_cpu_mem_usage": low_cpu_mem_usage,
-            "dtype": dtype,
+            "torch_dtype": torch_dtype,
         }
         return cls()
 
@@ -119,6 +119,10 @@ class LLMBackendTests(unittest.TestCase):
             self.assertTrue(
                 FakeTransformersModel.last_from_pretrained_kwargs["low_cpu_mem_usage"]
             )
+            self.assertEqual(
+                FakeTransformersModel.last_from_pretrained_kwargs["torch_dtype"],
+                "float16",
+            )
             payload = backend.generate_json("prompt", max_tokens=32, temperature=0.1)
             self.assertIsInstance(payload, dict)
             self.assertEqual(payload["subgoal"], "advance-level")
@@ -153,6 +157,77 @@ class LLMBackendTests(unittest.TestCase):
 
             self.assertFalse(backend.available)
             self.assertEqual(backend.last_error, "CUDA device required for transformers backend")
+
+    def test_gguf_backend_requires_cuda(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.gguf"
+            model_path.write_text("stub\n", encoding="utf-8")
+
+            with patch.dict(
+                sys.modules,
+                {"llama_cpp": types.SimpleNamespace(Llama=object, supports_cuda=False)},
+                clear=False,
+            ):
+                backend = LlamaCppBackend(model_path)
+
+            self.assertFalse(backend.available)
+            self.assertEqual(backend.last_error, "CUDA device required for llama.cpp backend")
+
+    def test_gguf_backend_can_load_without_torch_when_llama_cpp_reports_cuda(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.gguf"
+            model_path.write_text("stub\n", encoding="utf-8")
+
+            class FakeLlama:
+                last_init_kwargs = None
+
+                def __init__(self, **kwargs) -> None:
+                    type(self).last_init_kwargs = dict(kwargs)
+
+            with patch.dict(
+                sys.modules,
+                {"llama_cpp": types.SimpleNamespace(Llama=FakeLlama, supports_cuda=True)},
+                clear=False,
+            ):
+                with patch("importlib.import_module") as import_module:
+                    def side_effect(name: str):
+                        if name == "llama_cpp":
+                            return sys.modules["llama_cpp"]
+                        if name == "torch":
+                            raise ImportError("torch not installed")
+                        raise ImportError(name)
+
+                    import_module.side_effect = side_effect
+                    backend = LlamaCppBackend(model_path)
+
+            self.assertTrue(backend.available)
+            self.assertEqual(FakeLlama.last_init_kwargs["n_gpu_layers"], -1)
+
+    def test_gguf_backend_enables_full_gpu_offload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.gguf"
+            model_path.write_text("stub\n", encoding="utf-8")
+
+            class FakeLlama:
+                last_init_kwargs = None
+
+                def __init__(self, **kwargs) -> None:
+                    type(self).last_init_kwargs = dict(kwargs)
+
+            llama_cpp_module = types.SimpleNamespace(Llama=FakeLlama)
+            torch_module = types.SimpleNamespace(
+                cuda=types.SimpleNamespace(is_available=lambda: True),
+            )
+
+            with patch.dict(
+                sys.modules,
+                {"llama_cpp": llama_cpp_module, "torch": torch_module},
+                clear=False,
+            ):
+                backend = LlamaCppBackend(model_path)
+
+            self.assertTrue(backend.available)
+            self.assertEqual(FakeLlama.last_init_kwargs["n_gpu_layers"], -1)
 
     def test_effective_model_path_prefers_transformers_directory_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

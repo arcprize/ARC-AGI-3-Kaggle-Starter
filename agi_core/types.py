@@ -52,8 +52,27 @@ class EpisodeRecord:
     prior_game_state: str
     levels_completed: int
     prior_frame_signature: str | None = None
+    next_game_state: str = ""
+    next_frame_signature: str | None = None
+    prior_legal_actions: list[str] = field(default_factory=list)
+    stagnation_before: int = 0
+    stagnation_after: int = 0
     decision_subgoal: str | None = None
     decision_source: str | None = None
+
+
+@dataclass(slots=True)
+class MemoryBundle:
+    recent_records: list[dict[str, Any]] = field(default_factory=list)
+    basin_status: dict[str, Any] = field(default_factory=dict)
+    basin_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    state_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    frame_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    subgoal_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    trained_prior_bucket: dict[str, int] = field(default_factory=dict)
+    recommended_actions: list[str] = field(default_factory=list)
+    suppressed_actions: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -74,6 +93,9 @@ class ExecutiveContext:
     llm_backend: Any
     config: Any
     episode_id: str
+    memory_bundle: MemoryBundle | None = None
+    llm_memory_bundle: MemoryBundle | None = None
+    contextual_memory_bundles: dict[str, MemoryBundle] = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -91,6 +113,9 @@ class EnvironmentAdapter(Protocol):
         ...
 
     def fallback_decision(self, observation: Observation) -> ActionDecision:
+        ...
+
+    def default_metadata_for_action(self, action_name: str) -> dict[str, Any]:
         ...
 
     def to_game_action(self, decision: ActionDecision) -> Any:

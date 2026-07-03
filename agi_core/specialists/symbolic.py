@@ -31,8 +31,8 @@ class SymbolicSpecialist:
             if action_name not in observation.legal_actions:
                 continue
             metadata = {}
-            if action_name == "ACTION6":
-                metadata = {"x": 32, "y": 32}
+            if hasattr(context.adapter, "default_metadata_for_action"):
+                metadata = dict(context.adapter.default_metadata_for_action(action_name) or {})
             proposals.append(
                 ActionProposal(
                     action_name=action_name,

@@ -7,6 +7,8 @@ from pathlib import Path
 DEFAULT_EXTERNAL_LLM_MODEL_PATH = Path(
     r"E:\.models\gemma-4-transformers-gemma-4-e2b-it-v1"
 )
+DEFAULT_RESET_STATE_NAMES = ("NOT_PLAYED", "GAME_OVER")
+DEFAULT_WIN_STATE_NAME = "WIN"
 
 
 def _resolve_path(root: Path, value: str | Path | None, default_relative: str) -> Path:
@@ -23,6 +25,7 @@ class RuntimeConfig:
     project_root: Path
     hyperon_rules_path: Path
     hyperon_learning_path: Path
+    memory_db_path: Path
     trained_priors_db_path: Path
     hyperon_wheel_dir: Path
     extra_wheel_dir: Path
@@ -35,9 +38,10 @@ class RuntimeConfig:
     llm_max_tokens: int = 192
     llm_temperature: float = 0.1
     symbolic_confidence_gate: float = 0.70
+    executive_replan_stagnation_threshold: int = 12
     deterministic_fallback_action: str = "ACTION1"
-    reset_state_names: tuple[str, ...] = ("NOT_PLAYED", "GAME_OVER")
-    win_state_name: str = "WIN"
+    reset_state_names: tuple[str, ...] = DEFAULT_RESET_STATE_NAMES
+    win_state_name: str = DEFAULT_WIN_STATE_NAME
     default_legal_actions: tuple[str, ...] = (
         "ACTION1",
         "ACTION2",
@@ -58,6 +62,28 @@ class RuntimeConfig:
     def from_env(cls, project_root: Path | None = None) -> "RuntimeConfig":
         root = project_root or Path(__file__).resolve().parents[1]
         env = os.environ
+        reset_state_names = tuple(
+            token.strip().upper()
+            for token in env.get(
+                "AGI_RESET_STATE_NAMES",
+                ",".join(DEFAULT_RESET_STATE_NAMES),
+            ).split(",")
+            if token.strip()
+        ) or DEFAULT_RESET_STATE_NAMES
+        win_state_name = (
+            env.get("AGI_WIN_STATE_NAME", DEFAULT_WIN_STATE_NAME).strip().upper()
+            or DEFAULT_WIN_STATE_NAME
+        )
+        memory_db_path = _resolve_path(
+            root,
+            env.get("AGI_MEMORY_DB_PATH"),
+            "training_artifacts/arc_memory.sqlite3",
+        )
+        trained_priors_db_path = _resolve_path(
+            root,
+            env.get("AGI_TRAINED_PRIORS_DB_PATH"),
+            "training_artifacts/arc_demo_action_priors.sqlite3",
+        )
         llm_model_dir = _resolve_path(root, env.get("AGI_LLM_MODEL_DIR"), "models")
         llm_model_path = _resolve_path(
             root,
@@ -76,11 +102,8 @@ class RuntimeConfig:
                 env.get("AGI_HYPERON_LEARNING_PATH"),
                 "agi_core/knowledge/rules/arc_learned.json",
             ),
-            trained_priors_db_path=_resolve_path(
-                root,
-                env.get("AGI_TRAINED_PRIORS_DB_PATH"),
-                "training_artifacts/arc_demo_action_priors.sqlite3",
-            ),
+            memory_db_path=memory_db_path,
+            trained_priors_db_path=trained_priors_db_path,
             hyperon_wheel_dir=_resolve_path(
                 root,
                 env.get("AGI_HYPERON_WHEEL_DIR"),
@@ -106,10 +129,15 @@ class RuntimeConfig:
             symbolic_confidence_gate=float(
                 env.get("AGI_SYMBOLIC_GATE", "0.70")
             ),
+            executive_replan_stagnation_threshold=int(
+                env.get("AGI_EXECUTIVE_REPLAN_STAGNATION", "12")
+            ),
             deterministic_fallback_action=env.get(
                 "AGI_FALLBACK_ACTION",
                 "ACTION1",
             ).upper(),
+            reset_state_names=reset_state_names,
+            win_state_name=win_state_name,
         )
 
     def effective_model_path(self) -> Path:

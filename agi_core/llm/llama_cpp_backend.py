@@ -80,6 +80,9 @@ class LlamaCppBackend:
         except Exception as exc:
             self.last_error = repr(exc)
             return
+        if not self._llama_cpp_cuda_available(module):
+            self.last_error = "CUDA device required for llama.cpp backend"
+            return
         llama_cls = getattr(module, "Llama", None)
         if llama_cls is None:
             self.last_error = "llama_cpp.Llama not found"
@@ -88,6 +91,7 @@ class LlamaCppBackend:
             self._llm = llama_cls(
                 model_path=str(self.model_path),
                 n_ctx=self.n_ctx,
+                n_gpu_layers=-1,
                 verbose=False,
             )
         except Exception as exc:
@@ -127,7 +131,7 @@ class LlamaCppBackend:
                 str(self.model_path),
                 local_files_only=True,
                 low_cpu_mem_usage=True,
-                dtype=model_dtype,
+                torch_dtype=model_dtype,
             )
             if hasattr(self._llm, "to"):
                 self._llm = self._llm.to(self.device)
@@ -142,6 +146,47 @@ class LlamaCppBackend:
         self._transformers_dtype = model_dtype
         self._backend_kind = "transformers"
         self.available = True
+
+    def _llama_cpp_cuda_available(self, module: Any) -> bool:
+        explicit_support = self._probe_llama_cpp_cuda_support(module)
+        if explicit_support is not None:
+            return explicit_support
+        try:
+            torch = importlib.import_module("torch")
+        except Exception:
+            torch = None
+        if torch is not None:
+            cuda = getattr(torch, "cuda", None)
+            if cuda is not None and hasattr(cuda, "is_available"):
+                try:
+                    if bool(cuda.is_available()):
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    def _probe_llama_cpp_cuda_support(self, module: Any) -> bool | None:
+        for attr_name in (
+            "supports_cuda",
+            "gpu_offload_supported",
+            "GGML_USE_CUDA",
+            "LLAMA_CPP_USE_CUDA",
+        ):
+            attr_value = getattr(module, attr_name, None)
+            if isinstance(attr_value, bool):
+                return attr_value
+            if callable(attr_value):
+                try:
+                    return bool(attr_value())
+                except Exception:
+                    continue
+        nested = getattr(module, "llama_cpp", None)
+        if nested is not None:
+            for attr_name in ("GGML_USE_CUDA", "LLAMA_CPP_USE_CUDA"):
+                attr_value = getattr(nested, attr_name, None)
+                if isinstance(attr_value, bool):
+                    return attr_value
+        return None
 
     def _generate_with_transformers(
         self,

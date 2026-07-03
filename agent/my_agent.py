@@ -50,13 +50,20 @@ class MyAgent(Agent):
             game_action_cls=GameAction,
             default_game_id=self.game_id,
             deterministic_action=config.deterministic_fallback_action,
+            reset_state_names=config.reset_state_names,
         )
-        memory = EpisodicMemory()
+        memory = EpisodicMemory(
+            win_state_name=config.win_state_name,
+            reset_state_names=config.reset_state_names,
+        )
         hyperon = HyperonBridge(
             rules_path=config.hyperon_rules_path,
             learning_path=config.hyperon_learning_path,
+            memory_db_path=config.memory_db_path,
             trained_priors_db_path=config.trained_priors_db_path,
             project_root=config.project_root,
+            reset_state_names=config.reset_state_names,
+            win_state_name=config.win_state_name,
             enabled=config.hyperon_enabled,
             skip_probe=config.hyperon_skip_probe,
             probe_timeout_seconds=config.hyperon_probe_timeout_seconds,
@@ -85,7 +92,11 @@ class MyAgent(Agent):
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         # Stop once we win. Do not stop on GAME_OVER because reset is a valid recovery action.
-        return latest_frame.state is GameState.WIN
+        if latest_frame.state is GameState.WIN:
+            self.runtime.bind_game(self.game_id)
+            self.runtime.note_terminal_observation(frames, latest_frame)
+            return True
+        return False
 
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData

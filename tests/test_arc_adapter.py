@@ -37,6 +37,7 @@ class StubFrame:
     levels_completed: int = 0
     last_action: StubGameAction | None = None
     available_actions: list[StubGameAction] | None = None
+    step_index: int | None = None
 
 
 class ArcAdapterTests(unittest.TestCase):
@@ -53,15 +54,18 @@ class ArcAdapterTests(unittest.TestCase):
             levels_completed=3,
             last_action=StubGameAction.ACTION1,
             available_actions=[StubGameAction.ACTION2, StubGameAction.ACTION6],
+            step_index=7,
         )
 
         observation = self.adapter.observe([frame], frame)
 
         self.assertEqual(observation.game_id, "ls20")
         self.assertEqual(observation.game_state, "ACTIVE")
+        self.assertEqual(observation.step_index, 7)
         self.assertEqual(observation.levels_completed, 3)
         self.assertEqual(observation.last_action, "ACTION1")
         self.assertEqual(observation.legal_actions, ["ACTION2", "ACTION6"])
+        self.assertTrue(observation.derived_features["step_index_reliable"])
 
     def test_observe_normalizes_integer_action_ids(self) -> None:
         frame = StubFrame(
@@ -80,6 +84,32 @@ class ArcAdapterTests(unittest.TestCase):
         self.assertEqual(observation.legal_actions, ["RESET"])
         fallback = self.adapter.fallback_decision(observation)
         self.assertEqual(fallback.action_name, "RESET")
+
+    def test_active_frame_without_explicit_actions_fails_closed(self) -> None:
+        frame = StubFrame(state=StubGameState.ACTIVE)
+
+        observation = self.adapter.observe([frame], frame)
+
+        self.assertEqual(observation.legal_actions, [])
+        self.assertFalse(observation.derived_features["legal_actions_known"])
+        self.assertEqual(self.adapter.fallback_action_name(observation), "ACTION2")
+        self.assertEqual(observation.step_index, 0)
+        self.assertFalse(observation.derived_features["step_index_reliable"])
+
+    def test_custom_reset_state_names_drive_legality_and_fallback(self) -> None:
+        adapter = ArcAdapter(
+            game_action_cls=StubGameAction,
+            default_game_id="ls20",
+            deterministic_action="ACTION2",
+            reset_state_names=("READY", "LOSE"),
+        )
+        frame = StubFrame(state="lose")
+
+        observation = adapter.observe([frame], frame)
+
+        self.assertEqual(observation.game_state, "LOSE")
+        self.assertEqual(observation.legal_actions, ["RESET"])
+        self.assertEqual(adapter.fallback_action_name(observation), "RESET")
 
     def test_complex_action_maps_coordinates(self) -> None:
         decision = ActionDecision(

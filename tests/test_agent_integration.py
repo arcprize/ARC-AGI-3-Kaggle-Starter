@@ -11,6 +11,8 @@ from enum import Enum
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
+from agi_core.types import MemoryBundle
+
 
 class StubGameState(Enum):
     NOT_PLAYED = "not_played"
@@ -63,9 +65,17 @@ class FakeHyperonBridge:
     def __init__(self, *args, **kwargs) -> None:
         self.available = False
         self.last_error = None
+        self._bundle = MemoryBundle()
+        self.recorded_transitions = []
 
     def sync(self, observation, memory, goals) -> None:
         return None
+
+    def current_memory_bundle(self):
+        return self._bundle
+
+    def record_transition(self, record) -> None:
+        self.recorded_transitions.append(record)
 
     def run_rules(self, query: str):
         return []
@@ -149,3 +159,47 @@ class MyAgentIntegrationTests(unittest.TestCase):
                     with redirect_stdout(buffer):
                         agent.choose_action([active_frame], active_frame)
                     self.assertIn("decision action=", buffer.getvalue())
+
+    def test_my_agent_flushes_terminal_win_transition_into_runtime_memory(self) -> None:
+        arcengine_module = types.ModuleType("arcengine")
+        arcengine_module.FrameData = StubFrameData
+        arcengine_module.GameAction = StubGameAction
+        arcengine_module.GameState = StubGameState
+
+        agents_module = types.ModuleType("agents")
+        agents_agent_module = types.ModuleType("agents.agent")
+        agents_agent_module.Agent = StubAgent
+
+        module_overrides = {
+            "arcengine": arcengine_module,
+            "agents": agents_module,
+            "agents.agent": agents_agent_module,
+        }
+
+        with patch.dict(sys.modules, module_overrides, clear=False):
+            sys.modules.pop("agent.my_agent", None)
+            module = importlib.import_module("agent.my_agent")
+            module = importlib.reload(module)
+            with patch.object(module, "LlamaCppBackend", FakeLlamaBackend):
+                with patch.object(module, "HyperonBridge", FakeHyperonBridge):
+                    agent = module.MyAgent(game_id="ls20", agent_name="StubAgent")
+
+                    active_frame = StubFrameData(
+                        state=StubGameState.ACTIVE,
+                        levels_completed=0,
+                        last_action=StubGameAction.ACTION1,
+                        available_actions=[StubGameAction.ACTION1, StubGameAction.ACTION2],
+                    )
+                    agent.choose_action([active_frame], active_frame)
+
+                    win_frame = StubFrameData(
+                        state=StubGameState.WIN,
+                        levels_completed=1,
+                        last_action=StubGameAction.ACTION1,
+                        available_actions=[StubGameAction.ACTION1, StubGameAction.ACTION2],
+                    )
+                    self.assertTrue(agent.is_done([active_frame, win_frame], win_frame))
+                    self.assertEqual(len(agent.runtime.hyperon.recorded_transitions), 1)
+                    record = agent.runtime.hyperon.recorded_transitions[0]
+                    self.assertEqual(record.outcome, "progress")
+                    self.assertEqual(record.next_game_state, "WIN")

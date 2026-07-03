@@ -7,10 +7,18 @@ import zipfile
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
-from agi_core.storage import initialize_schema, upsert_metadata, upsert_training_counts
+from agi_core.config import RuntimeConfig
+from agi_core.storage import (
+    initialize_memory_schema,
+    record_transitions,
+    upsert_metadata,
+    upsert_training_counts,
+)
+from agi_core.types import EpisodeRecord
 
 @dataclass(slots=True)
 class RecordingMeta:
@@ -35,6 +43,28 @@ class TrainingStep:
     win_levels: int
     full_reset: bool
     frame_signature: str | None
+
+
+def _win_state_name() -> str:
+    return _terminal_state_config()[0]
+
+
+def _reset_state_names() -> set[str]:
+    return set(_terminal_state_config()[1])
+
+
+@lru_cache(maxsize=1)
+def _terminal_state_config() -> tuple[str, tuple[str, ...]]:
+    config = RuntimeConfig.from_env()
+    return config.win_state_name, tuple(config.reset_state_names)
+
+
+def _is_win_state(state_name: str) -> bool:
+    return str(state_name or "").upper() == _win_state_name()
+
+
+def _is_reset_state(state_name: str) -> bool:
+    return str(state_name or "").upper() in _reset_state_names()
 
 
 def normalize_action_name(action_id: Any) -> str | None:
@@ -184,17 +214,19 @@ def build_action_prior_artifact(
         limit_recordings=limit_recordings,
     )
     training_rows: list[dict[str, Any]] = []
+    memory_records: list[EpisodeRecord] = []
     for payload in _collect_recording_aggregates(
         archive_path,
         selected_recordings=selected_recordings,
         workers=workers,
     ):
         _merge_recording_payload(artifact, payload)
+        memory_records.extend(payload.get("memory_records", []))
     if output_path is not None:
         destination = Path(output_path)
         if destination.exists():
             destination.unlink()
-        initialize_schema(destination)
+        initialize_memory_schema(destination)
         for game_id, game_entry in sorted(artifact["games"].items()):
             training_rows.extend(
                 _count_rows_for_game(
@@ -203,15 +235,17 @@ def build_action_prior_artifact(
                 )
             )
         upsert_training_counts(destination, training_rows)
+        record_transitions(destination, memory_records)
         upsert_metadata(
             destination,
             {
-                "schema_version": "1",
+                "schema_version": "2",
                 "source_zip": str(archive_path),
                 "build_timestamp": datetime.now(timezone.utc).isoformat(),
                 "recordings_seen": str(artifact["recordings_seen"]),
                 "steps_seen": str(artifact["steps_seen"]),
                 "steps_used": str(artifact["steps_used"]),
+                "offline_memory_records": str(len(memory_records)),
             },
         )
     return artifact
@@ -265,6 +299,7 @@ def _process_recording(
         "steps_seen": 0,
         "steps_used": 0,
         "games": {short_game_id: _new_game_entry()},
+        "memory_records": [],
     }
     game_entry = payload["games"][short_game_id]
     game_entry["recordings"] = 1
@@ -306,6 +341,14 @@ def _process_recording(
             continue
         payload["steps_used"] += 1
         game_entry["steps_used"] += 1
+        payload["memory_records"].append(
+            _build_memory_record(
+                step=step,
+                next_step=next_step,
+                future_steps=future_steps,
+                stall_streak=stall_streak,
+            )
+        )
         _increment_count_by(game_entry["actions"], action_name, weight)
         _increment_support_once(game_entry["action_supports"], seen_game_actions, action_name)
         state_entry = game_entry["states"].setdefault(step.state, {"actions": {}})
@@ -436,7 +479,7 @@ def _training_weight(
 def _recording_quality_bonus(steps: list[TrainingStep]) -> int:
     if not steps:
         return 0
-    if any(step.state == "WIN" for step in steps):
+    if any(_is_win_state(step.state) for step in steps):
         return 2
     best_levels_completed = max(int(step.levels_completed or 0) for step in steps)
     max_win_levels = max(int(step.win_levels or 0) for step in steps)
@@ -454,7 +497,7 @@ def _recording_drag_penalty(steps: list[TrainingStep]) -> int:
     if len(steps) < 6:
         return 0
     best_levels_completed = max(int(step.levels_completed or 0) for step in steps) if steps else 0
-    if any(step.state == "WIN" for step in steps):
+    if any(_is_win_state(step.state) for step in steps):
         return 0
     if best_levels_completed <= 0:
         return 1
@@ -488,7 +531,7 @@ def _endgame_conversion_bonus(
     if step.win_levels <= 0:
         return 0
     candidate_steps = [candidate for candidate in [next_step, *future_steps] if candidate is not None]
-    if any(candidate.state == "WIN" for candidate in candidate_steps):
+    if any(_is_win_state(candidate.state) for candidate in candidate_steps):
         return 2
     best_future_levels = max(
         [int(step.levels_completed or 0)]
@@ -509,7 +552,7 @@ def _progress_momentum_bonus(
     best_seen = int(step.levels_completed or 0)
     for candidate in candidate_steps:
         levels_completed = int(candidate.levels_completed or 0)
-        if candidate.state == "WIN" or levels_completed > best_seen:
+        if _is_win_state(candidate.state) or levels_completed > best_seen:
             progress_hits += 1
             best_seen = max(best_seen, levels_completed)
     if progress_hits >= 2:
@@ -527,7 +570,7 @@ def _progress_stability_bonus(
     sustained_level = int(next_step.levels_completed or 0)
     stable_follow_ups = 0
     for candidate in future_steps:
-        if candidate.state == "GAME_OVER" or candidate.full_reset:
+        if _is_reset_state(candidate.state) or candidate.full_reset:
             break
         if int(candidate.levels_completed or 0) < sustained_level:
             break
@@ -546,9 +589,9 @@ def _progress_regression_penalty(
         return 0
     gained_level = int(next_step.levels_completed or 0)
     for distance, candidate in enumerate(future_steps, start=1):
-        if candidate.state == "WIN":
+        if _is_win_state(candidate.state):
             return 0
-        if candidate.state == "GAME_OVER" or candidate.full_reset:
+        if _is_reset_state(candidate.state) or candidate.full_reset:
             return 0
         if int(candidate.levels_completed or 0) < gained_level:
             if distance <= 2:
@@ -561,10 +604,10 @@ def _pre_win_setup_bonus(
     next_step: TrainingStep | None,
     future_steps: list[TrainingStep],
 ) -> int:
-    if next_step is not None and next_step.state == "WIN":
+    if next_step is not None and _is_win_state(next_step.state):
         return 0
     for distance, candidate in enumerate(future_steps, start=1):
-        if candidate.state == "WIN":
+        if _is_win_state(candidate.state):
             if distance <= 2:
                 return 1
             return 0
@@ -576,7 +619,7 @@ def _terminal_win_bonus(
     future_steps: list[TrainingStep],
 ) -> int:
     candidate_steps = [candidate for candidate in [next_step, *future_steps] if candidate is not None]
-    if any(candidate.state == "WIN" for candidate in candidate_steps):
+    if any(_is_win_state(candidate.state) for candidate in candidate_steps):
         return 1
     return 0
 
@@ -606,7 +649,7 @@ def _preceding_stall_streak(
     cursor = index - 1
     while cursor >= 0:
         previous = steps[cursor]
-        if previous.state == "WIN" or previous.state == "GAME_OVER":
+        if _is_win_state(previous.state) or _is_reset_state(previous.state):
             break
         if int(previous.levels_completed or 0) != int(current.levels_completed or 0):
             break
@@ -659,9 +702,9 @@ def _infer_step_outcome(
     progress_delta = _step_progress_delta(step, next_step)
     state_name = next_step.state if next_step is not None else step.state
     full_reset = bool(next_step.full_reset if next_step is not None else step.full_reset)
-    if state_name == "WIN" or progress_delta > 0:
+    if _is_win_state(state_name) or progress_delta > 0:
         return "progress"
-    if state_name == "GAME_OVER" or full_reset:
+    if _is_reset_state(state_name) or full_reset:
         return "failed"
     return "stalled"
 
@@ -680,7 +723,7 @@ def _lookahead_progress(
 ) -> tuple[int, int]:
     for distance, future_step in enumerate(future_steps, start=1):
         progress_delta = int(future_step.levels_completed) - int(step.levels_completed)
-        if future_step.state == "WIN" or progress_delta > 0:
+        if _is_win_state(future_step.state) or progress_delta > 0:
             return progress_delta, distance
     return 0, 0
 
@@ -690,13 +733,13 @@ def _lookahead_failure_distance(
     future_steps: list[TrainingStep],
 ) -> int | None:
     for distance, future_step in enumerate(future_steps, start=1):
-        if future_step.state == "GAME_OVER" or future_step.full_reset:
+        if _is_reset_state(future_step.state) or future_step.full_reset:
             return distance
     return None
 
 
 def _is_meaningful_reset(step: TrainingStep) -> bool:
-    return step.state in {"NOT_PLAYED", "GAME_OVER"} or step.full_reset
+    return _is_reset_state(step.state) or step.full_reset
 
 
 def _is_noop_transition(
@@ -720,6 +763,8 @@ def _merge_recording_payload(
     artifact["recordings_seen"] += int(payload.get("recordings_seen", 0) or 0)
     artifact["steps_seen"] += int(payload.get("steps_seen", 0) or 0)
     artifact["steps_used"] += int(payload.get("steps_used", 0) or 0)
+    artifact.setdefault("offline_memory_records", 0)
+    artifact["offline_memory_records"] += len(payload.get("memory_records", []))
     for game_id, game_payload in sorted(payload.get("games", {}).items()):
         target_game_entry = artifact["games"].setdefault(game_id, _new_game_entry())
         target_game_entry["recordings"] += int(game_payload.get("recordings", 0) or 0)
@@ -762,6 +807,65 @@ def _merge_recording_payload(
                     int(target_frame_entry["action_supports"].get(action_name, 0) or 0)
                     + int(count or 0)
                 )
+
+
+def _build_memory_record(
+    *,
+    step: TrainingStep,
+    next_step: TrainingStep | None,
+    future_steps: list[TrainingStep],
+    stall_streak: int,
+) -> EpisodeRecord:
+    outcome = _infer_step_outcome(step, next_step)
+    progress_delta = _step_progress_delta(step, next_step)
+    next_state = next_step.state if next_step is not None else step.state
+    next_frame_signature = next_step.frame_signature if next_step is not None else step.frame_signature
+    return EpisodeRecord(
+        game_id=step.game_id.split("-")[0],
+        step_index=int(step.step_index),
+        action_name=str(step.action_name or ""),
+        outcome=outcome,
+        progress_delta=int(progress_delta),
+        game_state=next_state,
+        prior_game_state=step.state,
+        levels_completed=int(next_step.levels_completed if next_step is not None else step.levels_completed),
+        prior_frame_signature=step.frame_signature,
+        next_game_state=next_state,
+        next_frame_signature=next_frame_signature,
+        prior_legal_actions=list(step.available_actions),
+        stagnation_before=max(0, stall_streak),
+        stagnation_after=max(0, stall_streak + (0 if outcome == "progress" else 1)),
+        decision_subgoal=_infer_training_subgoal(
+            step=step,
+            next_step=next_step,
+            future_steps=future_steps,
+            outcome=outcome,
+            stall_streak=stall_streak,
+        ),
+        decision_source="offline-demo-trainer",
+    )
+
+
+def _infer_training_subgoal(
+    *,
+    step: TrainingStep,
+    next_step: TrainingStep | None,
+    future_steps: list[TrainingStep],
+    outcome: str,
+    stall_streak: int,
+) -> str:
+    if step.action_name == "RESET" or _is_reset_state(step.state):
+        return "re-enter-level"
+    if outcome == "progress":
+        return "advance-level"
+    if stall_streak >= 2:
+        return "break-stall"
+    future_progress_delta, _ = _lookahead_progress(step, future_steps)
+    if future_progress_delta > 0:
+        return "advance-level"
+    if next_step is not None and _is_win_state(next_step.state):
+        return "hold-win"
+    return "break-stall"
 
 
 def _count_rows_for_game(

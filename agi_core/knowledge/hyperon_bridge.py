@@ -8,8 +8,19 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from agi_core.storage import load_best_prior_bucket
-from agi_core.types import ActionProposal, GoalState, Observation
+from agi_core.config import DEFAULT_RESET_STATE_NAMES, DEFAULT_WIN_STATE_NAME
+from agi_core.storage import (
+    import_legacy_learning_json,
+    initialize_memory_schema,
+    load_best_prior_bucket,
+    load_memory_bundle,
+    record_transition as persist_transition,
+)
+from agi_core.storage.memory_sqlite import (
+    _derive_recommended_actions,
+    _derive_suppressed_actions,
+)
+from agi_core.types import ActionProposal, EpisodeRecord, GoalState, MemoryBundle, Observation
 
 
 class HyperonBridge:
@@ -19,8 +30,11 @@ class HyperonBridge:
         self,
         rules_path: str | Path | None = None,
         learning_path: str | Path | None = None,
+        memory_db_path: str | Path | None = None,
         trained_priors_db_path: str | Path | None = None,
         project_root: str | Path | None = None,
+        reset_state_names: tuple[str, ...] = ("NOT_PLAYED", "GAME_OVER"),
+        win_state_name: str = "WIN",
         enabled: bool = True,
         skip_probe: bool = False,
         python_executable: str | Path | None = None,
@@ -28,10 +42,13 @@ class HyperonBridge:
     ) -> None:
         self.rules_path = Path(rules_path) if rules_path is not None else None
         self.learning_path = Path(learning_path) if learning_path is not None else None
+        self.memory_db_path = Path(memory_db_path) if memory_db_path is not None else None
         self.trained_priors_db_path = (
             Path(trained_priors_db_path) if trained_priors_db_path is not None else None
         )
         self.project_root = self._resolve_project_root(project_root, self.rules_path)
+        self._reset_state_names = {str(name or "").upper() for name in reset_state_names}
+        self._win_state_name = str(win_state_name or "").upper()
         self.enabled = enabled
         self.skip_probe = skip_probe
         self.python_executable = str(python_executable or sys.executable)
@@ -41,17 +58,43 @@ class HyperonBridge:
         self.available = False
         self.facts: dict[str, Any] = {}
         self.last_error: str | None = None
-        self.learned_knowledge = self._load_learned_knowledge()
+        self.learned_knowledge: dict[str, Any] = self._load_learned_knowledge()
+        self._ingested_record_keys: set[tuple[Any, ...]] = set()
         self._probe_attempted = False
         self._probe_ok = False
         self._runtime: Any = None
         self._trained_priors_error: str | None = None
-        self._ingested_record_keys: set[
-            tuple[str, int, str, str, int, str, str | None, str | None, str | None]
-        ] = set()
+        self._memory_error: str | None = None
+        self._memory_store_available = False
+        self._memory_write_available = False
+        self._unpersisted_records: dict[tuple[Any, ...], EpisodeRecord] = {}
+        self._last_observation_step_by_game: dict[str, int] = {}
+        self._last_observation_state_by_game: dict[str, str] = {}
+        self._current_memory_bundle = MemoryBundle()
+        self._rules_loaded = False
+        self._last_fact_program: str | None = None
+        self._initialize_memory_store()
+
+    def bind_game(self, game_id: str) -> None:
+        game_key = str(game_id or "")
+        stale_games = [
+            record_game_id
+            for record_game_id in self._last_observation_step_by_game
+            if record_game_id != game_key
+        ]
+        for stale_game_id in stale_games:
+            self._last_observation_step_by_game.pop(stale_game_id, None)
+            self._last_observation_state_by_game.pop(stale_game_id, None)
 
     def sync(self, observation: Observation, memory: Any, goals: list[GoalState]) -> None:
-        self._ingest_episode_records(memory.records)
+        self._note_observation_boundary(observation)
+        bundle = self._load_memory_bundle(
+            observation=observation,
+            subgoal=None,
+            legal_actions=list(observation.legal_actions),
+            memory=memory,
+        )
+        self._current_memory_bundle = MemoryBundle(**bundle)
         self.facts = {
             "episode": {
                 "game_id": observation.game_id,
@@ -76,11 +119,54 @@ class HyperonBridge:
                 for action_name in observation.legal_actions
             ],
             "memory": memory.summarize_for_hyperon(),
-            "learned": self._summarize_learned_knowledge(observation.game_id),
-            "trained_prior_bucket": self._load_trained_prior_bucket(observation),
+            "memory_bundle": bundle,
+            "learned": self._memory_bundle_as_learned(bundle),
+            "trained_prior_bucket": dict(bundle.get("trained_prior_bucket", {})),
             "proposals": [],
         }
         self._refresh_runtime()
+
+    def current_memory_bundle(self) -> MemoryBundle:
+        return self._current_memory_bundle
+
+    def contextual_memory_bundle(
+        self,
+        observation: Observation,
+        subgoal: str | None,
+        legal_actions: list[str],
+    ) -> MemoryBundle:
+        if not subgoal:
+            return self._current_memory_bundle
+        bundle = self._load_memory_bundle(
+            observation=observation,
+            subgoal=subgoal,
+            legal_actions=legal_actions,
+            memory=None,
+        )
+        return MemoryBundle(**bundle)
+
+    def record_transition(self, record: EpisodeRecord) -> None:
+        record_key = self._record_key(record)
+        self._unpersisted_records[record_key] = record
+        if not self._ensure_memory_write_available():
+            return
+        try:
+            self._flush_unpersisted_records()
+            self._memory_error = None
+        except Exception as exc:
+            self._memory_store_available = True
+            self._memory_write_available = False
+            self._memory_error = repr(exc)
+
+    def _flush_unpersisted_records(self) -> None:
+        if self.memory_db_path is None:
+            return
+        persisted_keys: list[tuple[Any, ...]] = []
+        for pending_key, pending_record in self._unpersisted_records.items():
+            persist_transition(self.memory_db_path, pending_record)
+            persisted_keys.append(pending_key)
+        for pending_key in persisted_keys:
+            self._unpersisted_records.pop(pending_key, None)
 
     def update_proposals(self, proposals: list[ActionProposal]) -> None:
         self.facts["proposals"] = [
@@ -96,6 +182,9 @@ class HyperonBridge:
             return
         try:
             self._run_program(self._build_proposal_fact_program())
+            # Force the next sync to refresh base facts so stale proposal facts
+            # cannot survive across turns in a reused runtime.
+            self._last_fact_program = None
         except Exception as exc:
             self._disable_runtime(f"failed to sync proposal facts: {exc}")
 
@@ -112,6 +201,8 @@ class HyperonBridge:
         memory = self.facts.get("memory", {})
         query_name, query_arg = self._parse_query(query)
         legal_actions = list(episode.get("legal_actions", []))
+        if query_name in {"reset-needed", "goal-hints"} and self._uses_custom_terminal_states():
+            return self._run_shadow_rules(query)
         if query_name == "reset-needed":
             state_name = self._symbol(episode.get("game_state"))
             if self._evaluate_scalar(f"!(reset-required {state_name})") is True:
@@ -134,7 +225,7 @@ class HyperonBridge:
                 subgoal = self._evaluate_scalar(f"!(goal-hint {state_name})")
             if subgoal is None:
                 return []
-            confidence = 0.95 if episode.get("game_state") == "WIN" else 0.72
+            confidence = 0.95 if episode.get("game_state") == self._win_state_name else 0.72
             return [{"subgoal": str(subgoal), "confidence": confidence}]
         if query_name == "action-priors":
             return self._action_priors(
@@ -150,13 +241,19 @@ class HyperonBridge:
             return self._run_shadow_rules(query)
         return self._run_shadow_rules(query)
 
+    def _uses_custom_terminal_states(self) -> bool:
+        return (
+            self._win_state_name != DEFAULT_WIN_STATE_NAME
+            or self._reset_state_names != set(DEFAULT_RESET_STATE_NAMES)
+        )
+
     def _run_shadow_rules(self, query: str) -> list[dict[str, Any]]:
         episode = self.facts.get("episode", {})
         memory = self.facts.get("memory", {})
         query_name, query_arg = self._parse_query(query)
         legal_actions = list(episode.get("legal_actions", []))
         if query_name == "reset-needed":
-            if episode.get("game_state") in {"NOT_PLAYED", "GAME_OVER"}:
+            if episode.get("game_state") in self._reset_state_names:
                 return [
                     {
                         "action_name": "RESET",
@@ -176,7 +273,7 @@ class HyperonBridge:
                 ]
             return []
         if query_name == "goal-hints":
-            if episode.get("game_state") == "WIN":
+            if episode.get("game_state") == self._win_state_name:
                 return [{"subgoal": "hold-win", "confidence": 0.95}]
             if memory.get("stagnation_steps", 0):
                 return [{"subgoal": "break-stall", "confidence": 0.72}]
@@ -211,20 +308,40 @@ class HyperonBridge:
         results: list[dict[str, Any]] = []
         success_counts = memory.get("success_counts", {})
         failure_streaks = memory.get("failure_streaks", {})
-        learned = learned or {}
-        learned_actions = learned.get("actions", {})
-        learned_states = learned.get("states", {})
-        learned_subgoals = learned.get("subgoals", {})
-        learned_frame_signatures = learned.get("frame_signatures", {})
-        state_actions = learned_states.get(current_state, {}).get("actions", {})
-        subgoal_actions = learned_subgoals.get(current_subgoal or "", {}).get("actions", {})
-        frame_actions = learned_frame_signatures.get(current_frame_signature, {}).get(
-            "actions", {}
+        bundle = self._load_contextual_bundle(
+            current_state=current_state,
+            current_frame_signature=current_frame_signature,
+            current_subgoal=current_subgoal,
+            legal_actions=legal_actions,
         )
+        learned = learned or self._memory_bundle_as_learned(
+            bundle,
+            subgoal_name=current_subgoal,
+        )
+        learned_actions = dict(bundle.get("action_stats", {}))
+        state_actions = dict(bundle.get("state_action_stats", {}))
+        subgoal_actions = dict(bundle.get("subgoal_action_stats", {}))
+        basin_actions = dict(bundle.get("basin_action_stats", {}))
+        frame_actions = dict(bundle.get("frame_action_stats", {}))
+        offline_actions = dict(bundle.get("trained_prior_bucket", {}))
+        basin_status = dict(bundle.get("basin_status", {}))
+        recommended_actions = list(bundle.get("recommended_actions", []))
+        suppressed_actions = set(bundle.get("suppressed_actions", []))
         recent_actions = memory.get("recent_actions", [])
         most_recent = recent_actions[-1] if recent_actions else None
         stagnation_steps = int(memory.get("stagnation_steps", 0) or 0)
-        offline_actions = dict(self.facts.get("trained_prior_bucket", {}))
+        episode_context_attempts = self._episode_context_attempts(
+            memory,
+            state_name=current_state,
+            frame_signature=current_frame_signature,
+        )
+        episode_distinct_attempts = len(episode_context_attempts)
+        basin_hard_exhausted = self._is_episode_basin_hard_exhausted(
+            legal_actions=legal_actions,
+            stagnation_steps=stagnation_steps,
+            basin_status=basin_status,
+            episode_context_attempts=episode_context_attempts,
+        )
         for index, action_name in enumerate(legal_actions):
             if action_name == "RESET":
                 continue
@@ -249,28 +366,63 @@ class HyperonBridge:
             confidence -= min(0.12, learned_failed * 0.02)
             confidence -= min(0.06, learned_stalled * 0.01)
             confidence += self._contextual_learning_bias(
-                frame_actions.get(action_name, {}),
+                basin_actions.get(action_name, {}),
                 success_scale=0.04,
-                failed_scale=0.015,
-                stalled_scale=0.01,
-                positive_cap=0.18,
-                negative_cap=0.06,
+                failed_scale=0.02,
+                stalled_scale=0.012,
+                positive_cap=0.20,
+                negative_cap=0.08,
+            )
+            confidence -= self._frame_context_loop_penalty(
+                basin_actions.get(action_name, {}),
+                action_name=action_name,
+                most_recent_action=most_recent,
+                stagnation_steps=stagnation_steps,
             )
             confidence += self._contextual_learning_bias(
                 state_actions.get(action_name, {}),
-                success_scale=0.025,
-                failed_scale=0.025,
-                stalled_scale=0.015,
-                positive_cap=0.12,
+                success_scale=0.03,
+                failed_scale=0.02,
+                stalled_scale=0.012,
+                positive_cap=0.14,
                 negative_cap=0.12,
             )
             confidence += self._contextual_learning_bias(
                 subgoal_actions.get(action_name, {}),
-                success_scale=0.03,
+                success_scale=0.035,
                 failed_scale=0.02,
                 stalled_scale=0.01,
-                positive_cap=0.14,
+                positive_cap=0.16,
                 negative_cap=0.10,
+            )
+            confidence += self._contextual_learning_bias(
+                frame_actions.get(action_name, {}),
+                success_scale=0.012,
+                failed_scale=0.008,
+                stalled_scale=0.006,
+                positive_cap=0.05,
+                negative_cap=0.03,
+            )
+            confidence += self._stagnation_novelty_bonus(
+                action_name=action_name,
+                stagnation_steps=stagnation_steps,
+                episode_context_attempts=episode_context_attempts,
+            )
+            confidence += self._recommended_action_bonus(action_name, recommended_actions)
+            confidence -= self._suppressed_action_penalty(
+                action_name=action_name,
+                suppressed_actions=suppressed_actions,
+                basin_status=basin_status,
+            )
+            confidence -= self._episode_basin_loop_penalty(
+                action_name=action_name,
+                legal_actions=legal_actions,
+                stagnation_steps=stagnation_steps,
+                episode_context_attempts=episode_context_attempts,
+                episode_distinct_attempts=episode_distinct_attempts,
+                basin_status=basin_status,
+                basin_hard_exhausted=basin_hard_exhausted,
+                most_recent_action=most_recent,
             )
             if stagnation_steps and action_name != most_recent:
                 confidence += 0.03
@@ -320,6 +472,873 @@ class HyperonBridge:
         negative = min(negative_cap, (failed * failed_scale) + (stalled * stalled_scale))
         return positive - negative
 
+    def _frame_context_loop_penalty(
+        self,
+        stats: dict[str, Any],
+        *,
+        action_name: str,
+        most_recent_action: str | None,
+        stagnation_steps: int,
+    ) -> float:
+        if not stats:
+            return 0.0
+        progress = int(stats.get("progress", 0) or 0)
+        failed = int(stats.get("failed", 0) or 0)
+        stalled = int(stats.get("stalled", 0) or 0)
+        if progress > 0:
+            return 0.0
+        penalty = 0.0
+        if failed > 0:
+            penalty += min(0.20, 0.12 + (failed - 1) * 0.04)
+        elif stalled >= 3:
+            penalty += 0.16
+        elif stalled >= 2:
+            penalty += 0.10
+        if stagnation_steps >= 2 and most_recent_action == action_name and stalled > 0:
+            penalty += 0.04
+        return min(0.24, penalty)
+
+    def _episode_context_attempts(
+        self,
+        memory: dict[str, Any],
+        *,
+        state_name: str,
+        frame_signature: str,
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        if not state_name:
+            return counts
+        for raw_record in memory.get("records", []):
+            if not isinstance(raw_record, dict):
+                continue
+            if str(raw_record.get("prior_game_state") or "") != state_name:
+                continue
+            if frame_signature and str(raw_record.get("prior_frame_signature") or "") != frame_signature:
+                continue
+            action_name = str(raw_record.get("action_name") or "").upper()
+            if not action_name:
+                continue
+            counts[action_name] = int(counts.get(action_name, 0) or 0) + 1
+        return counts
+
+    def _stagnation_novelty_bonus(
+        self,
+        *,
+        action_name: str,
+        stagnation_steps: int,
+        episode_context_attempts: dict[str, int],
+    ) -> float:
+        if stagnation_steps < 3:
+            return 0.0
+        attempts = int(episode_context_attempts.get(action_name, 0) or 0)
+        if attempts == 0:
+            return 0.18
+        if attempts == 1:
+            return 0.04
+        return -min(0.18, 0.06 * (attempts - 1))
+
+    def _recommended_action_bonus(
+        self,
+        action_name: str,
+        recommended_actions: list[str],
+    ) -> float:
+        if action_name not in recommended_actions:
+            return 0.0
+        index = recommended_actions.index(action_name)
+        return max(0.02, 0.08 - (index * 0.02))
+
+    def _suppressed_action_penalty(
+        self,
+        *,
+        action_name: str,
+        suppressed_actions: set[str],
+        basin_status: dict[str, Any],
+    ) -> float:
+        if action_name not in suppressed_actions:
+            return 0.0
+        if basin_status.get("is_exhausted"):
+            return 0.65
+        if int(basin_status.get("progress_events", 0) or 0) <= 0:
+            return 0.32
+        return 0.18
+
+    def _episode_basin_loop_penalty(
+        self,
+        *,
+        action_name: str,
+        legal_actions: list[str],
+        stagnation_steps: int,
+        episode_context_attempts: dict[str, int],
+        episode_distinct_attempts: int,
+        basin_status: dict[str, Any],
+        basin_hard_exhausted: bool,
+        most_recent_action: str | None,
+    ) -> float:
+        attempts = int(episode_context_attempts.get(action_name, 0) or 0)
+        if attempts <= 0:
+            return 0.0
+        candidate_actions = [action for action in legal_actions if action != "RESET"]
+        if not candidate_actions:
+            return 0.0
+        no_progress_basin = int(basin_status.get("progress_events", 0) or 0) <= 0
+        broad_exploration = episode_distinct_attempts >= min(3, len(candidate_actions))
+        if stagnation_steps < 4 and not basin_hard_exhausted:
+            return 0.0
+        penalty = 0.0
+        if no_progress_basin and broad_exploration:
+            penalty += 0.18
+        if attempts >= 2:
+            penalty += min(0.20, 0.08 * (attempts - 1))
+        if most_recent_action == action_name and stagnation_steps >= 6:
+            penalty += 0.06
+        if basin_hard_exhausted:
+            penalty += 0.30
+        return min(0.75, penalty)
+
+    def _is_episode_basin_hard_exhausted(
+        self,
+        *,
+        legal_actions: list[str],
+        stagnation_steps: int,
+        basin_status: dict[str, Any],
+        episode_context_attempts: dict[str, int],
+    ) -> bool:
+        candidate_actions = [action for action in legal_actions if action != "RESET"]
+        if not candidate_actions:
+            return False
+        if stagnation_steps < max(4, len(candidate_actions)):
+            return False
+        if int(basin_status.get("progress_events", 0) or 0) > 0:
+            return False
+        return all(int(episode_context_attempts.get(action, 0) or 0) > 0 for action in candidate_actions)
+
+    def _initialize_memory_store(self) -> None:
+        if self.memory_db_path is None:
+            return
+        try:
+            initialize_memory_schema(self.memory_db_path)
+            if self.learning_path is not None:
+                import_legacy_learning_json(self.memory_db_path, self.learning_path)
+            self._memory_store_available = True
+            self._memory_write_available = True
+            self._memory_error = None
+        except Exception as exc:
+            self._memory_store_available = False
+            self._memory_write_available = False
+            self._memory_error = repr(exc)
+
+    def _ensure_memory_write_available(self) -> bool:
+        if self.memory_db_path is None:
+            return False
+        if self._memory_write_available:
+            return True
+        self._initialize_memory_store()
+        return self._memory_write_available
+
+    def _note_observation_boundary(self, observation: Observation) -> None:
+        game_id = str(observation.game_id or "")
+        if not game_id:
+            return
+        step_index = int(observation.step_index or 0)
+        state_name = str(observation.game_state or "")
+        step_index_reliable = bool(
+            observation.derived_features.get("step_index_reliable", True)
+        )
+        last_step_index = self._last_observation_step_by_game.get(game_id)
+        last_state_name = self._last_observation_state_by_game.get(game_id, "")
+        restart_detected = (
+            step_index_reliable
+            and last_step_index is not None
+            and step_index < last_step_index
+        )
+        reset_exit_detected = (
+            bool(last_state_name)
+            and last_state_name in self._reset_state_names
+            and state_name not in self._reset_state_names
+        )
+        if restart_detected or reset_exit_detected:
+            self._clear_unpersisted_records_for_game(game_id)
+        self._last_observation_step_by_game[game_id] = step_index
+        self._last_observation_state_by_game[game_id] = state_name
+
+    def _clear_unpersisted_records_for_game(self, game_id: str) -> None:
+        pending_keys = [
+            record_key
+            for record_key, record in self._unpersisted_records.items()
+            if str(self._record_field(record, "game_id", "") or "") == game_id
+        ]
+        for record_key in pending_keys:
+            self._unpersisted_records.pop(record_key, None)
+
+    def _load_memory_bundle(
+        self,
+        *,
+        observation: Observation,
+        subgoal: str | None,
+        legal_actions: list[str],
+        memory: Any | None,
+    ) -> dict[str, Any]:
+        if not self._memory_store_available or self.memory_db_path is None:
+            return self._fallback_memory_bundle(
+                observation=observation,
+                subgoal=subgoal,
+                legal_actions=legal_actions,
+                memory=memory,
+            )
+        try:
+            bundle = load_memory_bundle(
+                self.memory_db_path,
+                game_id=observation.game_id,
+                state=observation.game_state,
+                frame_signature=str(
+                    observation.derived_features.get("frame_signature", "") or ""
+                ),
+                subgoal=subgoal,
+                legal_actions=legal_actions,
+            )
+            pending_records = self._pending_records_for_game(observation.game_id)
+            if pending_records:
+                bundle = self._overlay_records_onto_bundle(
+                    bundle=bundle,
+                    records=pending_records,
+                    observation=observation,
+                    subgoal=subgoal,
+                    legal_actions=legal_actions,
+                )
+            return bundle
+        except Exception as exc:
+            self._memory_store_available = False
+            self._memory_error = repr(exc)
+            return self._fallback_memory_bundle(
+                observation=observation,
+                subgoal=subgoal,
+                legal_actions=legal_actions,
+                memory=memory,
+            )
+
+    def _load_contextual_bundle(
+        self,
+        *,
+        current_state: str,
+        current_frame_signature: str,
+        current_subgoal: str | None,
+        legal_actions: list[str],
+    ) -> dict[str, Any]:
+        episode = self.facts.get("episode", {})
+        observation = Observation(
+            game_id=str(episode.get("game_id", "")),
+            step_index=int(episode.get("step_index", 0) or 0),
+            game_state=current_state or str(episode.get("game_state", "")),
+            levels_completed=int(episode.get("levels_completed", 0) or 0),
+            last_action=episode.get("last_action"),
+            legal_actions=list(legal_actions),
+            derived_features={"frame_signature": current_frame_signature},
+        )
+        bundle = self._load_memory_bundle(
+            observation=observation,
+            subgoal=current_subgoal,
+            legal_actions=legal_actions,
+            memory=None,
+        )
+        if current_subgoal is None:
+            return self.facts.get("memory_bundle", bundle)
+        return bundle
+
+    def _fallback_memory_bundle(
+        self,
+        *,
+        observation: Observation,
+        subgoal: str | None,
+        legal_actions: list[str],
+        memory: Any | None,
+    ) -> dict[str, Any]:
+        records = self._fallback_memory_records(memory)
+        trained_prior_bucket = self._load_trained_prior_bucket(observation)
+        learned = self._summarize_learned_knowledge(observation.game_id)
+        if memory is not None:
+            self._ingest_episode_records(records)
+            learned = self._summarize_learned_knowledge(observation.game_id)
+        frame_signature = str(
+            observation.derived_features.get("frame_signature", "") or ""
+        )
+        state_name = str(observation.game_state or "")
+        action_stats = self._clone_action_stats(learned.get("actions", {}))
+        state_stats = self._clone_action_stats(
+            (learned.get("states", {}).get(state_name, {}) or {}).get("actions", {})
+        )
+        frame_stats = self._clone_action_stats(
+            (learned.get("frame_signatures", {}).get(frame_signature, {}) or {}).get(
+                "actions", {}
+            )
+        )
+        subgoal_stats = self._clone_action_stats(
+            (learned.get("subgoals", {}).get(str(subgoal or ""), {}) or {}).get(
+                "actions", {}
+            )
+        )
+        if (
+            not records
+            and not action_stats
+            and not state_stats
+            and not frame_stats
+            and not subgoal_stats
+            and not trained_prior_bucket
+        ):
+            bundle = self._empty_memory_bundle()
+            bundle["trained_prior_bucket"] = trained_prior_bucket
+            return bundle
+        pending_records = [
+            record
+            for record in records
+            if self._record_key(record) not in self._ingested_record_keys
+        ]
+        if pending_records:
+            self._merge_action_stats(
+                action_stats,
+                self._action_stats_from_records(records=pending_records),
+            )
+            self._merge_action_stats(
+                state_stats,
+                self._action_stats_from_records(
+                    records=pending_records,
+                    state_name=state_name,
+                ),
+            )
+            self._merge_action_stats(
+                frame_stats,
+                self._action_stats_from_records(
+                    records=pending_records,
+                    frame_signature=frame_signature,
+                ),
+            )
+            self._merge_action_stats(
+                subgoal_stats,
+                self._action_stats_from_records(
+                    records=pending_records,
+                    subgoal=str(subgoal or ""),
+                ),
+            )
+        basin_action_stats = self._basin_action_stats_from_records(
+            records=records,
+            state_name=state_name,
+            frame_signature=frame_signature,
+        )
+        recent_records = self._recent_records_from_records(
+            records=records,
+            state_name=state_name,
+            frame_signature=frame_signature,
+            subgoal=subgoal,
+        )
+        basin_status = self._fallback_basin_status(
+            records=records,
+            observation=observation,
+            basin_action_stats=basin_action_stats,
+        )
+        suppressed_actions = _derive_suppressed_actions(
+            legal_actions=legal_actions,
+            basin_action_stats=basin_action_stats,
+            state_stats=state_stats,
+            subgoal_stats=subgoal_stats,
+            basin_status=basin_status,
+        )
+        recommended_actions = _derive_recommended_actions(
+            legal_actions=legal_actions,
+            action_stats=action_stats,
+            state_stats=state_stats,
+            basin_action_stats=basin_action_stats,
+            frame_stats=frame_stats,
+            subgoal_stats=subgoal_stats,
+            trained_prior_bucket=trained_prior_bucket,
+            recent_records=recent_records,
+            suppressed_actions=suppressed_actions,
+        )
+        return {
+            "recent_records": recent_records,
+            "basin_status": basin_status,
+            "basin_action_stats": basin_action_stats,
+            "action_stats": action_stats,
+            "state_action_stats": state_stats,
+            "frame_action_stats": frame_stats,
+            "subgoal_action_stats": subgoal_stats,
+            "trained_prior_bucket": trained_prior_bucket,
+            "recommended_actions": recommended_actions,
+            "suppressed_actions": suppressed_actions,
+        }
+
+    def _overlay_records_onto_bundle(
+        self,
+        *,
+        bundle: dict[str, Any],
+        records: list[Any],
+        observation: Observation,
+        subgoal: str | None,
+        legal_actions: list[str],
+    ) -> dict[str, Any]:
+        frame_signature = str(
+            observation.derived_features.get("frame_signature", "") or ""
+        )
+        state_name = str(observation.game_state or "")
+        action_stats = self._clone_action_stats(dict(bundle.get("action_stats", {})))
+        state_stats = self._clone_action_stats(
+            dict(bundle.get("state_action_stats", {}))
+        )
+        frame_stats = self._clone_action_stats(
+            dict(bundle.get("frame_action_stats", {}))
+        )
+        subgoal_stats = self._clone_action_stats(
+            dict(bundle.get("subgoal_action_stats", {}))
+        )
+        basin_action_stats = self._clone_action_stats(
+            dict(bundle.get("basin_action_stats", {}))
+        )
+        self._merge_action_stats(
+            action_stats,
+            self._action_stats_from_records(records=records),
+        )
+        self._merge_action_stats(
+            state_stats,
+            self._action_stats_from_records(
+                records=records,
+                state_name=state_name,
+            ),
+        )
+        self._merge_action_stats(
+            frame_stats,
+            self._action_stats_from_records(
+                records=records,
+                frame_signature=frame_signature,
+            ),
+        )
+        self._merge_action_stats(
+            subgoal_stats,
+            self._action_stats_from_records(
+                records=records,
+                subgoal=str(subgoal or ""),
+            ),
+        )
+        self._merge_action_stats(
+            basin_action_stats,
+            self._basin_action_stats_from_records(
+                records=records,
+                state_name=state_name,
+                frame_signature=frame_signature,
+            ),
+        )
+        recent_records = self._recent_records_from_records(
+            records=[*records, *(bundle.get("recent_records", []) or [])],
+            state_name=state_name,
+            frame_signature=frame_signature,
+            subgoal=subgoal,
+        )
+        basin_status = self._merge_basin_status(
+            base=dict(bundle.get("basin_status", {})),
+            overlay=self._fallback_basin_status(
+                records=records,
+                observation=observation,
+                basin_action_stats=basin_action_stats,
+            ),
+            basin_action_stats=basin_action_stats,
+            observation=observation,
+        )
+        trained_prior_bucket = dict(bundle.get("trained_prior_bucket", {}))
+        suppressed_actions = _derive_suppressed_actions(
+            legal_actions=legal_actions,
+            basin_action_stats=basin_action_stats,
+            state_stats=state_stats,
+            subgoal_stats=subgoal_stats,
+            basin_status=basin_status,
+        )
+        recommended_actions = _derive_recommended_actions(
+            legal_actions=legal_actions,
+            action_stats=action_stats,
+            state_stats=state_stats,
+            basin_action_stats=basin_action_stats,
+            frame_stats=frame_stats,
+            subgoal_stats=subgoal_stats,
+            trained_prior_bucket=trained_prior_bucket,
+            recent_records=recent_records,
+            suppressed_actions=suppressed_actions,
+        )
+        return {
+            "recent_records": recent_records,
+            "basin_status": basin_status,
+            "basin_action_stats": basin_action_stats,
+            "action_stats": action_stats,
+            "state_action_stats": state_stats,
+            "frame_action_stats": frame_stats,
+            "subgoal_action_stats": subgoal_stats,
+            "trained_prior_bucket": trained_prior_bucket,
+            "recommended_actions": recommended_actions,
+            "suppressed_actions": suppressed_actions,
+        }
+
+    def _empty_memory_bundle(self) -> dict[str, Any]:
+        return {
+            "recent_records": [],
+            "basin_status": {},
+            "basin_action_stats": {},
+            "action_stats": {},
+            "state_action_stats": {},
+            "frame_action_stats": {},
+            "subgoal_action_stats": {},
+            "trained_prior_bucket": {},
+            "recommended_actions": [],
+            "suppressed_actions": [],
+        }
+
+    def _clone_action_stats(self, stats: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        cloned: dict[str, dict[str, Any]] = {}
+        for action_name, value in stats.items():
+            if not isinstance(value, dict):
+                continue
+            cloned[str(action_name)] = dict(value)
+        return cloned
+
+    def _merge_action_stats(
+        self,
+        target: dict[str, dict[str, Any]],
+        overlay: dict[str, dict[str, Any]],
+    ) -> None:
+        for action_name, stats in overlay.items():
+            entry = target.setdefault(
+                action_name,
+                {"progress": 0, "failed": 0, "stalled": 0, "total": 0, "last_outcome": None},
+            )
+            entry["progress"] = int(entry.get("progress", 0) or 0) + int(
+                stats.get("progress", 0) or 0
+            )
+            entry["failed"] = int(entry.get("failed", 0) or 0) + int(
+                stats.get("failed", 0) or 0
+            )
+            entry["stalled"] = int(entry.get("stalled", 0) or 0) + int(
+                stats.get("stalled", 0) or 0
+            )
+            entry["total"] = int(entry.get("total", 0) or 0) + int(
+                stats.get("total", 0) or 0
+            )
+            if stats.get("last_outcome") is not None:
+                entry["last_outcome"] = stats.get("last_outcome")
+
+    def _merge_basin_status(
+        self,
+        *,
+        base: dict[str, Any],
+        overlay: dict[str, Any],
+        basin_action_stats: dict[str, dict[str, Any]],
+        observation: Observation,
+    ) -> dict[str, Any]:
+        merged = dict(base)
+        for key in ("visits", "actions_attempted", "progress_events", "failed_events", "stalled_events"):
+            merged[key] = int(base.get(key, 0) or 0) + int(overlay.get(key, 0) or 0)
+        merged["state"] = overlay.get("state") or base.get("state") or str(observation.game_state or "")
+        merged["frame_signature"] = overlay.get("frame_signature") or base.get("frame_signature") or str(
+            observation.derived_features.get("frame_signature", "") or ""
+        )
+        merged["distinct_actions_tried"] = len(basin_action_stats)
+        merged["last_action_name"] = overlay.get("last_action_name") or base.get("last_action_name")
+        merged["last_progress_step"] = overlay.get("last_progress_step")
+        if merged["last_progress_step"] is None:
+            merged["last_progress_step"] = base.get("last_progress_step")
+        merged["action_outcomes"] = basin_action_stats
+        merged["is_exhausted"] = self._fallback_is_basin_exhausted(
+            observation=observation,
+            basin_action_stats=basin_action_stats,
+        )
+        return merged
+
+    def _pending_records_for_game(self, game_id: str) -> list[EpisodeRecord]:
+        pending: list[EpisodeRecord] = []
+        for record in self._unpersisted_records.values():
+            if str(record.game_id or "") == game_id:
+                pending.append(record)
+        return pending
+
+    def _fallback_memory_records(self, memory: Any | None) -> list[Any]:
+        if memory is not None and hasattr(memory, "records"):
+            return list(memory.records)
+        raw_records = self.facts.get("memory", {}).get("records", [])
+        if not isinstance(raw_records, list):
+            return []
+        return raw_records
+
+    def _action_stats_from_records(
+        self,
+        *,
+        records: list[Any],
+        state_name: str | None = None,
+        frame_signature: str | None = None,
+        subgoal: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        stats: dict[str, dict[str, Any]] = {}
+        for record in records:
+            row = self._record_to_recent_record(record)
+            if state_name is not None and str(row.get("prior_game_state") or "") != state_name:
+                continue
+            if frame_signature is not None and str(
+                row.get("prior_frame_signature") or ""
+            ) != frame_signature:
+                continue
+            if subgoal is not None and str(row.get("decision_subgoal") or "") != subgoal:
+                continue
+            action_name = str(row.get("action_name") or "").upper()
+            if not action_name:
+                continue
+            entry = stats.setdefault(
+                action_name,
+                {"progress": 0, "failed": 0, "stalled": 0, "total": 0, "last_outcome": None},
+            )
+            self._apply_context_learning(entry, str(row.get("outcome") or ""))
+        return stats
+
+    def _record_key(self, record: Any) -> tuple[Any, ...]:
+        return (
+            self._record_field(record, "game_id", ""),
+            int(self._record_field(record, "step_index", 0) or 0),
+            self._record_field(record, "action_name", ""),
+            self._record_field(record, "outcome", ""),
+            int(self._record_field(record, "progress_delta", 0) or 0),
+            self._record_field(record, "game_state", ""),
+            self._record_field(record, "prior_game_state", ""),
+            self._record_field(record, "decision_subgoal", None),
+            self._record_field(record, "prior_frame_signature", None),
+        )
+
+    def _record_field(self, record: Any, name: str, default: Any = None) -> Any:
+        if isinstance(record, dict):
+            return record.get(name, default)
+        return getattr(record, name, default)
+
+    def _basin_action_stats_from_records(
+        self,
+        *,
+        records: list[Any],
+        state_name: str,
+        frame_signature: str,
+    ) -> dict[str, dict[str, Any]]:
+        basin_stats: dict[str, dict[str, Any]] = {}
+        for record in records:
+            row = self._record_to_recent_record(record)
+            if str(row.get("prior_game_state") or "") != state_name:
+                continue
+            record_frame_signature = str(row.get("prior_frame_signature") or "")
+            if frame_signature and record_frame_signature != frame_signature:
+                continue
+            action_name = str(row.get("action_name") or "").upper()
+            if not action_name:
+                continue
+            entry = basin_stats.setdefault(
+                action_name,
+                {"progress": 0, "failed": 0, "stalled": 0, "total": 0, "last_outcome": None},
+            )
+            self._apply_context_learning(entry, str(row.get("outcome") or ""))
+        return basin_stats
+
+    def _recent_records_from_records(
+        self,
+        *,
+        records: list[Any],
+        state_name: str,
+        frame_signature: str,
+        subgoal: str | None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        current_subgoal = str(subgoal or "")
+        scored_rows: list[tuple[tuple[int, int, int, int, int], dict[str, Any]]] = []
+        for record in records:
+            row = self._record_to_recent_record(record)
+            prior_state = str(row.get("prior_game_state") or "")
+            prior_frame_signature = str(row.get("prior_frame_signature") or "")
+            record_subgoal = str(row.get("decision_subgoal") or "")
+            exact_basin = (
+                1
+                if state_name
+                and frame_signature
+                and prior_state == state_name
+                and prior_frame_signature == frame_signature
+                else 0
+            )
+            same_state = 1 if state_name and prior_state == state_name else 0
+            same_subgoal = 1 if current_subgoal and record_subgoal == current_subgoal else 0
+            same_frame = 1 if frame_signature and prior_frame_signature == frame_signature else 0
+            scored_rows.append(
+                (
+                    (
+                        exact_basin,
+                        same_state,
+                        same_subgoal,
+                        same_frame,
+                        int(row.get("step_index", 0) or 0),
+                    ),
+                    row,
+                )
+            )
+        scored_rows.sort(key=lambda item: item[0], reverse=True)
+        return [row for _, row in scored_rows[:limit]]
+
+    def _record_to_recent_record(self, record: Any) -> dict[str, Any]:
+        if isinstance(record, dict):
+            return {
+                "game_id": str(record.get("game_id", "")),
+                "step_index": int(record.get("step_index", 0) or 0),
+                "action_name": str(record.get("action_name", "")),
+                "outcome": str(record.get("outcome", "")),
+                "progress_delta": int(record.get("progress_delta", 0) or 0),
+                "game_state": str(
+                    record.get("game_state")
+                    or record.get("next_game_state")
+                    or ""
+                ),
+                "prior_game_state": str(record.get("prior_game_state", "")),
+                "prior_frame_signature": str(record.get("prior_frame_signature", "") or ""),
+                "next_frame_signature": str(record.get("next_frame_signature", "") or ""),
+                "decision_subgoal": str(record.get("decision_subgoal", "") or ""),
+                "decision_source": str(record.get("decision_source", "") or ""),
+                "stagnation_before": int(record.get("stagnation_before", 0) or 0),
+                "stagnation_after": int(record.get("stagnation_after", 0) or 0),
+                "prior_legal_actions": list(record.get("prior_legal_actions", []) or []),
+            }
+        return {
+            "game_id": str(getattr(record, "game_id", "") or ""),
+            "step_index": int(getattr(record, "step_index", 0) or 0),
+            "action_name": str(getattr(record, "action_name", "") or ""),
+            "outcome": str(getattr(record, "outcome", "") or ""),
+            "progress_delta": int(getattr(record, "progress_delta", 0) or 0),
+            "game_state": str(
+                getattr(record, "game_state", "")
+                or getattr(record, "next_game_state", "")
+                or ""
+            ),
+            "prior_game_state": str(getattr(record, "prior_game_state", "") or ""),
+            "prior_frame_signature": str(
+                getattr(record, "prior_frame_signature", "") or ""
+            ),
+            "next_frame_signature": str(
+                getattr(record, "next_frame_signature", "") or ""
+            ),
+            "decision_subgoal": str(getattr(record, "decision_subgoal", "") or ""),
+            "decision_source": str(getattr(record, "decision_source", "") or ""),
+            "stagnation_before": int(getattr(record, "stagnation_before", 0) or 0),
+            "stagnation_after": int(getattr(record, "stagnation_after", 0) or 0),
+            "prior_legal_actions": list(
+                getattr(record, "prior_legal_actions", []) or []
+            ),
+        }
+
+    def _fallback_basin_status(
+        self,
+        *,
+        records: list[Any],
+        observation: Observation,
+        basin_action_stats: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        state_name = str(observation.game_state or "")
+        frame_signature = str(
+            observation.derived_features.get("frame_signature", "") or ""
+        )
+        visits = 0
+        actions_attempted = 0
+        progress_events = 0
+        failed_events = 0
+        stalled_events = 0
+        last_action_name = None
+        last_progress_step = None
+        for record in records:
+            row = self._record_to_recent_record(record)
+            if str(row.get("prior_game_state") or "") != state_name:
+                continue
+            record_frame_signature = str(row.get("prior_frame_signature") or "")
+            if frame_signature and record_frame_signature != frame_signature:
+                continue
+            visits += 1
+            actions_attempted += 1
+            action_name = str(row.get("action_name") or "")
+            if action_name:
+                last_action_name = action_name
+            outcome = str(row.get("outcome") or "")
+            if outcome == "progress":
+                progress_events += 1
+                last_progress_step = int(row.get("step_index", 0) or 0)
+            elif outcome == "failed":
+                failed_events += 1
+            elif outcome == "stalled":
+                stalled_events += 1
+        return {
+            "state": state_name,
+            "frame_signature": frame_signature,
+            "visits": visits,
+            "actions_attempted": actions_attempted,
+            "distinct_actions_tried": len(basin_action_stats),
+            "progress_events": progress_events,
+            "failed_events": failed_events,
+            "stalled_events": stalled_events,
+            "last_action_name": last_action_name,
+            "last_progress_step": last_progress_step,
+            "is_exhausted": self._fallback_is_basin_exhausted(
+                observation=observation,
+                basin_action_stats=basin_action_stats,
+            ),
+            "action_outcomes": basin_action_stats,
+        }
+
+    def _fallback_is_basin_exhausted(
+        self,
+        *,
+        observation: Observation,
+        basin_action_stats: dict[str, dict[str, Any]],
+    ) -> bool:
+        state_name = str(observation.game_state or "")
+        if not state_name:
+            return False
+        legal_actions = [action for action in observation.legal_actions if action != "RESET"]
+        if not legal_actions:
+            return False
+        frame_signature = str(
+            observation.derived_features.get("frame_signature", "") or ""
+        )
+        exhausted_actions = 0
+        for action_name in legal_actions:
+            counts = basin_action_stats.get(action_name, {})
+            if int(counts.get("progress", 0) or 0) > 0:
+                return False
+            failed = int(counts.get("failed", 0) or 0)
+            stalled = int(counts.get("stalled", 0) or 0)
+            if not frame_signature and len(legal_actions) == 1:
+                if failed > 0 or stalled >= 2:
+                    exhausted_actions += 1
+                continue
+            if failed > 0 or stalled > 0:
+                exhausted_actions += 1
+        return exhausted_actions == len(legal_actions)
+
+    def _memory_bundle_as_learned(
+        self,
+        bundle: dict[str, Any],
+        *,
+        subgoal_name: str | None = None,
+    ) -> dict[str, Any]:
+        episode = self.facts.get("episode", {})
+        state_name = str(episode.get("game_state", "") or "")
+        frame_signature = str(episode.get("frame_signature", "") or "")
+        learned = {
+            "actions": dict(bundle.get("action_stats", {})),
+            "states": {},
+            "subgoals": {},
+            "frame_signatures": {},
+            "records_seen": len(bundle.get("recent_records", [])),
+        }
+        if state_name:
+            learned["states"][state_name] = {
+                "actions": dict(bundle.get("state_action_stats", {}))
+            }
+        if frame_signature:
+            learned["frame_signatures"][frame_signature] = {
+                "actions": dict(bundle.get("frame_action_stats", {}))
+            }
+        subgoal_actions = dict(bundle.get("subgoal_action_stats", {}))
+        if subgoal_actions and subgoal_name:
+            learned["subgoals"][subgoal_name] = {"actions": subgoal_actions}
+        return learned
+
     def _lookup_symbolic_prior(self, action_name: str) -> float | None:
         value = self._evaluate_scalar(f"!(symbolic-prior {self._symbol(action_name)})")
         if value is None:
@@ -332,14 +1351,40 @@ class HyperonBridge:
     def _refresh_runtime(self) -> None:
         if not self._ensure_runtime_capability():
             return
+        fact_program = self._build_fact_program()
+        if self.available and self._runtime is not None and self._last_fact_program == fact_program:
+            return
         try:
-            self._runtime = self._create_runtime()
-            self._run_program(self.rules_text)
-            self._run_program(self._build_fact_program())
+            self._prepare_runtime_for_sync(fact_program)
             self.available = True
             self.last_error = None
         except Exception as exc:
             self._disable_runtime(f"failed to initialize Hyperon runtime: {exc}")
+
+    def _prepare_runtime_for_sync(self, fact_program: str) -> None:
+        if self._runtime is None:
+            self._runtime = self._create_runtime()
+            self._run_program(self.rules_text)
+            self._rules_loaded = True
+        elif self._last_fact_program != fact_program and not self._clear_runtime_facts():
+            self._runtime = self._create_runtime()
+            self._run_program(self.rules_text)
+            self._rules_loaded = True
+        self._run_program(fact_program)
+        self._last_fact_program = fact_program
+
+    def _clear_runtime_facts(self) -> bool:
+        if self._runtime is None:
+            return False
+        for method_name in ("clear", "reset", "reset_space"):
+            method = getattr(self._runtime, method_name, None)
+            if callable(method):
+                method()
+                if self.rules_text:
+                    self._run_program(self.rules_text)
+                self._rules_loaded = True
+                return True
+        return False
 
     def _ensure_runtime_capability(self) -> bool:
         if not self.enabled:
@@ -517,6 +1562,8 @@ class HyperonBridge:
     def _disable_runtime(self, message: str) -> None:
         self.available = False
         self._runtime = None
+        self._rules_loaded = False
+        self._last_fact_program = None
         self.last_error = message
 
     def _try_import_hyperon(self) -> Any:
@@ -554,17 +1601,7 @@ class HyperonBridge:
     def _ingest_episode_records(self, records: list[Any]) -> None:
         changed = False
         for record in records:
-            key = (
-                record.game_id,
-                int(record.step_index),
-                record.action_name,
-                record.outcome,
-                int(record.progress_delta),
-                record.game_state,
-                record.prior_game_state,
-                record.decision_subgoal,
-                record.prior_frame_signature,
-            )
+            key = self._record_key(record)
             if key in self._ingested_record_keys:
                 continue
             self._ingested_record_keys.add(key)
@@ -574,9 +1611,17 @@ class HyperonBridge:
             self._persist_learned_knowledge()
 
     def _apply_record_learning(self, record: Any) -> None:
+        game_id = str(self._record_field(record, "game_id", "") or "")
+        action_name = str(self._record_field(record, "action_name", "") or "")
+        outcome_name = str(self._record_field(record, "outcome", "") or "")
+        prior_game_state = str(self._record_field(record, "prior_game_state", "") or "")
+        prior_frame_signature = str(
+            self._record_field(record, "prior_frame_signature", "") or ""
+        )
+        decision_subgoal = str(self._record_field(record, "decision_subgoal", "") or "")
         games = self.learned_knowledge.setdefault("games", {})
         game_entry = games.setdefault(
-            record.game_id,
+            game_id,
             {
                 "actions": {},
                 "states": {},
@@ -587,10 +1632,9 @@ class HyperonBridge:
         )
         game_entry.setdefault("frame_signatures", {})
         action_entry = game_entry["actions"].setdefault(
-            record.action_name,
+            action_name,
             {"progress": 0, "failed": 0, "stalled": 0, "total": 0, "last_outcome": None},
         )
-        outcome_name = str(record.outcome)
         action_entry["total"] = int(action_entry.get("total", 0) or 0) + 1
         if outcome_name == "progress":
             action_entry["progress"] = int(action_entry.get("progress", 0) or 0) + 1
@@ -599,35 +1643,32 @@ class HyperonBridge:
         else:
             action_entry["stalled"] = int(action_entry.get("stalled", 0) or 0) + 1
         action_entry["last_outcome"] = outcome_name
-        state_name = str(record.prior_game_state or "")
-        if state_name:
-            state_entry = game_entry["states"].setdefault(state_name, {"actions": {}})
+        if prior_game_state:
+            state_entry = game_entry["states"].setdefault(prior_game_state, {"actions": {}})
             self._apply_context_learning(
                 state_entry["actions"].setdefault(
-                    record.action_name,
+                    action_name,
                     {"progress": 0, "failed": 0, "stalled": 0, "total": 0, "last_outcome": None},
                 ),
                 outcome_name,
             )
-        frame_signature = str(record.prior_frame_signature or "")
-        if frame_signature:
+        if prior_frame_signature:
             frame_entry = game_entry["frame_signatures"].setdefault(
-                frame_signature,
+                prior_frame_signature,
                 {"actions": {}},
             )
             self._apply_context_learning(
                 frame_entry["actions"].setdefault(
-                    record.action_name,
+                    action_name,
                     {"progress": 0, "failed": 0, "stalled": 0, "total": 0, "last_outcome": None},
                 ),
                 outcome_name,
             )
-        subgoal_name = str(record.decision_subgoal or "")
-        if subgoal_name:
-            subgoal_entry = game_entry["subgoals"].setdefault(subgoal_name, {"actions": {}})
+        if decision_subgoal:
+            subgoal_entry = game_entry["subgoals"].setdefault(decision_subgoal, {"actions": {}})
             self._apply_context_learning(
                 subgoal_entry["actions"].setdefault(
-                    record.action_name,
+                    action_name,
                     {"progress": 0, "failed": 0, "stalled": 0, "total": 0, "last_outcome": None},
                 ),
                 outcome_name,

@@ -9,9 +9,18 @@ from .types import ActionDecision, EpisodeRecord, Observation
 class EpisodicMemory:
     """Tracks recent transitions and lightweight action statistics."""
 
-    def __init__(self, history_limit: int = 64) -> None:
+    def __init__(
+        self,
+        history_limit: int = 64,
+        *,
+        win_state_name: str = "WIN",
+        reset_state_names: tuple[str, ...] = ("NOT_PLAYED", "GAME_OVER"),
+    ) -> None:
         self.history_limit = history_limit
+        self._win_state_name = str(win_state_name or "").upper()
+        self._reset_state_names = {str(name or "").upper() for name in reset_state_names}
         self._records: deque[EpisodeRecord] = deque(maxlen=history_limit)
+        self._new_records: deque[EpisodeRecord] = deque()
         self._recent_actions: deque[str] = deque(maxlen=16)
         self._success_counts: defaultdict[str, int] = defaultdict(int)
         self._failure_streaks: defaultdict[str, int] = defaultdict(int)
@@ -25,6 +34,7 @@ class EpisodicMemory:
         if game_id != self._game_id:
             self._game_id = game_id
             self._records.clear()
+            self._new_records.clear()
             self._recent_actions.clear()
             self._success_counts.clear()
             self._failure_streaks.clear()
@@ -64,6 +74,11 @@ class EpisodicMemory:
     def recent_actions(self) -> list[str]:
         return list(self._recent_actions)
 
+    def drain_new_records(self) -> list[EpisodeRecord]:
+        drained = list(self._new_records)
+        self._new_records.clear()
+        return drained
+
     def most_recent_action(self) -> str | None:
         if not self._recent_actions:
             return None
@@ -94,6 +109,95 @@ class EpisodicMemory:
     def success_bonus(self, action_name: str) -> float:
         return min(0.15, self._success_counts.get(action_name, 0) * 0.03)
 
+    def context_stall_penalty(
+        self,
+        action_name: str,
+        *,
+        state_name: str,
+        frame_signature: str | None,
+    ) -> float:
+        if not state_name:
+            return 0.0
+        stalled_hits = 0
+        failed_hits = 0
+        progress_hits = 0
+        for record in reversed(self._records):
+            if record.action_name != action_name:
+                continue
+            if record.prior_game_state != state_name:
+                continue
+            if frame_signature and record.prior_frame_signature != frame_signature:
+                continue
+            if record.outcome == "progress":
+                progress_hits += 1
+            elif record.outcome == "failed":
+                failed_hits += 1
+            elif record.outcome == "stalled":
+                stalled_hits += 1
+        if progress_hits > 0:
+            return 0.0
+        if failed_hits >= 1:
+            return min(0.30, 0.18 + (failed_hits - 1) * 0.06)
+        if stalled_hits >= 3:
+            return 0.24
+        if stalled_hits >= 2:
+            return 0.16
+        return 0.0
+
+    def context_outcome_counts(
+        self,
+        action_name: str,
+        *,
+        state_name: str,
+        frame_signature: str | None,
+    ) -> dict[str, int]:
+        counts = {"progress": 0, "failed": 0, "stalled": 0, "total": 0}
+        if not state_name:
+            return counts
+        for record in reversed(self._records):
+            if record.action_name != action_name:
+                continue
+            if record.prior_game_state != state_name:
+                continue
+            if frame_signature and record.prior_frame_signature != frame_signature:
+                continue
+            counts["total"] += 1
+            if record.outcome in counts:
+                counts[record.outcome] += 1
+        return counts
+
+    def current_basin_key(self, observation: Observation) -> tuple[str, str] | None:
+        state_name = str(observation.game_state or "")
+        frame_signature = str(observation.derived_features.get("frame_signature", "") or "")
+        if not state_name or not frame_signature:
+            return None
+        return state_name, frame_signature
+
+    def is_basin_exhausted(self, observation: Observation) -> bool:
+        state_name = str(observation.game_state or "")
+        frame_signature = str(observation.derived_features.get("frame_signature", "") or "")
+        if not state_name:
+            return False
+        legal_actions = [action for action in observation.legal_actions if action != "RESET"]
+        if not legal_actions:
+            return False
+        exhausted_actions = 0
+        for action_name in legal_actions:
+            counts = self.context_outcome_counts(
+                action_name,
+                state_name=state_name,
+                frame_signature=frame_signature,
+            )
+            if counts["progress"] > 0:
+                return False
+            if not frame_signature and len(legal_actions) == 1:
+                if counts["failed"] > 0 or counts["stalled"] >= 2:
+                    exhausted_actions += 1
+                continue
+            if counts["failed"] > 0 or counts["stalled"] > 0:
+                exhausted_actions += 1
+        return exhausted_actions == len(legal_actions)
+
     def summarize_for_hyperon(self) -> dict[str, object]:
         return {
             "recent_actions": self.recent_actions(),
@@ -110,12 +214,13 @@ class EpisodicMemory:
         if previous is None or decision is None:
             return
         progress_delta = current_observation.levels_completed - previous.levels_completed
-        if current_observation.game_state == "WIN" or progress_delta > 0:
+        stagnation_before = self._stagnation_steps
+        if current_observation.game_state == self._win_state_name or progress_delta > 0:
             outcome = "progress"
             self._success_counts[decision.action_name] += 1
             self._failure_streaks[decision.action_name] = 0
             self._stagnation_steps = 0
-        elif current_observation.game_state == "GAME_OVER":
+        elif current_observation.game_state in self._reset_state_names:
             outcome = "failed"
             self._failure_streaks[decision.action_name] += 1
             self._stagnation_steps += 1
@@ -123,22 +228,30 @@ class EpisodicMemory:
             outcome = "stalled"
             self._failure_streaks[decision.action_name] += 1
             self._stagnation_steps += 1
-        self._records.append(
-            EpisodeRecord(
-                game_id=current_observation.game_id,
-                step_index=current_observation.step_index,
-                action_name=decision.action_name,
-                outcome=outcome,
-                progress_delta=progress_delta,
-                game_state=current_observation.game_state,
-                prior_game_state=previous.game_state,
-                levels_completed=current_observation.levels_completed,
-                prior_frame_signature=str(
-                    previous.derived_features.get("frame_signature", "") or ""
-                )
-                or None,
-                decision_subgoal=decision.subgoal,
-                decision_source=decision.source,
+        record = EpisodeRecord(
+            game_id=current_observation.game_id,
+            step_index=current_observation.step_index,
+            action_name=decision.action_name,
+            outcome=outcome,
+            progress_delta=progress_delta,
+            game_state=current_observation.game_state,
+            prior_game_state=previous.game_state,
+            levels_completed=current_observation.levels_completed,
+            prior_frame_signature=str(
+                previous.derived_features.get("frame_signature", "") or ""
             )
+            or None,
+            next_game_state=current_observation.game_state,
+            next_frame_signature=str(
+                current_observation.derived_features.get("frame_signature", "") or ""
+            )
+            or None,
+            prior_legal_actions=list(previous.legal_actions),
+            stagnation_before=stagnation_before,
+            stagnation_after=self._stagnation_steps,
+            decision_subgoal=decision.subgoal,
+            decision_source=decision.source,
         )
+        self._records.append(record)
+        self._new_records.append(record)
         self._pending_decision = None

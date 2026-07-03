@@ -14,9 +14,11 @@ class ArcAdapter:
         game_action_cls: Any,
         default_game_id: str = "",
         deterministic_action: str = "ACTION1",
+        reset_state_names: tuple[str, ...] = ("NOT_PLAYED", "GAME_OVER"),
     ) -> None:
         self._game_action_cls = game_action_cls
         self._game_id = default_game_id
+        self._reset_state_names = {str(name or "").upper() for name in reset_state_names}
         self._default_legal_actions = self._discover_default_actions()
         if deterministic_action in self._default_legal_actions:
             self._deterministic_action = deterministic_action
@@ -30,10 +32,11 @@ class ArcAdapter:
 
     def observe(self, frames: list[Any], latest_frame: Any) -> Observation:
         game_state = self._normalize_name(self._get_attr(latest_frame, "state"))
-        legal_actions = self._extract_legal_actions(latest_frame, game_state)
+        legal_actions, legal_actions_known = self._extract_legal_actions(latest_frame, game_state)
+        step_index, step_index_reliable = self._extract_step_index(frames, latest_frame)
         return Observation(
             game_id=self._game_id or str(self._get_attr(latest_frame, "game_id", "")),
-            step_index=max(len(frames) - 1, 0),
+            step_index=step_index,
             game_state=game_state,
             levels_completed=int(
                 self._get_attr(latest_frame, "levels_completed", "level", default=0) or 0
@@ -46,6 +49,8 @@ class ArcAdapter:
             derived_features={
                 "frame_count": len(frames),
                 "legal_actions": list(legal_actions),
+                "legal_actions_known": legal_actions_known,
+                "step_index_reliable": step_index_reliable,
                 "frame_signature": runtime_frame_signature(latest_frame),
             },
         )
@@ -54,14 +59,14 @@ class ArcAdapter:
         return list(observation.legal_actions)
 
     def fallback_action_name(self, observation: Observation) -> str:
-        if observation.game_state in {"NOT_PLAYED", "GAME_OVER"}:
+        if observation.game_state in self._reset_state_names:
             return "RESET"
         legal_actions = [name for name in observation.legal_actions if name != "RESET"]
         if legal_actions:
             if self._deterministic_action in legal_actions:
                 return self._deterministic_action
             return legal_actions[0]
-        return "RESET"
+        return self._deterministic_action
 
     def fallback_decision(self, observation: Observation) -> ActionDecision:
         action_name = self.fallback_action_name(observation)
@@ -70,9 +75,12 @@ class ArcAdapter:
             source="fallback",
             confidence=0.05,
             reason="deterministic adapter fallback",
-            metadata=self._default_metadata_for(action_name),
+            metadata=self.default_metadata_for_action(action_name),
             used_fallback=True,
         )
+
+    def default_metadata_for_action(self, action_name: str) -> dict[str, Any]:
+        return self._default_metadata_for(action_name)
 
     def to_game_action(self, decision: ActionDecision) -> Any:
         action_name = (decision.action_name or "RESET").upper()
@@ -123,13 +131,23 @@ class ArcAdapter:
             return {"x": 32, "y": 32}
         return {}
 
-    def _extract_legal_actions(self, latest_frame: Any, game_state: str) -> list[str]:
+    def _extract_legal_actions(self, latest_frame: Any, game_state: str) -> tuple[list[str], bool]:
         explicit = self._extract_explicit_actions(latest_frame)
         if explicit:
-            return explicit
-        if game_state in {"NOT_PLAYED", "GAME_OVER"}:
-            return ["RESET"]
-        return list(self._default_legal_actions)
+            return explicit, True
+        if game_state in self._reset_state_names:
+            return ["RESET"], True
+        return [], False
+
+    def _extract_step_index(self, frames: list[Any], latest_frame: Any) -> tuple[int, bool]:
+        for name in ("step_index", "step", "turn_index", "turn", "frame_index"):
+            value = getattr(latest_frame, name, None)
+            try:
+                if value is not None:
+                    return int(value), True
+            except (TypeError, ValueError):
+                continue
+        return max(len(frames) - 1, 0), False
 
     def _extract_explicit_actions(self, latest_frame: Any) -> list[str]:
         for name in ("legal_actions", "available_actions", "valid_actions", "actions"):
