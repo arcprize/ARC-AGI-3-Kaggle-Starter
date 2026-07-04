@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib
-import json
+import re
 from pathlib import Path
 from typing import Any
+
+from .json_utils import coerce_json_dict
 
 
 class LlamaCppBackend:
@@ -57,7 +59,14 @@ class LlamaCppBackend:
                     temperature=temperature,
                 )
                 text = response["choices"][0]["text"]
-            return self._coerce_json(text)
+            payload = self._coerce_json(text)
+            if payload is None:
+                payload = self._coerce_plain_action_response(text)
+            if payload is None:
+                self.last_error = self._invalid_json_error(text)
+            else:
+                self.last_error = None
+            return payload
         except Exception as exc:
             self.last_error = repr(exc)
             return None
@@ -231,7 +240,14 @@ class LlamaCppBackend:
             input_length = inputs["input_ids"].shape[-1]
             generated_tokens = output[0][input_length:]
             text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            return self._coerce_json(text)
+            payload = self._coerce_json(text)
+            if payload is None:
+                payload = self._coerce_plain_action_response(text)
+            if payload is None:
+                self.last_error = self._invalid_json_error(text)
+            else:
+                self.last_error = None
+            return payload
         except Exception:
             self._clear_cuda_cache()
             raise
@@ -274,46 +290,38 @@ class LlamaCppBackend:
             return
 
     def _coerce_json(self, text: str) -> dict[str, Any] | None:
-        text = text.strip()
-        if not text:
-            return None
-        if text.startswith("```"):
-            stripped_lines = [
-                line
-                for line in text.splitlines()
-                if not line.strip().startswith("```")
-            ]
-            text = "\n".join(stripped_lines).strip()
-            if not text:
-                return None
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            repaired = self._repair_json_fragment(text)
-            if repaired is not None:
-                try:
-                    return json.loads(repaired)
-                except json.JSONDecodeError:
-                    pass
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                return None
-            try:
-                return json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                return None
+        return coerce_json_dict(text)
 
     def _repair_json_fragment(self, text: str) -> str | None:
-        candidate = text.strip()
-        if not candidate or "{" not in candidate:
+        from .json_utils import repair_json_fragment
+
+        return repair_json_fragment(text)
+
+    def _invalid_json_error(self, text: str) -> str:
+        snippet = " ".join(str(text or "").split())
+        if len(snippet) > 160:
+            snippet = f"{snippet[:157]}..."
+        if not snippet:
+            return "response did not contain a valid JSON object"
+        return f"response did not contain a valid JSON object: {snippet}"
+
+    def _coerce_plain_action_response(self, text: str) -> dict[str, Any] | None:
+        normalized = str(text or "").strip().upper()
+        if not normalized:
             return None
-        open_braces = candidate.count("{")
-        close_braces = candidate.count("}")
-        open_brackets = candidate.count("[")
-        close_brackets = candidate.count("]")
-        if close_brackets < open_brackets:
-            candidate += "]" * (open_brackets - close_brackets)
-        if close_braces < open_braces:
-            candidate += "}" * (open_braces - close_braces)
-        return candidate
+        match = re.search(r"ACTION(?:ACTION)?([1-9][0-9]*)\b", normalized)
+        if match is None:
+            return None
+        action_name = f"ACTION{match.group(1)}"
+        return {
+            "subgoal": "replan",
+            "confidence": 0.35,
+            "reason": "salvaged plain action response",
+            "action_candidates": [
+                {
+                    "action": action_name,
+                    "confidence": 0.35,
+                    "reason": "salvaged plain action response",
+                }
+            ],
+        }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from agi_core.image_input import board_probe_click_target, default_click_target, preferred_board_probe_action
 from agi_core.types import ActionProposal, ExecutiveContext
 
 
@@ -28,12 +29,23 @@ class ReactiveSpecialist:
             if not bool(observation.derived_features.get("legal_actions_known", True)):
                 return proposals
             fallback = context.adapter.fallback_action_name(observation)
+            metadata = {}
+            if hasattr(context.adapter, "default_metadata_for_action"):
+                metadata = dict(context.adapter.default_metadata_for_action(fallback) or {})
+            if fallback == "ACTION6" and observation.image_input is not None:
+                metadata = self._board_probe_metadata(context)
             proposals.append(
                 ActionProposal(
                     action_name=fallback,
                     source=self.source,
                     confidence=0.20,
                     reason="no explicit legal actions reported",
+                    subgoal=self._subgoal_for_action(
+                        observation.image_input,
+                        fallback,
+                        default="maintain-control-loop",
+                    ),
+                    metadata=metadata,
                 )
             )
             return proposals
@@ -52,6 +64,11 @@ class ReactiveSpecialist:
         if context.memory.stagnation_steps >= 2:
             ranked_actions = self._rank_stall_break_actions(context, observation.legal_actions)
             for index, action_name in enumerate(ranked_actions[:3]):
+                metadata = {}
+                if hasattr(context.adapter, "default_metadata_for_action"):
+                    metadata = dict(context.adapter.default_metadata_for_action(action_name) or {})
+                if action_name == "ACTION6" and observation.image_input is not None:
+                    metadata = self._board_probe_metadata(context)
                 proposals.append(
                     ActionProposal(
                         action_name=action_name,
@@ -61,7 +78,12 @@ class ReactiveSpecialist:
                             index,
                         ),
                         reason="reactive stall breaker",
-                        subgoal="break-stall",
+                        subgoal=self._subgoal_for_action(
+                            observation.image_input,
+                            action_name,
+                            default="break-stall",
+                        ),
+                        metadata=metadata,
                     )
                 )
             if proposals:
@@ -74,13 +96,19 @@ class ReactiveSpecialist:
         metadata = {}
         if hasattr(context.adapter, "default_metadata_for_action"):
             metadata = dict(context.adapter.default_metadata_for_action(fallback) or {})
+        if fallback == "ACTION6" and observation.image_input is not None:
+            metadata = self._board_probe_metadata(context)
         proposals.append(
             ActionProposal(
                 action_name=fallback,
                 source=self.source,
                 confidence=0.40,
                 reason="deterministic reactive baseline",
-                subgoal="maintain-control-loop",
+                subgoal=self._subgoal_for_action(
+                    observation.image_input,
+                    fallback,
+                    default="maintain-control-loop",
+                ),
                 metadata=metadata,
             )
         )
@@ -92,7 +120,11 @@ class ReactiveSpecialist:
         legal_actions: Iterable[str],
     ) -> list[str]:
         observation = context.observation
-        frame_signature = str(observation.derived_features.get("frame_signature", "") or "")
+        frame_signature = ""
+        if observation.image_input is not None:
+            frame_signature = str(observation.image_input.frame_signature or "")
+        if not frame_signature:
+            frame_signature = str(observation.derived_features.get("frame_signature", "") or "")
         recent_actions = context.memory.recent_actions()
         most_recent = recent_actions[-1] if recent_actions else None
         recommended_actions: list[str] = []
@@ -100,7 +132,12 @@ class ReactiveSpecialist:
         if context.memory_bundle is not None:
             recommended_actions = list(context.memory_bundle.recommended_actions or [])
             suppressed_actions = set(context.memory_bundle.suppressed_actions or [])
-        blocked: list[tuple[tuple[int, int, float, float, float, int, str], str]] = []
+        board_probe_action = preferred_board_probe_action(
+            legal_actions,
+            observation.image_input,
+            suppressed_actions=suppressed_actions,
+        )
+        blocked: list[tuple[tuple[int, int, int, float, float, float, int, str], str]] = []
         for index, action_name in enumerate(legal_actions):
             if action_name == "RESET" or action_name == most_recent:
                 continue
@@ -118,11 +155,13 @@ class ReactiveSpecialist:
                 if action_name in recommended_actions
                 else len(recommended_actions) + 1
             )
+            board_probe_penalty = 0 if action_name == board_probe_action else 1
             blocked.append(
                 (
                     (
                         suppressed_penalty,
                         recommendation_bonus,
+                        board_probe_penalty,
                         context_penalty,
                         repeat_penalty,
                         loop_penalty,
@@ -159,15 +198,32 @@ class ReactiveSpecialist:
             metadata = {}
             if hasattr(context.adapter, "default_metadata_for_action"):
                 metadata = dict(context.adapter.default_metadata_for_action(action_name) or {})
+            if action_name == "ACTION6" and context.observation.image_input is not None:
+                metadata = self._board_probe_metadata(context)
             return ActionProposal(
                 action_name=action_name,
                 source=self.source,
                 confidence=0.46,
                 reason="memory-informed reactive baseline",
-                subgoal="reuse-known-good-action",
+                subgoal=self._subgoal_for_action(
+                    context.observation.image_input,
+                    action_name,
+                    default="reuse-known-good-action",
+                ),
                 metadata=metadata,
             )
         return None
+
+    def _subgoal_for_action(
+        self,
+        image_input,
+        action_name: str,
+        *,
+        default: str,
+    ) -> str:
+        if action_name == "ACTION6" and image_input is not None:
+            return "inspect-active-board"
+        return default
 
     def _stall_break_confidence(
         self,
@@ -176,6 +232,21 @@ class ReactiveSpecialist:
     ) -> float:
         stagnation_decay = min(0.30, max(0, stagnation_steps - 2) * 0.03)
         return max(0.18, 0.55 - stagnation_decay - (proposal_index * 0.05))
+
+    def _board_probe_metadata(self, context: ExecutiveContext) -> dict[str, int]:
+        image_input = context.observation.image_input
+        if image_input is None:
+            return default_click_target(image_input)
+        frame_signature = str(
+            context.observation.derived_features.get("frame_signature", "") or ""
+        ) or None
+        counts = context.memory.context_outcome_counts(
+            "ACTION6",
+            state_name=context.observation.game_state,
+            frame_signature=frame_signature,
+        )
+        attempt_index = int(counts.get("failed", 0) or 0) + int(counts.get("stalled", 0) or 0)
+        return board_probe_click_target(image_input, attempt_index=attempt_index)
 
     def _deterministic_baseline_action(
         self,
@@ -187,6 +258,13 @@ class ReactiveSpecialist:
         suppressed = set()
         if context.memory_bundle is not None:
             suppressed = set(context.memory_bundle.suppressed_actions or [])
+        board_probe_action = preferred_board_probe_action(
+            legal,
+            context.observation.image_input,
+            suppressed_actions=suppressed,
+        )
+        if board_probe_action is not None:
+            return board_probe_action
         if adapter_choice in legal and adapter_choice not in suppressed:
             return adapter_choice
         for action_name in legal:
@@ -214,7 +292,11 @@ class ReactiveSpecialist:
                 action_name in suppressed_actions for action_name in candidate_actions
             ):
                 return True
-        frame_signature = str(observation.derived_features.get("frame_signature", "") or "")
+        frame_signature = ""
+        if observation.image_input is not None:
+            frame_signature = str(observation.image_input.frame_signature or "")
+        if not frame_signature:
+            frame_signature = str(observation.derived_features.get("frame_signature", "") or "")
         if not frame_signature:
             return False
         exhausted = 0

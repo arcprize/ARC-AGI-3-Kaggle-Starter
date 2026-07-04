@@ -2,6 +2,7 @@
 
 from .config import RuntimeConfig
 from .executive import Executive, ExecutiveRuntime
+from .image_input import BoardImageInput
 from .memory import EpisodicMemory
 from .types import (
     ActionDecision,
@@ -14,6 +15,7 @@ from .types import (
 __all__ = [
     "ActionDecision",
     "ActionProposal",
+    "BoardImageInput",
     "EpisodicMemory",
     "Executive",
     "ExecutiveContext",

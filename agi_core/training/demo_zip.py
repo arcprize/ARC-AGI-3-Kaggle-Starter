@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import zipfile
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from functools import lru_cache
@@ -12,6 +14,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from agi_core.config import RuntimeConfig
+from agi_core.image_input import (
+    BoardImageInput,
+    board_image_input_from_source,
+    compute_board_signature,
+    extract_board_image_input,
+    normalize_visible_board,
+)
 from agi_core.storage import (
     initialize_memory_schema,
     record_transitions,
@@ -43,6 +52,7 @@ class TrainingStep:
     win_levels: int
     full_reset: bool
     frame_signature: str | None
+    image_input: BoardImageInput | None = None
 
 
 def _win_state_name() -> str:
@@ -97,38 +107,21 @@ def normalize_action_id(action_id: Any) -> int | None:
 
 
 def latest_visible_board(frame: Any) -> Any:
-    if not isinstance(frame, list) or not frame:
-        return None
-    candidate = frame[-1]
-    if not isinstance(candidate, list) or not candidate:
-        return None
-    if not isinstance(candidate[0], list):
-        return None
-    return candidate
+    return normalize_visible_board(frame)
 
 
 def compute_frame_signature(frame: Any) -> str | None:
-    board = latest_visible_board(frame)
-    if board is None:
+    image_input = board_image_input_from_source(frame, source_attr="frame")
+    if image_input is None:
         return None
-    height = len(board)
-    width = len(board[0]) if board[0] else 0
-    payload = json.dumps(
-        {"height": height, "width": width, "board": board},
-        separators=(",", ":"),
-    )
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    return image_input.frame_signature
 
 
 def runtime_frame_signature(raw_frame_ref: Any) -> str | None:
-    if raw_frame_ref is None:
+    image_input = extract_board_image_input(raw_frame_ref)
+    if image_input is None:
         return None
-    for attribute in ("frame", "frames", "board", "grid"):
-        value = getattr(raw_frame_ref, attribute, None)
-        signature = compute_frame_signature(value)
-        if signature is not None:
-            return signature
-    return None
+    return image_input.frame_signature
 
 
 def iter_recordings(zip_path: str | Path) -> Iterator[RecordingMeta]:
@@ -174,6 +167,7 @@ def iter_steps(zip_path: str | Path, recording_name: str) -> Iterator[TrainingSt
                     if action_name is not None
                 ]
                 frame = data.get("frame")
+                image_input = board_image_input_from_source(frame, source_attr="frame")
                 yield TrainingStep(
                     game_id=str(data.get("game_id", "")),
                     recording_guid=str(data.get("guid", "")),
@@ -188,7 +182,8 @@ def iter_steps(zip_path: str | Path, recording_name: str) -> Iterator[TrainingSt
                     state=str(data.get("state", "")),
                     win_levels=int(data.get("win_levels", 0) or 0),
                     full_reset=bool(data.get("full_reset", False)),
-                    frame_signature=compute_frame_signature(frame),
+                    frame_signature=image_input.frame_signature if image_input is not None else None,
+                    image_input=image_input,
                 )
 
 
@@ -198,7 +193,7 @@ def build_action_prior_artifact(
     games: set[str] | None = None,
     limit_recordings: int | None = None,
     workers: int = 1,
-) -> dict[str, Any]:
+    ) -> dict[str, Any]:
     archive_path = Path(zip_path)
     wanted_games = {game.strip() for game in games or set() if game.strip()}
     artifact: dict[str, Any] = {
@@ -224,9 +219,8 @@ def build_action_prior_artifact(
         memory_records.extend(payload.get("memory_records", []))
     if output_path is not None:
         destination = Path(output_path)
-        if destination.exists():
-            destination.unlink()
         initialize_memory_schema(destination)
+        _reset_output_database(destination)
         for game_id, game_entry in sorted(artifact["games"].items()):
             training_rows.extend(
                 _count_rows_for_game(
@@ -249,6 +243,21 @@ def build_action_prior_artifact(
             },
         )
     return artifact
+
+
+def _reset_output_database(db_path: str | Path) -> None:
+    with closing(sqlite3.connect(Path(db_path))) as connection:
+        connection.execute("DELETE FROM game_action_priors")
+        connection.execute("DELETE FROM state_action_priors")
+        connection.execute("DELETE FROM frame_action_priors")
+        connection.execute("DELETE FROM live_episode_records")
+        connection.execute("DELETE FROM live_action_stats")
+        connection.execute("DELETE FROM live_state_action_stats")
+        connection.execute("DELETE FROM live_frame_action_stats")
+        connection.execute("DELETE FROM live_subgoal_action_stats")
+        connection.execute("DELETE FROM live_basin_stats")
+        connection.execute("DELETE FROM metadata")
+        connection.commit()
 
 
 def _increment_count(bucket: dict[str, int], action_name: str) -> None:

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from agi_core.image_input import (
+    active_cell_count,
+    canonical_click_target_bonus,
+    click_target_bias,
+)
 from agi_core.types import ActionProposal, ExecutiveContext
 
 
@@ -10,9 +15,13 @@ class ProposalCritic:
         proposals: list[ActionProposal],
     ) -> list[ActionProposal]:
         legal_actions = set(context.observation.legal_actions)
-        frame_signature = str(
-            context.observation.derived_features.get("frame_signature", "") or ""
-        )
+        frame_signature = ""
+        if context.observation.image_input is not None:
+            frame_signature = str(context.observation.image_input.frame_signature or "")
+        if not frame_signature:
+            frame_signature = str(
+                context.observation.derived_features.get("frame_signature", "") or ""
+            )
         bundle_cache: dict[str, object] = {}
         rescored: list[ActionProposal] = []
         for proposal in proposals:
@@ -92,11 +101,47 @@ class ProposalCritic:
                     score -= 0.45
                 elif proposal.source == "llm":
                     score += 0.20
+            if (
+                proposal.action_name != "RESET"
+                and context.memory.stagnation_steps >= 4
+                and (context.replan_mode or context.force_llm_replan)
+            ):
+                if proposal.source == "symbolic":
+                    score -= 0.18
+                elif proposal.source == "llm":
+                    score += 0.12
+            if proposal.action_name != "RESET" and context.probe_dead_end_replan:
+                if proposal.source == "symbolic":
+                    score -= 0.30
+                elif proposal.source == "llm":
+                    score += 0.22
+            if proposal.action_name == "ACTION6":
+                score += click_target_bias(
+                    context.observation.image_input,
+                    proposal.metadata,
+                )
+                score += canonical_click_target_bonus(
+                    context.observation.image_input,
+                    proposal.metadata,
+                )
+                score += self._board_probe_bonus(
+                    context,
+                    proposal.metadata,
+                )
+                score += self._board_probe_subgoal_bonus(
+                    proposal.subgoal,
+                    context,
+                    proposal.metadata,
+                )
+                score += self._opening_board_probe_bonus(proposal.subgoal, context)
+                score += self._recent_board_probe_continuity_bonus(context)
+                score -= self._repeated_board_probe_exit_penalty(context)
             proposal.score = round(max(-1.0, min(score, 1.50)), 4)
             rescored.append(proposal)
         rescored.sort(
             key=lambda proposal: (
                 proposal.score,
+                self._proposal_tiebreak_priority(context, proposal),
                 proposal.confidence,
                 context.config.source_bias.get(proposal.source, 0.0),
             ),
@@ -165,3 +210,88 @@ class ProposalCritic:
         positive = min(positive_cap, progress * success_scale)
         negative = min(negative_cap, (failed * failed_scale) + (stalled * stalled_scale))
         return positive - negative
+
+    def _board_probe_bonus(
+        self,
+        context: ExecutiveContext,
+        metadata: dict[str, object] | None,
+    ) -> float:
+        if active_cell_count(context.observation.image_input) <= 0:
+            return 0.0
+        if click_target_bias(context.observation.image_input, metadata) <= 0:
+            return 0.0
+        return 0.08
+
+    def _board_probe_subgoal_bonus(
+        self,
+        subgoal: str | None,
+        context: ExecutiveContext,
+        metadata: dict[str, object] | None,
+    ) -> float:
+        if str(subgoal or "") != "inspect-active-board":
+            return 0.0
+        if active_cell_count(context.observation.image_input) <= 0:
+            return 0.0
+        if click_target_bias(context.observation.image_input, metadata) <= 0:
+            return 0.0
+        return 0.04
+
+    def _opening_board_probe_bonus(
+        self,
+        subgoal: str | None,
+        context: ExecutiveContext,
+    ) -> float:
+        if str(subgoal or "") != "inspect-active-board":
+            return 0.0
+        if active_cell_count(context.observation.image_input) <= 0:
+            return 0.0
+        if context.memory.most_recent_action() is not None:
+            return 0.0
+        if int(context.observation.step_index) > 0:
+            return 0.0
+        return 0.05
+
+    def _proposal_tiebreak_priority(
+        self,
+        context: ExecutiveContext,
+        proposal: ActionProposal,
+    ) -> int:
+        if (
+            proposal.action_name == "ACTION6"
+            and active_cell_count(context.observation.image_input) > 0
+        ):
+            if str(proposal.subgoal or "") == "inspect-active-board":
+                return 2
+            return 1
+        return 0
+
+    def _recent_board_probe_continuity_bonus(
+        self,
+        context: ExecutiveContext,
+    ) -> float:
+        if active_cell_count(context.observation.image_input) <= 0:
+            return 0.0
+        if context.memory.stagnation_steps > 1:
+            return 0.0
+        if context.memory.most_recent_action() != "ACTION6":
+            return 0.0
+        return 0.18
+
+    def _repeated_board_probe_exit_penalty(
+        self,
+        context: ExecutiveContext,
+    ) -> float:
+        if active_cell_count(context.observation.image_input) <= 0:
+            return 0.0
+        if context.memory.stagnation_steps < 2:
+            return 0.0
+        recent_actions = [
+            action_name
+            for action_name in context.memory.recent_actions()[-2:]
+            if action_name
+        ]
+        if len(recent_actions) < 2:
+            return 0.0
+        if recent_actions[-2:] != ["ACTION6", "ACTION6"]:
+            return 0.0
+        return 0.28

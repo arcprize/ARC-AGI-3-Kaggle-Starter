@@ -25,6 +25,10 @@ editor and a notebook.
 
 That's it. No GPU required for the starter agent.
 
+If you want to use the OpenAI-backed LLM path, `make setup` now also installs
+the official `openai` Python library and stages its wheel set into
+`third_party/wheels/` so the generated Kaggle notebook can install it offline.
+
 ---
 
 ## Quick start
@@ -171,6 +175,38 @@ already the default in this kit.
 | `make submit` | Build the notebook **and** push it to Kaggle |
 | `make status` | Check the status of your most recent Kaggle run |
 | `make clean` | Remove the venv, downloads, and generated notebook |
+
+---
+
+## Optional: OpenAI LLM backend
+
+The executive runtime now supports two explicit LLM providers:
+
+- `local` (default): existing GGUF / Transformers local backend
+- `openai`: OpenAI Responses API via the official `openai` Python package
+
+To enable the OpenAI provider locally, set:
+
+```bash
+export AGI_LLM_PROVIDER=openai
+export OPENAI_API_KEY=your_api_key_here
+export AGI_OPENAI_MODEL=gpt-4.1-mini
+```
+
+Optional transport overrides:
+
+```bash
+export AGI_OPENAI_BASE_URL=https://api.openai.com/v1
+export AGI_OPENAI_TIMEOUT_SECONDS=30
+```
+
+Notes:
+
+- `make setup` installs `openai` into the local venv and downloads the wheel
+  set into `third_party/wheels/`.
+- `make submit` bundles wheels from `third_party/wheels/` into the generated
+  notebook runtime so Kaggle's offline execution can still import `openai`.
+- If `AGI_LLM_PROVIDER` is unset, the repo stays on the existing local backend.
 
 ---
 

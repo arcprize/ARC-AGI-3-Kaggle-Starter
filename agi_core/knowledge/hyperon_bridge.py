@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agi_core.config import DEFAULT_RESET_STATE_NAMES, DEFAULT_WIN_STATE_NAME
+from agi_core.image_input import (
+    active_cell_count,
+    board_context_match_score,
+    board_context_summary,
+    default_click_target,
+)
 from agi_core.storage import (
     import_legacy_learning_json,
     initialize_memory_schema,
@@ -95,6 +101,21 @@ class HyperonBridge:
             memory=memory,
         )
         self._current_memory_bundle = MemoryBundle(**bundle)
+        image_input = observation.image_input
+        board_active_cells = int(
+            observation.derived_features.get("board_active_cells", active_cell_count(image_input)) or 0
+        )
+        board_default_probe = dict(
+            observation.derived_features.get(
+                "board_default_probe",
+                default_click_target(image_input) if image_input is not None else {},
+            )
+            or {}
+        )
+        board_source_attr = observation.derived_features.get(
+            "board_source_attr",
+            image_input.source_attr if image_input is not None else None,
+        )
         self.facts = {
             "episode": {
                 "game_id": observation.game_id,
@@ -104,6 +125,12 @@ class HyperonBridge:
                 "levels_completed": observation.levels_completed,
                 "legal_actions": list(observation.legal_actions),
                 "frame_signature": observation.derived_features.get("frame_signature"),
+                "has_image_input": image_input is not None,
+                "board_height": image_input.height if image_input is not None else 0,
+                "board_width": image_input.width if image_input is not None else 0,
+                "board_active_cells": board_active_cells,
+                "board_default_probe": board_default_probe,
+                "board_source_attr": board_source_attr,
             },
             "goals": [
                 {
@@ -223,9 +250,17 @@ class HyperonBridge:
                 subgoal = self._evaluate_scalar("!(stagnation-hint True)")
             if subgoal is None:
                 subgoal = self._evaluate_scalar(f"!(goal-hint {state_name})")
+            if (
+                (subgoal is None or str(subgoal) == "advance-level")
+                and int(episode.get("board_active_cells", 0) or 0) > 0
+                and "ACTION6" in legal_actions
+            ):
+                subgoal = "inspect-active-board"
             if subgoal is None:
                 return []
             confidence = 0.95 if episode.get("game_state") == self._win_state_name else 0.72
+            if str(subgoal) == "inspect-active-board":
+                confidence = 0.74
             return [{"subgoal": str(subgoal), "confidence": confidence}]
         if query_name == "action-priors":
             return self._action_priors(
@@ -277,6 +312,11 @@ class HyperonBridge:
                 return [{"subgoal": "hold-win", "confidence": 0.95}]
             if memory.get("stagnation_steps", 0):
                 return [{"subgoal": "break-stall", "confidence": 0.72}]
+            if (
+                int(episode.get("board_active_cells", 0) or 0) > 0
+                and "ACTION6" in legal_actions
+            ):
+                return [{"subgoal": "inspect-active-board", "confidence": 0.74}]
             return [{"subgoal": "advance-level", "confidence": 0.70}]
         if query_name == "action-priors":
             return self._action_priors(
@@ -414,6 +454,10 @@ class HyperonBridge:
                 suppressed_actions=suppressed_actions,
                 basin_status=basin_status,
             )
+            confidence += self._board_probe_prior_bonus(
+                action_name=action_name,
+                current_subgoal=current_subgoal,
+            )
             confidence -= self._episode_basin_loop_penalty(
                 action_name=action_name,
                 legal_actions=legal_actions,
@@ -437,6 +481,25 @@ class HyperonBridge:
             )
         results.sort(key=lambda row: float(row.get("confidence", 0.0)), reverse=True)
         return results
+
+    def _board_probe_prior_bonus(
+        self,
+        *,
+        action_name: str,
+        current_subgoal: str | None,
+    ) -> float:
+        if action_name != "ACTION6":
+            return 0.0
+        episode = self.facts.get("episode", {})
+        if int(episode.get("board_active_cells", 0) or 0) <= 0:
+            return 0.0
+        bonus = 0.06
+        subgoal_name = str(current_subgoal or "")
+        if subgoal_name == "inspect-active-board":
+            bonus += 0.04
+        elif subgoal_name == "break-stall":
+            bonus += 0.02
+        return bonus
 
     def _offline_prior_confidence(
         self,
@@ -695,6 +758,10 @@ class HyperonBridge:
                 ),
                 subgoal=subgoal,
                 legal_actions=legal_actions,
+                board_context=board_context_summary(
+                    observation.image_input,
+                    derived_features=observation.derived_features,
+                ),
             )
             pending_records = self._pending_records_for_game(observation.game_id)
             if pending_records:
@@ -733,6 +800,15 @@ class HyperonBridge:
             last_action=episode.get("last_action"),
             legal_actions=list(legal_actions),
             derived_features={"frame_signature": current_frame_signature},
+        )
+        observation.derived_features.update(
+            {
+                "board_height": int(episode.get("board_height", 0) or 0),
+                "board_width": int(episode.get("board_width", 0) or 0),
+                "board_active_cells": int(episode.get("board_active_cells", 0) or 0),
+                "board_default_probe": dict(episode.get("board_default_probe", {}) or {}),
+                "board_source_attr": episode.get("board_source_attr"),
+            }
         )
         bundle = self._load_memory_bundle(
             observation=observation,
@@ -828,6 +904,10 @@ class HyperonBridge:
             state_name=state_name,
             frame_signature=frame_signature,
             subgoal=subgoal,
+            board_context_summary=board_context_summary(
+                observation.image_input,
+                derived_features=observation.derived_features,
+            ),
         )
         basin_status = self._fallback_basin_status(
             records=records,
@@ -841,6 +921,13 @@ class HyperonBridge:
             subgoal_stats=subgoal_stats,
             basin_status=basin_status,
         )
+        board_context_action_stats = self._action_stats_from_records(
+            records=recent_records,
+            board_context_summary=board_context_summary(
+                observation.image_input,
+                derived_features=observation.derived_features,
+            ),
+        )
         recommended_actions = _derive_recommended_actions(
             legal_actions=legal_actions,
             action_stats=action_stats,
@@ -848,11 +935,17 @@ class HyperonBridge:
             basin_action_stats=basin_action_stats,
             frame_stats=frame_stats,
             subgoal_stats=subgoal_stats,
+            board_context_stats=board_context_action_stats,
             trained_prior_bucket=trained_prior_bucket,
             recent_records=recent_records,
             suppressed_actions=suppressed_actions,
         )
         return {
+            "board_context_summary": board_context_summary(
+                observation.image_input,
+                derived_features=observation.derived_features,
+            ),
+            "board_context_action_stats": board_context_action_stats,
             "recent_records": recent_records,
             "basin_status": basin_status,
             "basin_action_stats": basin_action_stats,
@@ -929,6 +1022,7 @@ class HyperonBridge:
             state_name=state_name,
             frame_signature=frame_signature,
             subgoal=subgoal,
+            board_context_summary=dict(bundle.get("board_context_summary", {}) or {}),
         )
         basin_status = self._merge_basin_status(
             base=dict(bundle.get("basin_status", {})),
@@ -948,6 +1042,10 @@ class HyperonBridge:
             subgoal_stats=subgoal_stats,
             basin_status=basin_status,
         )
+        board_context_action_stats = self._action_stats_from_records(
+            records=recent_records,
+            board_context_summary=dict(bundle.get("board_context_summary", {}) or {}),
+        )
         recommended_actions = _derive_recommended_actions(
             legal_actions=legal_actions,
             action_stats=action_stats,
@@ -955,11 +1053,17 @@ class HyperonBridge:
             basin_action_stats=basin_action_stats,
             frame_stats=frame_stats,
             subgoal_stats=subgoal_stats,
+            board_context_stats=board_context_action_stats,
             trained_prior_bucket=trained_prior_bucket,
             recent_records=recent_records,
             suppressed_actions=suppressed_actions,
         )
         return {
+            "board_context_summary": board_context_summary(
+                observation.image_input,
+                derived_features=observation.derived_features,
+            ),
+            "board_context_action_stats": board_context_action_stats,
             "recent_records": recent_records,
             "basin_status": basin_status,
             "basin_action_stats": basin_action_stats,
@@ -974,6 +1078,8 @@ class HyperonBridge:
 
     def _empty_memory_bundle(self) -> dict[str, Any]:
         return {
+            "board_context_summary": {},
+            "board_context_action_stats": {},
             "recent_records": [],
             "basin_status": {},
             "basin_action_stats": {},
@@ -1068,8 +1174,10 @@ class HyperonBridge:
         state_name: str | None = None,
         frame_signature: str | None = None,
         subgoal: str | None = None,
+        board_context_summary: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
         stats: dict[str, dict[str, Any]] = {}
+        current_board_context = dict(board_context_summary or {})
         for record in records:
             row = self._record_to_recent_record(record)
             if state_name is not None and str(row.get("prior_game_state") or "") != state_name:
@@ -1079,6 +1187,11 @@ class HyperonBridge:
             ) != frame_signature:
                 continue
             if subgoal is not None and str(row.get("decision_subgoal") or "") != subgoal:
+                continue
+            if board_context_summary is not None and board_context_match_score(
+                current_board_context,
+                dict(row.get("board_context_summary", {}) or {}),
+            ) < 2:
                 continue
             action_name = str(row.get("action_name") or "").upper()
             if not action_name:
@@ -1140,10 +1253,12 @@ class HyperonBridge:
         state_name: str,
         frame_signature: str,
         subgoal: str | None,
+        board_context_summary: dict[str, Any] | None = None,
         limit: int = 8,
     ) -> list[dict[str, Any]]:
         current_subgoal = str(subgoal or "")
-        scored_rows: list[tuple[tuple[int, int, int, int, int], dict[str, Any]]] = []
+        current_board_context = dict(board_context_summary or {})
+        scored_rows: list[tuple[tuple[int, int, int, int, int, int], dict[str, Any]]] = []
         for record in records:
             row = self._record_to_recent_record(record)
             prior_state = str(row.get("prior_game_state") or "")
@@ -1160,12 +1275,17 @@ class HyperonBridge:
             same_state = 1 if state_name and prior_state == state_name else 0
             same_subgoal = 1 if current_subgoal and record_subgoal == current_subgoal else 0
             same_frame = 1 if frame_signature and prior_frame_signature == frame_signature else 0
+            board_match = board_context_match_score(
+                current_board_context,
+                dict(row.get("board_context_summary", {}) or {}),
+            )
             scored_rows.append(
                 (
                     (
                         exact_basin,
                         same_state,
                         same_subgoal,
+                        board_match,
                         same_frame,
                         int(row.get("step_index", 0) or 0),
                     ),
@@ -1196,6 +1316,16 @@ class HyperonBridge:
                 "stagnation_before": int(record.get("stagnation_before", 0) or 0),
                 "stagnation_after": int(record.get("stagnation_after", 0) or 0),
                 "prior_legal_actions": list(record.get("prior_legal_actions", []) or []),
+                "board_context_summary": {
+                    "board_height": int(record.get("prior_board_height", 0) or 0),
+                    "board_width": int(record.get("prior_board_width", 0) or 0),
+                    "board_active_cells": int(record.get("prior_board_active_cells", 0) or 0),
+                    "board_source_attr": str(record.get("prior_board_source_attr") or "")
+                    or None,
+                    "board_default_probe": dict(
+                        record.get("prior_board_default_probe", {}) or {}
+                    ),
+                },
             }
         return {
             "game_id": str(getattr(record, "game_id", "") or ""),
@@ -1222,6 +1352,20 @@ class HyperonBridge:
             "prior_legal_actions": list(
                 getattr(record, "prior_legal_actions", []) or []
             ),
+            "board_context_summary": {
+                "board_height": int(getattr(record, "prior_board_height", 0) or 0),
+                "board_width": int(getattr(record, "prior_board_width", 0) or 0),
+                "board_active_cells": int(
+                    getattr(record, "prior_board_active_cells", 0) or 0
+                ),
+                "board_source_attr": str(
+                    getattr(record, "prior_board_source_attr", "") or ""
+                )
+                or None,
+                "board_default_probe": dict(
+                    getattr(record, "prior_board_default_probe", {}) or {}
+                ),
+            },
         }
 
     def _fallback_basin_status(

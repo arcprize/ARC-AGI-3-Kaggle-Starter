@@ -32,8 +32,13 @@ class RuntimeConfig:
     hyperon_enabled: bool
     hyperon_skip_probe: bool
     hyperon_probe_timeout_seconds: float
+    llm_provider: str
     llm_model_dir: Path
     llm_model_path: Path
+    openai_model: str = "gpt-4.1-mini"
+    openai_api_key_env: str = "OPENAI_API_KEY"
+    openai_base_url: str | None = None
+    openai_timeout_seconds: float | None = None
     llm_max_calls_per_episode: int = 2
     llm_max_tokens: int = 192
     llm_temperature: float = 0.1
@@ -62,6 +67,9 @@ class RuntimeConfig:
     def from_env(cls, project_root: Path | None = None) -> "RuntimeConfig":
         root = project_root or Path(__file__).resolve().parents[1]
         env = os.environ
+        llm_provider = env.get("AGI_LLM_PROVIDER", "local").strip().lower() or "local"
+        if llm_provider not in {"local", "openai"}:
+            raise ValueError(f"unsupported AGI_LLM_PROVIDER: {llm_provider}")
         reset_state_names = tuple(
             token.strip().upper()
             for token in env.get(
@@ -90,6 +98,7 @@ class RuntimeConfig:
             env.get("AGI_LLM_MODEL_PATH"),
             "models/executive.gguf",
         )
+        openai_timeout = env.get("AGI_OPENAI_TIMEOUT_SECONDS")
         return cls(
             project_root=root,
             hyperon_rules_path=_resolve_path(
@@ -121,8 +130,15 @@ class RuntimeConfig:
             hyperon_probe_timeout_seconds=float(
                 env.get("AGI_HYPERON_PROBE_TIMEOUT", "5.0")
             ),
+            llm_provider=llm_provider,
             llm_model_dir=llm_model_dir,
             llm_model_path=llm_model_path,
+            openai_model=env.get("AGI_OPENAI_MODEL", "gpt-4.1-mini").strip()
+            or "gpt-4.1-mini",
+            openai_base_url=env.get("AGI_OPENAI_BASE_URL") or None,
+            openai_timeout_seconds=(
+                float(openai_timeout) if openai_timeout and openai_timeout.strip() else None
+            ),
             llm_max_calls_per_episode=int(env.get("AGI_LLM_MAX_CALLS", "2")),
             llm_max_tokens=int(env.get("AGI_LLM_MAX_TOKENS", "192")),
             llm_temperature=float(env.get("AGI_LLM_TEMPERATURE", "0.1")),

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import agi_core.training.demo_zip as demo_zip_module
 from agi_core.storage import load_best_prior_bucket, load_memory_bundle
+from agi_core.image_input import compute_board_signature
 from agi_core.training import (
     RecordingMeta,
     build_action_prior_artifact,
@@ -141,6 +142,14 @@ class DemoZipTrainingTests(unittest.TestCase):
                 steps[0].frame_signature,
                 compute_frame_signature([[[1, 2], [3, 4]]]),
             )
+            self.assertIsNotNone(steps[0].image_input)
+            assert steps[0].image_input is not None
+            self.assertEqual(steps[0].image_input.board, [[1, 2], [3, 4]])
+            self.assertEqual(steps[0].image_input.source_attr, "frame")
+            self.assertEqual(
+                steps[0].image_input.frame_signature,
+                compute_board_signature([[1, 2], [3, 4]]),
+            )
 
     def test_normalizes_string_action_ids_and_skips_summary_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -237,6 +246,7 @@ class DemoZipTrainingTests(unittest.TestCase):
             win_levels=2,
             full_reset=False,
             frame_signature="sig-a",
+            image_input=None,
         )
         win_step = demo_zip_module.TrainingStep(
             game_id="ls20-9607627b",
@@ -253,6 +263,7 @@ class DemoZipTrainingTests(unittest.TestCase):
             win_levels=2,
             full_reset=False,
             frame_signature="sig-b",
+            image_input=None,
         )
         lose_step = demo_zip_module.TrainingStep(
             game_id="ls20-9607627b",
@@ -269,6 +280,7 @@ class DemoZipTrainingTests(unittest.TestCase):
             win_levels=2,
             full_reset=False,
             frame_signature="sig-c",
+            image_input=None,
         )
 
         env = {
@@ -1828,6 +1840,24 @@ class DemoZipTrainingTests(unittest.TestCase):
                 ["ACTION1", "ACTION2"],
             )
             self.assertEqual(bucket, {"ACTION1": 6})
+
+    def test_build_action_prior_artifact_reuses_output_db_when_file_is_already_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            zip_path = self._build_zip(root)
+            output_path = root / "artifact.sqlite3"
+
+            build_action_prior_artifact(zip_path, output_path=output_path, workers=1)
+            with closing(sqlite3.connect(output_path)) as connection:
+                artifact = build_action_prior_artifact(
+                    zip_path,
+                    output_path=output_path,
+                    workers=1,
+                )
+                self.assertEqual(artifact["recordings_seen"], 3)
+                metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+
+            self.assertEqual(metadata["offline_memory_records"], "3")
 
 
 if __name__ == "__main__":

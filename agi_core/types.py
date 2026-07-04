@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from .image_input import BoardImageInput
+
 
 @dataclass(slots=True)
 class Observation:
@@ -12,6 +14,7 @@ class Observation:
     levels_completed: int
     last_action: str | None
     legal_actions: list[str]
+    image_input: BoardImageInput | None = None
     raw_frame_ref: Any = None
     derived_features: dict[str, Any] = field(default_factory=dict)
 
@@ -59,10 +62,17 @@ class EpisodeRecord:
     stagnation_after: int = 0
     decision_subgoal: str | None = None
     decision_source: str | None = None
+    prior_board_height: int = 0
+    prior_board_width: int = 0
+    prior_board_active_cells: int = 0
+    prior_board_source_attr: str | None = None
+    prior_board_default_probe: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class MemoryBundle:
+    board_context_summary: dict[str, Any] = field(default_factory=dict)
+    board_context_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
     recent_records: list[dict[str, Any]] = field(default_factory=list)
     basin_status: dict[str, Any] = field(default_factory=dict)
     basin_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -95,7 +105,13 @@ class ExecutiveContext:
     episode_id: str
     memory_bundle: MemoryBundle | None = None
     llm_memory_bundle: MemoryBundle | None = None
+    llm_subgoal_hint: str | None = None
     contextual_memory_bundles: dict[str, MemoryBundle] = field(default_factory=dict)
+    force_llm_replan: bool = False
+    replan_mode: bool = False
+    probe_dead_end_replan: bool = False
+    score_floor_proposals: list[Any] = field(default_factory=list)
+    score_floor_debug: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable

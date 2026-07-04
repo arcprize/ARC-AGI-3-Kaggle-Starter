@@ -801,6 +801,141 @@ class MemorySqliteTests(unittest.TestCase):
             self.assertEqual(bundle["subgoal_action_stats"]["ACTION2"]["progress"], 1)
             self.assertEqual(bundle["recommended_actions"][0], "ACTION2")
 
+    def test_recent_records_prefer_matching_board_context_when_state_and_subgoal_tie(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "memory.sqlite3"
+            initialize_memory_schema(db_path)
+            record_transition(
+                db_path,
+                EpisodeRecord(
+                    game_id="ls20",
+                    step_index=1,
+                    action_name="ACTION1",
+                    outcome="progress",
+                    progress_delta=1,
+                    game_state="ACTIVE",
+                    prior_game_state="ACTIVE",
+                    levels_completed=1,
+                    prior_frame_signature="sig-alpha",
+                    next_game_state="ACTIVE",
+                    next_frame_signature="sig-next-alpha",
+                    prior_legal_actions=["ACTION1", "ACTION6"],
+                    stagnation_before=0,
+                    stagnation_after=0,
+                    decision_subgoal="inspect-active-board",
+                    decision_source="symbolic",
+                    prior_board_height=3,
+                    prior_board_width=3,
+                    prior_board_active_cells=4,
+                    prior_board_source_attr="frame",
+                    prior_board_default_probe={"x": 1, "y": 1},
+                ),
+            )
+            record_transition(
+                db_path,
+                EpisodeRecord(
+                    game_id="ls20",
+                    step_index=2,
+                    action_name="ACTION6",
+                    outcome="progress",
+                    progress_delta=1,
+                    game_state="ACTIVE",
+                    prior_game_state="ACTIVE",
+                    levels_completed=1,
+                    prior_frame_signature="sig-beta",
+                    next_game_state="ACTIVE",
+                    next_frame_signature="sig-next-beta",
+                    prior_legal_actions=["ACTION1", "ACTION6"],
+                    stagnation_before=0,
+                    stagnation_after=0,
+                    decision_subgoal="inspect-active-board",
+                    decision_source="symbolic",
+                    prior_board_height=5,
+                    prior_board_width=5,
+                    prior_board_active_cells=6,
+                    prior_board_source_attr="frame",
+                    prior_board_default_probe={"x": 2, "y": 2},
+                ),
+            )
+
+            bundle = load_memory_bundle(
+                db_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature="sig-missing",
+                subgoal="inspect-active-board",
+                legal_actions=["ACTION1", "ACTION6"],
+                board_context={
+                    "board_height": 5,
+                    "board_width": 5,
+                    "board_active_cells": 6,
+                    "board_source_attr": "frame",
+                    "board_default_probe": {"x": 2, "y": 2},
+                },
+            )
+
+            self.assertTrue(bundle["recent_records"])
+            self.assertEqual(bundle["recent_records"][0]["action_name"], "ACTION6")
+            self.assertEqual(
+                bundle["recent_records"][0]["board_context_summary"]["board_height"],
+                5,
+            )
+            self.assertEqual(bundle["board_context_summary"]["board_width"], 5)
+            self.assertEqual(bundle["board_context_action_stats"]["ACTION6"]["progress"], 1)
+            self.assertEqual(bundle["recommended_actions"][0], "ACTION6")
+
+    def test_recommended_actions_promote_untried_actions_during_board_context_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "memory.sqlite3"
+            initialize_memory_schema(db_path)
+            for step_index, action_name in enumerate(("ACTION2", "ACTION3"), start=1):
+                record_transition(
+                    db_path,
+                    EpisodeRecord(
+                        game_id="ls20",
+                        step_index=step_index,
+                        action_name=action_name,
+                        outcome="stalled",
+                        progress_delta=0,
+                        game_state="ACTIVE",
+                        prior_game_state="ACTIVE",
+                        levels_completed=0,
+                        prior_frame_signature=f"sig-recovery-{step_index}",
+                        next_game_state="ACTIVE",
+                        next_frame_signature=f"sig-recovery-{step_index}",
+                        prior_legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                        stagnation_before=step_index - 1,
+                        stagnation_after=step_index,
+                        decision_subgoal="break-stall",
+                        decision_source="fallback",
+                        prior_board_height=5,
+                        prior_board_width=5,
+                        prior_board_active_cells=6,
+                        prior_board_source_attr="frame",
+                        prior_board_default_probe={"x": 2, "y": 2},
+                    ),
+                )
+
+            bundle = load_memory_bundle(
+                db_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature="sig-recovery-missing",
+                subgoal="break-stall",
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                board_context={
+                    "board_height": 5,
+                    "board_width": 5,
+                    "board_active_cells": 6,
+                    "board_source_attr": "frame",
+                    "board_default_probe": {"x": 2, "y": 2},
+                },
+            )
+
+            self.assertEqual(bundle["board_context_action_stats"]["ACTION2"]["stalled"], 1)
+            self.assertEqual(bundle["board_context_action_stats"]["ACTION3"]["stalled"], 1)
+            self.assertEqual(bundle["recommended_actions"][:2], ["ACTION1", "ACTION4"])
+
     def test_suppressed_actions_can_come_from_state_and_subgoal_when_basin_is_new(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "memory.sqlite3"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from agi_core.image_input import BoardImageInput
 from agi_core.memory import EpisodicMemory
 from agi_core.types import ActionDecision, Observation
 
@@ -17,6 +18,13 @@ class EpisodicMemoryTests(unittest.TestCase):
             levels_completed=0,
             last_action=None,
             legal_actions=["ACTION1", "ACTION2"],
+            image_input=BoardImageInput(
+                board=[[1, 0], [0, 1]],
+                height=2,
+                width=2,
+                frame_signature="sig-before",
+                source_attr="frame",
+            ),
             derived_features={"frame_signature": "sig-before"},
         )
         after = Observation(
@@ -46,6 +54,11 @@ class EpisodicMemoryTests(unittest.TestCase):
         self.assertEqual(record.prior_legal_actions, ["ACTION1", "ACTION2"])
         self.assertEqual(record.stagnation_before, 0)
         self.assertEqual(record.stagnation_after, 1)
+        self.assertEqual(record.prior_board_height, 2)
+        self.assertEqual(record.prior_board_width, 2)
+        self.assertEqual(record.prior_board_active_cells, 2)
+        self.assertEqual(record.prior_board_source_attr, "frame")
+        self.assertEqual(record.prior_board_default_probe, {"x": 1, "y": 1})
 
     def test_is_basin_exhausted_only_when_all_actions_stall_without_progress(self) -> None:
         memory = EpisodicMemory()

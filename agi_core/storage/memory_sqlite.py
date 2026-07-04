@@ -6,6 +6,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from agi_core.image_input import board_context_match_score
 from agi_core.storage.priors_sqlite import initialize_schema, load_best_prior_bucket
 from agi_core.types import EpisodeRecord
 
@@ -31,10 +32,16 @@ def initialize_memory_schema(db_path: str | Path) -> None:
                 decision_source TEXT NOT NULL,
                 stagnation_before INTEGER NOT NULL,
                 stagnation_after INTEGER NOT NULL,
-                legal_actions_json TEXT NOT NULL
+                legal_actions_json TEXT NOT NULL,
+                prior_board_height INTEGER NOT NULL DEFAULT 0,
+                prior_board_width INTEGER NOT NULL DEFAULT 0,
+                prior_board_active_cells INTEGER NOT NULL DEFAULT 0,
+                prior_board_source_attr TEXT NOT NULL DEFAULT '',
+                prior_board_default_probe_json TEXT NOT NULL DEFAULT '{}'
             )
             """
         )
+        _ensure_live_episode_record_columns(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS live_action_stats (
@@ -253,8 +260,13 @@ def _record_transition_with_connection(
             decision_source,
             stagnation_before,
             stagnation_after,
-            legal_actions_json
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            legal_actions_json,
+            prior_board_height,
+            prior_board_width,
+            prior_board_active_cells,
+            prior_board_source_attr,
+            prior_board_default_probe_json
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             record.game_id,
@@ -271,6 +283,11 @@ def _record_transition_with_connection(
             int(record.stagnation_before),
             int(record.stagnation_after),
             json.dumps(list(record.prior_legal_actions), sort_keys=True),
+            int(record.prior_board_height),
+            int(record.prior_board_width),
+            int(record.prior_board_active_cells),
+            str(record.prior_board_source_attr or ""),
+            json.dumps(dict(record.prior_board_default_probe or {}), sort_keys=True),
         ],
     )
     _upsert_outcome_row(
@@ -391,10 +408,13 @@ def load_memory_bundle(
     frame_signature: str,
     subgoal: str | None,
     legal_actions: list[str],
+    board_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = Path(db_path)
     if not path.exists():
-        return _empty_bundle()
+        bundle = _empty_bundle()
+        bundle["board_context_summary"] = _normalized_board_context(board_context)
+        return bundle
     with closing(sqlite3.connect(path)) as connection:
         action_stats = _query_action_stats(
             connection,
@@ -444,6 +464,7 @@ def load_memory_bundle(
             state=state,
             frame_signature=frame_signature,
             subgoal=subgoal,
+            board_context=board_context,
         )
     trained_prior_bucket = load_best_prior_bucket(
         path,
@@ -459,6 +480,10 @@ def load_memory_bundle(
         subgoal_stats=subgoal_stats,
         basin_status=basin_status,
     )
+    board_context_action_stats = _derive_board_context_action_stats(
+        board_context=board_context,
+        recent_records=recent_records,
+    )
     recommended_actions = _derive_recommended_actions(
         legal_actions=legal_actions,
         action_stats=action_stats,
@@ -466,6 +491,7 @@ def load_memory_bundle(
         basin_action_stats=basin_action_stats,
         frame_stats=frame_stats,
         subgoal_stats=subgoal_stats,
+        board_context_stats=board_context_action_stats,
         trained_prior_bucket=trained_prior_bucket,
         recent_records=recent_records,
         suppressed_actions=suppressed_actions,
@@ -476,6 +502,8 @@ def load_memory_bundle(
         suppressed_actions=suppressed_actions,
     )
     return {
+        "board_context_summary": _normalized_board_context(board_context),
+        "board_context_action_stats": board_context_action_stats,
         "recent_records": recent_records,
         "basin_status": basin_status,
         "basin_action_stats": basin_action_stats,
@@ -491,6 +519,8 @@ def load_memory_bundle(
 
 def _empty_bundle() -> dict[str, Any]:
     return {
+        "board_context_summary": _normalized_board_context(None),
+        "board_context_action_stats": {},
         "recent_records": [],
         "basin_status": {
             "state": "",
@@ -524,6 +554,7 @@ def _load_recent_records(
     state: str,
     frame_signature: str,
     subgoal: str | None,
+    board_context: dict[str, Any] | None,
     limit: int = 8,
 ) -> list[dict[str, Any]]:
     select_clause = """
@@ -542,7 +573,12 @@ def _load_recent_records(
             decision_source,
             stagnation_before,
             stagnation_after,
-            legal_actions_json
+            legal_actions_json,
+            prior_board_height,
+            prior_board_width,
+            prior_board_active_cells,
+            prior_board_source_attr,
+            prior_board_default_probe_json
         FROM live_episode_records
     """
     candidate_rows: list[tuple[Any, ...]] = []
@@ -578,6 +614,7 @@ def _load_recent_records(
             max(limit * 2, 16),
         )
     current_subgoal = str(subgoal or "")
+    current_board_context = _normalized_board_context(board_context)
     if current_subgoal:
         extend_candidates(
             "game_id = ? AND subgoal = ?",
@@ -595,7 +632,7 @@ def _load_recent_records(
         [game_id],
         max(limit * 4, 24),
     )
-    scored_rows: list[tuple[tuple[int, int, int, int], tuple[Any, ...]]] = []
+    scored_rows: list[tuple[tuple[int, int, int, int, int, int], tuple[Any, ...]]] = []
     for row in candidate_rows:
         prior_state = str(row[7] or "")
         prior_frame_signature = str(row[8] or "")
@@ -604,9 +641,26 @@ def _load_recent_records(
         same_state = 1 if state and prior_state == state else 0
         same_frame = 1 if frame_signature and prior_frame_signature == frame_signature else 0
         same_subgoal = 1 if current_subgoal and record_subgoal == current_subgoal else 0
+        board_match = board_context_match_score(
+            current_board_context,
+            {
+                "board_height": int(row[15] or 0),
+                "board_width": int(row[16] or 0),
+                "board_active_cells": int(row[17] or 0),
+                "board_source_attr": str(row[18] or "") or None,
+                "board_default_probe": _deserialize_probe_json(row[19]),
+            },
+        )
         scored_rows.append(
             (
-                (exact_basin, same_state, same_subgoal, same_frame, int(row[0] or 0)),
+                (
+                    exact_basin,
+                    same_state,
+                    same_subgoal,
+                    board_match,
+                    same_frame,
+                    int(row[0] or 0),
+                ),
                 row,
             )
         )
@@ -629,9 +683,36 @@ def _load_recent_records(
                 "stagnation_before": int(row[12] or 0),
                 "stagnation_after": int(row[13] or 0),
                 "prior_legal_actions": json.loads(row[14] or "[]"),
+                "board_context_summary": {
+                    "board_height": int(row[15] or 0),
+                    "board_width": int(row[16] or 0),
+                    "board_active_cells": int(row[17] or 0),
+                    "board_source_attr": str(row[18] or "") or None,
+                    "board_default_probe": _deserialize_probe_json(row[19]),
+                },
             }
         )
     return recent_records
+
+
+def _ensure_live_episode_record_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(live_episode_records)").fetchall()
+    }
+    expected = {
+        "prior_board_height": "INTEGER NOT NULL DEFAULT 0",
+        "prior_board_width": "INTEGER NOT NULL DEFAULT 0",
+        "prior_board_active_cells": "INTEGER NOT NULL DEFAULT 0",
+        "prior_board_source_attr": "TEXT NOT NULL DEFAULT ''",
+        "prior_board_default_probe_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    for column_name, column_def in expected.items():
+        if column_name in columns:
+            continue
+        connection.execute(
+            f"ALTER TABLE live_episode_records ADD COLUMN {column_name} {column_def}"
+        )
 
 
 def _table_has_rows(connection: sqlite3.Connection, table: str) -> bool:
@@ -823,6 +904,42 @@ def _query_action_stats(
             "last_outcome": last_outcome,
         }
     return stats
+
+
+def _normalized_board_context(board_context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(board_context, dict):
+        return {
+            "board_height": 0,
+            "board_width": 0,
+            "board_active_cells": 0,
+            "board_source_attr": None,
+            "board_default_probe": {},
+        }
+    return {
+        "board_height": int(board_context.get("board_height", 0) or 0),
+        "board_width": int(board_context.get("board_width", 0) or 0),
+        "board_active_cells": int(board_context.get("board_active_cells", 0) or 0),
+        "board_source_attr": str(board_context.get("board_source_attr") or "") or None,
+        "board_default_probe": dict(board_context.get("board_default_probe") or {}),
+    }
+
+
+def _deserialize_probe_json(value: Any) -> dict[str, int]:
+    try:
+        payload = json.loads(value or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key in ("x", "y"):
+        if key not in payload:
+            continue
+        try:
+            result[key] = int(payload[key])
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def _refresh_basin_row(
@@ -1121,14 +1238,37 @@ def _derive_recommended_actions(
     basin_action_stats: dict[str, dict[str, Any]],
     frame_stats: dict[str, dict[str, Any]],
     subgoal_stats: dict[str, dict[str, Any]],
+    board_context_stats: dict[str, dict[str, Any]],
     trained_prior_bucket: dict[str, int],
     recent_records: list[dict[str, Any]],
     suppressed_actions: list[str],
 ) -> list[str]:
-    ranked: list[tuple[float, str]] = []
+    ranked: list[tuple[float, int, int, str]] = []
     suppressed = set(suppressed_actions)
+    legal_action_order = {
+        str(action_name or "").upper(): index
+        for index, action_name in enumerate(legal_actions)
+    }
     recent_action = None
     recent_outcomes: dict[str, str] = {}
+    board_context_attempted_actions = {
+        str(action_name or "").upper()
+        for action_name in board_context_stats.keys()
+        if str(action_name or "").upper()
+    }
+    board_context_attempt_totals = {
+        str(action_name or "").upper(): int(dict(stats or {}).get("total", 0) or 0)
+        for action_name, stats in board_context_stats.items()
+    }
+    board_context_progress_actions = {
+        action_name
+        for action_name, stats in board_context_stats.items()
+        if int(dict(stats or {}).get("progress", 0) or 0) > 0
+    }
+    board_context_recovery_mode = (
+        len(board_context_attempted_actions) >= 2
+        and not board_context_progress_actions
+    )
     if recent_records:
         recent_action = str(recent_records[0].get("action_name") or "") or None
         for record in recent_records[:4]:
@@ -1144,15 +1284,19 @@ def _derive_recommended_actions(
         frame = frame_stats.get(action_name, {})
         state = state_stats.get(action_name, {})
         subgoal = subgoal_stats.get(action_name, {})
+        board_context = board_context_stats.get(action_name, {})
         game = action_stats.get(action_name, {})
         score = 0.0
         score += 5.0 * int(basin.get("progress", 0) or 0)
+        score += 4.0 * int(board_context.get("progress", 0) or 0)
         score += 3.5 * int(state.get("progress", 0) or 0)
         score += 2.5 * int(subgoal.get("progress", 0) or 0)
         score += 1.5 * int(frame.get("progress", 0) or 0)
         score += 1.0 * int(game.get("progress", 0) or 0)
         score -= 2.5 * int(basin.get("failed", 0) or 0)
         score -= 1.25 * int(basin.get("stalled", 0) or 0)
+        score -= 1.25 * int(board_context.get("failed", 0) or 0)
+        score -= 0.60 * int(board_context.get("stalled", 0) or 0)
         score -= 0.75 * int(frame.get("failed", 0) or 0)
         score -= 0.35 * int(frame.get("stalled", 0) or 0)
         score -= 0.75 * int(state.get("failed", 0) or 0)
@@ -1165,12 +1309,61 @@ def _derive_recommended_actions(
             score -= 0.75
         if action_name == recent_action:
             score -= 0.35
-        ranked.append((score, action_name))
-    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    positive = [action_name for score, action_name in ranked if score > 0]
+        if board_context_recovery_mode:
+            if action_name not in board_context_attempted_actions:
+                score += 1.25
+            elif action_name not in board_context_progress_actions:
+                score -= 0.20
+        ranked.append(
+            (
+                score,
+                int(board_context_attempt_totals.get(action_name, 0) or 0),
+                int(legal_action_order.get(action_name, len(legal_actions))),
+                action_name,
+            )
+        )
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+    positive = [action_name for score, _, _, action_name in ranked if score > 0]
     if positive:
         return positive[:3]
-    return [action_name for _, action_name in ranked[:3]]
+    return [action_name for _, _, _, action_name in ranked[:3]]
+
+
+def _derive_board_context_action_stats(
+    *,
+    board_context: dict[str, Any] | None,
+    recent_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    current_board_context = _normalized_board_context(board_context)
+    if not recent_records:
+        return {}
+    stats: dict[str, dict[str, Any]] = {}
+    for record in recent_records[:6]:
+        action_name = str(record.get("action_name") or "").upper()
+        if not action_name:
+            continue
+        if (
+            board_context_match_score(
+                current_board_context,
+                dict(record.get("board_context_summary", {}) or {}),
+            )
+            < 2
+        ):
+            continue
+        entry = stats.setdefault(
+            action_name,
+            {"progress": 0, "failed": 0, "stalled": 0, "total": 0, "last_outcome": None},
+        )
+        outcome = str(record.get("outcome") or "")
+        if outcome == "progress":
+            entry["progress"] = int(entry.get("progress", 0) or 0) + 1
+        elif outcome == "failed":
+            entry["failed"] = int(entry.get("failed", 0) or 0) + 1
+        elif outcome == "stalled":
+            entry["stalled"] = int(entry.get("stalled", 0) or 0) + 1
+        entry["total"] = int(entry.get("total", 0) or 0) + 1
+        entry["last_outcome"] = outcome
+    return stats
 
 
 def _is_basin_exhausted(

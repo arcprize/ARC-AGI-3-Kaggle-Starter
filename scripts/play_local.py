@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,15 @@ sys.path.insert(0, str(VENDOR))
 
 import arc_agi
 from arc_agi import OperationMode
+
+_PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
 def load_my_agent_class():
@@ -43,6 +53,29 @@ def load_my_agent_class():
     return module.MyAgent
 
 
+def _configure_local_runner_env(llm_provider: str) -> None:
+    os.environ["AGI_LLM_PROVIDER"] = (
+        str(llm_provider or "local").strip().lower() or "local"
+    )
+    preserve_proxy = str(
+        os.environ.get("AGI_PLAY_LOCAL_PRESERVE_PROXY", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if preserve_proxy:
+        return
+    for env_name in _PROXY_ENV_VARS:
+        os.environ.pop(env_name, None)
+    no_proxy_entries = [
+        entry.strip()
+        for entry in str(os.environ.get("NO_PROXY", "") or "").split(",")
+        if entry.strip()
+    ]
+    for host in ("localhost", "127.0.0.1"):
+        if host not in no_proxy_entries:
+            no_proxy_entries.append(host)
+    os.environ["NO_PROXY"] = ",".join(no_proxy_entries)
+    os.environ["no_proxy"] = os.environ["NO_PROXY"]
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--game", default=None,
@@ -55,9 +88,17 @@ def main() -> None:
                    help="List available games and exit.")
     p.add_argument("--render", default=None, choices=[None, "terminal"],
                    help="Optional terminal rendering each step.")
+    p.add_argument(
+        "--llm-provider",
+        choices=["local", "openai"],
+        default="local",
+        help="LLM provider for local runs. Defaults to local so shell env does not leak OpenAI into play-local.",
+    )
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _configure_local_runner_env(args.llm_provider)
+    print(f"Using llm provider: {args.llm_provider}")
 
     # NORMAL = local execution; game source is downloaded on first call into
     # ./environment_files/ and cached for subsequent runs.

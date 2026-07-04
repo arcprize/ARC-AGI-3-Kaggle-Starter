@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from agi_core.training import runtime_frame_signature
+from agi_core.image_input import (
+    active_cell_count,
+    default_click_target,
+    extract_board_image_input,
+    preferred_board_probe_action,
+)
 from agi_core.types import ActionDecision, Observation
 
 
@@ -18,6 +23,7 @@ class ArcAdapter:
     ) -> None:
         self._game_action_cls = game_action_cls
         self._game_id = default_game_id
+        self._last_image_input = None
         self._reset_state_names = {str(name or "").upper() for name in reset_state_names}
         self._default_legal_actions = self._discover_default_actions()
         if deterministic_action in self._default_legal_actions:
@@ -34,6 +40,9 @@ class ArcAdapter:
         game_state = self._normalize_name(self._get_attr(latest_frame, "state"))
         legal_actions, legal_actions_known = self._extract_legal_actions(latest_frame, game_state)
         step_index, step_index_reliable = self._extract_step_index(frames, latest_frame)
+        image_input = extract_board_image_input(latest_frame)
+        self._last_image_input = image_input
+        default_probe = default_click_target(image_input) if image_input is not None else {}
         return Observation(
             game_id=self._game_id or str(self._get_attr(latest_frame, "game_id", "")),
             step_index=step_index,
@@ -45,13 +54,20 @@ class ArcAdapter:
                 self._get_attr(latest_frame, "last_action", "action")
             ),
             legal_actions=legal_actions,
+            image_input=image_input,
             raw_frame_ref=latest_frame,
             derived_features={
                 "frame_count": len(frames),
                 "legal_actions": list(legal_actions),
                 "legal_actions_known": legal_actions_known,
                 "step_index_reliable": step_index_reliable,
-                "frame_signature": runtime_frame_signature(latest_frame),
+                "frame_signature": image_input.frame_signature if image_input is not None else None,
+                "board_height": image_input.height if image_input is not None else 0,
+                "board_width": image_input.width if image_input is not None else 0,
+                "board_active_cells": active_cell_count(image_input),
+                "board_default_probe": default_probe,
+                "board_source_attr": image_input.source_attr if image_input is not None else None,
+                "has_image_input": image_input is not None,
             },
         )
 
@@ -63,6 +79,12 @@ class ArcAdapter:
             return "RESET"
         legal_actions = [name for name in observation.legal_actions if name != "RESET"]
         if legal_actions:
+            board_probe_action = preferred_board_probe_action(
+                legal_actions,
+                observation.image_input,
+            )
+            if board_probe_action is not None:
+                return board_probe_action
             if self._deterministic_action in legal_actions:
                 return self._deterministic_action
             return legal_actions[0]
@@ -75,6 +97,11 @@ class ArcAdapter:
             source="fallback",
             confidence=0.05,
             reason="deterministic adapter fallback",
+            subgoal=(
+                "inspect-active-board"
+                if action_name == "ACTION6" and observation.image_input is not None
+                else None
+            ),
             metadata=self.default_metadata_for_action(action_name),
             used_fallback=True,
         )
@@ -128,8 +155,13 @@ class ArcAdapter:
 
     def _default_metadata_for(self, action_name: str) -> dict[str, Any]:
         if action_name == "ACTION6":
+            if self._last_image_input is not None and self._last_image_input.width > 0 and self._last_image_input.height > 0:
+                return self._default_complex_click_metadata()
             return {"x": 32, "y": 32}
         return {}
+
+    def _default_complex_click_metadata(self) -> dict[str, int]:
+        return default_click_target(self._last_image_input)
 
     def _extract_legal_actions(self, latest_frame: Any, game_state: str) -> tuple[list[str], bool]:
         explicit = self._extract_explicit_actions(latest_frame)

@@ -15,6 +15,7 @@ from agi_core.storage import (
     upsert_training_counts,
 )
 from agi_core.knowledge.hyperon_bridge import HyperonBridge
+from agi_core.image_input import BoardImageInput, compute_board_signature
 from agi_core.memory import EpisodicMemory
 from agi_core.types import (
     ActionDecision,
@@ -128,6 +129,102 @@ class HyperonBridgeTests(unittest.TestCase):
             [{"subgoal": "advance-level", "confidence": 0.70}],
         )
 
+    def test_shadow_goal_hints_prefers_board_inspection_when_active_cells_exist(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        board = [[0, 0, 0], [0, 4, 4], [0, 4, 4]]
+        signature = compute_board_signature(board)
+        observation = make_observation(
+            legal_actions=["ACTION1", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=signature,
+                source_attr="frame",
+            ),
+            derived_features={
+                "frame_signature": signature,
+                "board_active_cells": 4,
+                "board_default_probe": {"x": 2, "y": 2},
+                "board_source_attr": "frame",
+            },
+        )
+
+        bridge.sync(
+            observation,
+            memory,
+            [GoalState(name="finish-episode", target_state="WIN")],
+        )
+
+        self.assertEqual(
+            bridge.run_rules("goal-hints"),
+            [{"subgoal": "inspect-active-board", "confidence": 0.74}],
+        )
+
+    def test_sync_records_live_board_summary_without_persisting_board(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        board = [[7, 8], [9, 0]]
+        signature = compute_board_signature(board)
+        observation = make_observation(
+            image_input=BoardImageInput(
+                board=board,
+                height=2,
+                width=2,
+                frame_signature=signature,
+                source_attr="grid",
+            ),
+            derived_features={"frame_signature": signature},
+        )
+
+        bridge.sync(
+            observation,
+            memory,
+            [GoalState(name="finish-episode", target_state="WIN")],
+        )
+
+        episode = bridge.facts["episode"]
+        self.assertTrue(episode["has_image_input"])
+        self.assertEqual(episode["board_height"], 2)
+        self.assertEqual(episode["board_width"], 2)
+        self.assertEqual(episode["board_active_cells"], 3)
+        self.assertEqual(episode["board_default_probe"], {"x": 0, "y": 0})
+        self.assertEqual(episode["board_source_attr"], "grid")
+        self.assertNotIn("board", episode)
+
+    def test_sync_uses_derived_board_runtime_summary_fields(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        board = [[0, 0, 0], [0, 7, 7], [0, 7, 7]]
+        signature = compute_board_signature(board)
+        observation = make_observation(
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=signature,
+                source_attr="frame",
+            ),
+            derived_features={
+                "frame_signature": signature,
+                "board_active_cells": 4,
+                "board_default_probe": {"x": 2, "y": 2},
+                "board_source_attr": "frame",
+            },
+        )
+
+        bridge.sync(
+            observation,
+            memory,
+            [GoalState(name="finish-episode", target_state="WIN")],
+        )
+
+        episode = bridge.facts["episode"]
+        self.assertEqual(episode["board_active_cells"], 4)
+        self.assertEqual(episode["board_default_probe"], {"x": 2, "y": 2})
+        self.assertEqual(episode["board_source_attr"], "frame")
+
     def test_probe_failure_falls_back_without_breaking_rules(self) -> None:
         bridge = HyperonBridge()
         memory = EpisodicMemory()
@@ -187,6 +284,85 @@ class HyperonBridgeTests(unittest.TestCase):
                     "reason": "hyperon symbolic prior",
                 },
             ],
+        )
+
+    def test_runtime_goal_hints_fall_back_to_board_inspection_when_runtime_has_no_hint(self) -> None:
+        bridge = HyperonBridge()
+        bridge.backend = FakeHyperonModule
+        memory = EpisodicMemory()
+        board = [[0, 0, 0], [0, 4, 4], [0, 4, 4]]
+        signature = compute_board_signature(board)
+        observation = make_observation(
+            legal_actions=["ACTION1", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=signature,
+                source_attr="frame",
+            ),
+            derived_features={
+                "frame_signature": signature,
+                "board_active_cells": 4,
+                "board_default_probe": {"x": 2, "y": 2},
+                "board_source_attr": "frame",
+            },
+        )
+
+        class NoGoalHintRuntime(FakeRuntime):
+            def run(self, program: str):
+                query = program.strip()
+                if query == "!(goal-hint ACTIVE)":
+                    return []
+                return super().run(program)
+
+        with patch.object(bridge, "_probe_runtime", return_value=(True, None)):
+            with patch.object(bridge, "_create_runtime", return_value=NoGoalHintRuntime()):
+                bridge.sync(
+                    observation,
+                    memory,
+                    [GoalState(name="finish-episode", target_state="WIN")],
+                )
+
+        self.assertEqual(
+            bridge.run_rules("goal-hints"),
+            [{"subgoal": "inspect-active-board", "confidence": 0.74}],
+        )
+
+    def test_runtime_goal_hints_upgrade_generic_hint_to_board_inspection(self) -> None:
+        bridge = HyperonBridge()
+        bridge.backend = FakeHyperonModule
+        memory = EpisodicMemory()
+        board = [[0, 0, 0], [0, 4, 4], [0, 4, 4]]
+        signature = compute_board_signature(board)
+        observation = make_observation(
+            legal_actions=["ACTION1", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=signature,
+                source_attr="frame",
+            ),
+            derived_features={
+                "frame_signature": signature,
+                "board_active_cells": 4,
+                "board_default_probe": {"x": 2, "y": 2},
+                "board_source_attr": "frame",
+            },
+        )
+
+        with patch.object(bridge, "_probe_runtime", return_value=(True, None)):
+            with patch.object(bridge, "_create_runtime", return_value=FakeRuntime()):
+                bridge.sync(
+                    observation,
+                    memory,
+                    [GoalState(name="finish-episode", target_state="WIN")],
+                )
+
+        self.assertEqual(
+            bridge.run_rules("goal-hints"),
+            [{"subgoal": "inspect-active-board", "confidence": 0.74}],
         )
 
     def test_runtime_queries_fall_back_to_shadow_for_custom_terminal_states(self) -> None:
@@ -885,6 +1061,84 @@ class HyperonBridgeTests(unittest.TestCase):
         self.assertEqual(priors[0]["action_name"], "ACTION1")
         by_name = {row["action_name"]: row for row in priors}
         self.assertGreater(by_name["ACTION1"]["confidence"], by_name["ACTION3"]["confidence"])
+
+    def test_board_probe_prior_prefers_action6_when_active_cells_exist(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        board = [[0, 0, 0], [0, 5, 5], [0, 5, 5]]
+        signature = compute_board_signature(board)
+        observation = make_observation(
+            step_index=2,
+            game_state="NOT_FINISHED",
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=signature,
+                source_attr="frame",
+            ),
+            derived_features={
+                "frame_signature": signature,
+                "board_active_cells": 4,
+                "board_default_probe": {"x": 2, "y": 2},
+                "board_source_attr": "frame",
+            },
+        )
+
+        bridge.sync(
+            observation,
+            memory,
+            [GoalState(name="finish-episode", target_state="WIN")],
+        )
+
+        priors = bridge.run_rules("action-priors")
+        self.assertEqual(priors[0]["action_name"], "ACTION6")
+        by_name = {row["action_name"]: row for row in priors}
+        self.assertGreater(by_name["ACTION6"]["confidence"], by_name["ACTION1"]["confidence"])
+
+    def test_board_probe_prior_is_stronger_for_inspect_active_board_subgoal(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        board = [[0, 0, 0], [0, 5, 5], [0, 5, 5]]
+        signature = compute_board_signature(board)
+        observation = make_observation(
+            step_index=2,
+            game_state="NOT_FINISHED",
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=signature,
+                source_attr="frame",
+            ),
+            derived_features={
+                "frame_signature": signature,
+                "board_active_cells": 4,
+                "board_default_probe": {"x": 2, "y": 2},
+                "board_source_attr": "frame",
+            },
+        )
+
+        bridge.sync(
+            observation,
+            memory,
+            [GoalState(name="finish-episode", target_state="WIN")],
+        )
+
+        generic_priors = bridge.run_rules("action-priors")
+        inspect_priors = bridge.run_rules("action-priors:inspect-active-board")
+
+        generic_by_name = {row["action_name"]: row for row in generic_priors}
+        inspect_by_name = {row["action_name"]: row for row in inspect_priors}
+        self.assertEqual(inspect_priors[0]["action_name"], "ACTION6")
+        self.assertGreater(
+            inspect_by_name["ACTION6"]["confidence"],
+            generic_by_name["ACTION6"]["confidence"],
+        )
 
     def test_episode_basin_exhaustion_crushes_symbolic_confidence_after_full_cycle(self) -> None:
         bridge = HyperonBridge(enabled=False)
