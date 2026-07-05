@@ -34,6 +34,10 @@ class Executive:
         context.llm_memory_bundle = context.memory_bundle
         context.llm_subgoal_hint = None
         context.contextual_memory_bundles = {}
+        pre_replan_opening = self._pre_replan_opening_fast_path(context)
+        if pre_replan_opening is not None:
+            context.memory.note_decision(pre_replan_opening)
+            return pre_replan_opening
         pending_reopen = context.memory.pending_score_floor_reopen(context.observation)
         if pending_reopen is not None and "RESET" in context.observation.legal_actions:
             context.score_floor_debug = dict(pending_reopen.get("score_floor_debug") or {})
@@ -53,6 +57,10 @@ class Executive:
         replan_mode = self._should_enter_replan_mode(context)
         context.replan_mode = replan_mode
         reactive_proposals = [] if replan_mode else self.reactive.propose(context)
+        opening_fast_path = self._opening_fast_path(context, reactive_proposals)
+        if opening_fast_path is not None:
+            context.memory.note_decision(opening_fast_path)
+            return opening_fast_path
         symbolic_proposals = self.symbolic.propose(context)
         self._refresh_llm_memory_bundle(context, symbolic_proposals, reactive_proposals)
         proposals = list(reactive_proposals) + list(symbolic_proposals)
@@ -126,6 +134,69 @@ class Executive:
         fallback.proposals = rescored
         context.memory.note_decision(fallback)
         return fallback
+
+    def _pre_replan_opening_fast_path(
+        self,
+        context: ExecutiveContext,
+    ) -> ActionDecision | None:
+        opening_method = getattr(self.reactive, "_ar25_level0_opening_move", None)
+        if not callable(opening_method):
+            return None
+        proposal = opening_method(context)
+        if proposal is None:
+            return None
+        metadata = self._finalize_decision_metadata(
+            context,
+            proposal.action_name,
+            dict(getattr(proposal, "metadata", {}) or {}),
+        )
+        subgoal = self._finalize_decision_subgoal(
+            context,
+            proposal.action_name,
+            getattr(proposal, "subgoal", None),
+        )
+        return ActionDecision(
+            action_name=proposal.action_name,
+            source=proposal.source,
+            confidence=float(proposal.confidence),
+            reason=str(proposal.reason),
+            subgoal=subgoal,
+            metadata=metadata,
+            proposals=[proposal],
+        )
+
+    def _opening_fast_path(
+        self,
+        context: ExecutiveContext,
+        reactive_proposals: list,
+    ) -> ActionDecision | None:
+        if not reactive_proposals:
+            return None
+        proposal = reactive_proposals[0]
+        if (
+            str(getattr(context.observation, "game_id", "") or "").split("-")[0] != "ar25"
+            or str(getattr(proposal, "reason", "") or "") != "ar25 mirrored opening alignment"
+        ):
+            return None
+        metadata = self._finalize_decision_metadata(
+            context,
+            proposal.action_name,
+            dict(getattr(proposal, "metadata", {}) or {}),
+        )
+        subgoal = self._finalize_decision_subgoal(
+            context,
+            proposal.action_name,
+            getattr(proposal, "subgoal", None),
+        )
+        return ActionDecision(
+            action_name=proposal.action_name,
+            source=proposal.source,
+            confidence=float(proposal.confidence),
+            reason=str(proposal.reason),
+            subgoal=subgoal,
+            metadata=metadata,
+            proposals=list(reactive_proposals),
+        )
 
     def _all_legal_proposals_are_score_floor(
         self,
@@ -208,11 +279,14 @@ class Executive:
 
     def _should_enter_replan_mode(self, context: ExecutiveContext) -> bool:
         basin_status = {}
+        working_memory = {}
         if context.memory_bundle is not None:
             basin_status = dict(context.memory_bundle.basin_status or {})
+            working_memory = dict(context.memory_bundle.working_memory or {})
         basin_exhausted = bool(basin_status.get("is_exhausted")) or context.memory.is_basin_exhausted(
             context.observation
         )
+        failure_pressure = self._working_memory_failure_pressure(working_memory)
         recent_actions = [
             action_name
             for action_name in context.memory.recent_actions()[-6:]
@@ -232,11 +306,84 @@ class Executive:
                 basin_exhausted
                 and context.memory.stagnation_steps >= 4
             )
+            or (
+                failure_pressure["open_mode_count"] >= 3
+                and context.memory.stagnation_steps >= 3
+            )
+            or (
+                failure_pressure["max_failure_streak"] >= 3
+                and failure_pressure["recent_failure_count"] >= 2
+                and context.memory.stagnation_steps >= 2
+            )
             or diverse_stall_cycle
         ) and (
             context.observation.game_state not in context.config.reset_state_names
             and context.observation.game_state != context.config.win_state_name
         )
+
+    def _working_memory_failure_pressure(self, working_memory: dict) -> dict[str, int]:
+        open_failure_modes = list(working_memory.get("open_failure_modes", []) or [])
+        recent_failures = list(working_memory.get("recent_failures", []) or [])
+        failure_streaks = list(working_memory.get("failure_streaks", []) or [])
+        max_failure_streak = 0
+        for streak in failure_streaks:
+            if not isinstance(streak, dict):
+                continue
+            try:
+                count = int(streak.get("count", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count > max_failure_streak:
+                max_failure_streak = count
+        return {
+            "open_mode_count": len(open_failure_modes),
+            "recent_failure_count": len(recent_failures),
+            "max_failure_streak": max_failure_streak,
+        }
+
+    def _working_memory_failure_signal_for_action(
+        self,
+        working_memory: dict,
+        action_name: str,
+    ) -> dict[str, int]:
+        target = str(action_name or "")
+        recent_failure_count = 0
+        for row in list(working_memory.get("recent_failures", []) or []):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("action_name", "") or "") == target:
+                recent_failure_count += 1
+        failure_streak = 0
+        for row in list(working_memory.get("failure_streaks", []) or []):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("action_name", "") or "") != target:
+                continue
+            try:
+                failure_streak = max(failure_streak, int(row.get("count", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+        return {
+            "recent_failure_count": recent_failure_count,
+            "failure_streak": failure_streak,
+        }
+
+    def _working_memory_focus_rank(
+        self,
+        working_memory: dict,
+        action_name: str,
+    ) -> int | None:
+        target = str(action_name or "")
+        rank = 0
+        for raw_name in list(working_memory.get("procedural_focus_actions", []) or []):
+            if str(raw_name or "") == target:
+                return rank
+            rank += 1
+        for raw_name in list(working_memory.get("semantic_focus_actions", []) or []):
+            if str(raw_name or "") == target:
+                return rank
+            rank += 1
+        return None
 
     def _should_force_emergency_llm_replan(self, context: ExecutiveContext) -> bool:
         if context.observation.game_state in context.config.reset_state_names:
@@ -250,19 +397,29 @@ class Executive:
         if context.memory.can_call_llm(context.config.llm_max_calls_per_episode):
             return False
         basin_status = {}
+        working_memory = {}
         if context.memory_bundle is not None:
             basin_status = dict(context.memory_bundle.basin_status or {})
+            working_memory = dict(context.memory_bundle.working_memory or {})
         basin_exhausted = bool(basin_status.get("is_exhausted")) or context.memory.is_basin_exhausted(
             context.observation
         )
-        if not basin_exhausted or context.memory.stagnation_steps < 6:
+        if not basin_exhausted:
             return False
+        failure_pressure = self._working_memory_failure_pressure(working_memory)
         recent_actions = [
             action_name
             for action_name in context.memory.recent_actions()[-8:]
             if action_name and action_name != "RESET"
         ]
-        if len(recent_actions) < 6:
+        if (
+            failure_pressure["max_failure_streak"] >= 3
+            and failure_pressure["recent_failure_count"] >= 2
+            and context.memory.stagnation_steps >= 4
+            and len(recent_actions) >= 4
+        ):
+            return len(set(recent_actions)) >= 2
+        if context.memory.stagnation_steps < 6 or len(recent_actions) < 6:
             return False
         return len(set(recent_actions)) >= 3
 
@@ -274,14 +431,27 @@ class Executive:
             return False
         if context.memory.stagnation_steps < 2:
             return False
+        working_memory = {}
+        if context.memory_bundle is not None:
+            working_memory = dict(context.memory_bundle.working_memory or {})
         recent_actions = [
             action_name
             for action_name in context.memory.recent_actions()[-2:]
             if action_name
         ]
-        if recent_actions != ["ACTION6", "ACTION6"]:
+        if recent_actions == ["ACTION6", "ACTION6"]:
+            return "ACTION6" in context.observation.legal_actions
+        if context.memory.most_recent_action() != "ACTION6":
             return False
-        return "ACTION6" in context.observation.legal_actions
+        action_failure = self._working_memory_failure_signal_for_action(
+            working_memory,
+            "ACTION6",
+        )
+        return (
+            "ACTION6" in context.observation.legal_actions
+            and action_failure["failure_streak"] >= 2
+            and action_failure["recent_failure_count"] >= 1
+        )
 
     def _score_floor_fallback(self, context: ExecutiveContext, rescored: list) -> ActionDecision:
         candidate_actions = self._ordered_score_floor_actions(rescored)
@@ -454,9 +624,7 @@ class Executive:
             return None
         if not hasattr(self.llm, "memory_escape_proposals"):
             return None
-        preferred_actions = self._ordered_score_floor_actions(
-            list(context.score_floor_proposals or [])
-        )
+        preferred_actions = self._score_floor_escape_preferred_actions(context)
         proposals = self.llm.memory_escape_proposals(
             context,
             "score-floor post-emergency memory escape",
@@ -481,6 +649,66 @@ class Executive:
             subgoal=proposal.subgoal,
             metadata=metadata,
             used_fallback=True,
+        )
+
+    def _score_floor_escape_preferred_actions(
+        self,
+        context: ExecutiveContext,
+    ) -> list[str]:
+        ordered_actions = self._ordered_score_floor_actions(
+            list(context.score_floor_proposals or [])
+        )
+        if not ordered_actions:
+            return []
+        working_memory = {}
+        recommended_actions: list[str] = []
+        trained_prior_bucket: dict[str, int] = {}
+        if context.memory_bundle is not None:
+            working_memory = dict(context.memory_bundle.working_memory or {})
+            recommended_actions = [
+                str(action_name or "")
+                for action_name in list(context.memory_bundle.recommended_actions or [])
+                if str(action_name or "") in ordered_actions
+            ]
+            trained_prior_bucket = {
+                str(action_name): int(count)
+                for action_name, count in dict(
+                    context.memory_bundle.trained_prior_bucket or {}
+                ).items()
+                if str(action_name) in ordered_actions and int(count or 0) > 0
+            }
+        focus_actions = []
+        for action_name in list(working_memory.get("procedural_focus_actions", []) or []):
+            name = str(action_name or "")
+            if name and name in ordered_actions and name not in focus_actions:
+                focus_actions.append(name)
+        for action_name in list(working_memory.get("semantic_focus_actions", []) or []):
+            name = str(action_name or "")
+            if name and name in ordered_actions and name not in focus_actions:
+                focus_actions.append(name)
+        prior_peak = max(trained_prior_bucket.values(), default=0)
+        return sorted(
+            ordered_actions,
+            key=lambda action_name: (
+                action_name not in focus_actions,
+                recommended_actions.index(action_name)
+                if action_name in recommended_actions
+                else len(recommended_actions) + 1,
+                -(
+                    float(trained_prior_bucket.get(action_name, 0)) / float(prior_peak)
+                    if prior_peak > 0
+                    else 0.0
+                ),
+                self._working_memory_failure_signal_for_action(
+                    working_memory,
+                    action_name,
+                )["failure_streak"],
+                self._working_memory_failure_signal_for_action(
+                    working_memory,
+                    action_name,
+                )["recent_failure_count"],
+                ordered_actions.index(action_name),
+            ),
         )
 
     def _probe_dead_end_escape(
@@ -582,6 +810,18 @@ class Executive:
         ]
         if not candidates:
             return []
+        working_memory = {}
+        if context.memory_bundle is not None:
+            working_memory = dict(context.memory_bundle.working_memory or {})
+        focus_actions = []
+        for action_name in list(working_memory.get("procedural_focus_actions", []) or []):
+            name = str(action_name or "")
+            if name and name not in focus_actions:
+                focus_actions.append(name)
+        for action_name in list(working_memory.get("semantic_focus_actions", []) or []):
+            name = str(action_name or "")
+            if name and name not in focus_actions:
+                focus_actions.append(name)
         frame_signature = str(
             context.observation.derived_features.get("frame_signature", "") or ""
         ) or None
@@ -589,6 +829,15 @@ class Executive:
         return sorted(
             candidates,
             key=lambda action_name: (
+                action_name not in focus_actions,
+                self._working_memory_failure_signal_for_action(
+                    working_memory,
+                    action_name,
+                )["failure_streak"],
+                self._working_memory_failure_signal_for_action(
+                    working_memory,
+                    action_name,
+                )["recent_failure_count"],
                 action_name in recent_actions,
                 context.memory.context_outcome_counts(
                     action_name,
@@ -612,11 +861,13 @@ class Executive:
         )
         if not subgoal or not hasattr(context.hyperon, "contextual_memory_bundle"):
             return
-        bundle = context.hyperon.contextual_memory_bundle(
-            context.observation,
-            subgoal,
-            list(context.observation.legal_actions),
-        )
+        bundle = context.contextual_memory_bundles.get(subgoal)
+        if bundle is None:
+            bundle = context.hyperon.contextual_memory_bundle(
+                context.observation,
+                subgoal,
+                list(context.observation.legal_actions),
+            )
         context.contextual_memory_bundles[subgoal] = bundle
         context.llm_memory_bundle = bundle
         context.llm_subgoal_hint = subgoal
@@ -635,6 +886,7 @@ class Executive:
             ],
             key=lambda proposal: (
                 self._contextual_board_probe_priority(context, proposal),
+                self._contextual_memory_priority(context, proposal),
                 float(getattr(proposal, "confidence", 0.0)),
             ),
             reverse=True,
@@ -642,6 +894,76 @@ class Executive:
         if not ranked:
             return None
         return str(ranked[0].subgoal)
+
+    def _contextual_memory_priority(
+        self,
+        context: ExecutiveContext,
+        proposal,
+    ) -> float:
+        global_bundle = context.memory_bundle or MemoryBundle()
+        bundle = self._contextual_bundle_for_proposal(context, proposal)
+        working_memory = dict(global_bundle.working_memory or {})
+        action_name = str(getattr(proposal, "action_name", "") or "")
+        score = 0.0
+        focus_rank = self._working_memory_focus_rank(working_memory, action_name)
+        if focus_rank is not None:
+            score += max(0.10, 0.24 - (focus_rank * 0.06))
+        recommended_actions = [
+            str(name or "")
+            for name in list(
+                (bundle.recommended_actions or [])
+                or (global_bundle.recommended_actions or [])
+            )
+            if str(name or "")
+        ]
+        if action_name in recommended_actions:
+            score += max(0.08, 0.18 - (recommended_actions.index(action_name) * 0.05))
+        trained_prior_bucket = {
+            str(name): int(count)
+            for name, count in dict(bundle.trained_prior_bucket or {}).items()
+            if str(name) and int(count or 0) > 0
+        }
+        if action_name in trained_prior_bucket:
+            prior_peak = max(trained_prior_bucket.values(), default=0)
+            if prior_peak > 0:
+                score += 0.12 * (
+                    float(trained_prior_bucket.get(action_name, 0)) / float(prior_peak)
+                )
+                score += min(
+                    0.06,
+                    float(trained_prior_bucket.get(action_name, 0)) * 0.005,
+                )
+        action_failure = self._working_memory_failure_signal_for_action(
+            working_memory,
+            action_name,
+        )
+        score -= min(
+            0.22,
+            (action_failure["failure_streak"] * 0.05)
+            + (action_failure["recent_failure_count"] * 0.03),
+        )
+        return score
+
+    def _contextual_bundle_for_proposal(
+        self,
+        context: ExecutiveContext,
+        proposal,
+    ) -> MemoryBundle:
+        subgoal = str(getattr(proposal, "subgoal", "") or "")
+        if not subgoal:
+            return context.memory_bundle or MemoryBundle()
+        bundle = context.contextual_memory_bundles.get(subgoal)
+        if bundle is not None:
+            return bundle
+        if hasattr(context.hyperon, "contextual_memory_bundle"):
+            bundle = context.hyperon.contextual_memory_bundle(
+                context.observation,
+                subgoal,
+                list(context.observation.legal_actions),
+            )
+            context.contextual_memory_bundles[subgoal] = bundle
+            return bundle
+        return context.memory_bundle or MemoryBundle()
 
     def _contextual_board_probe_priority(
         self,
@@ -704,16 +1026,26 @@ class Executive:
         allow_exploratory_board_probe: bool = False,
     ) -> ActionDecision:
         bundle = context.memory_bundle or MemoryBundle()
+        working_memory = dict(bundle.working_memory or {})
+        trained_prior_bucket = {
+            str(action_name): int(count)
+            for action_name, count in dict(bundle.trained_prior_bucket or {}).items()
+            if str(action_name) and int(count or 0) > 0
+        }
         legal_actions = list(candidate_actions or context.observation.legal_actions)
         legal_actions_known = bool(
             context.observation.derived_features.get("legal_actions_known", True)
         )
-        if not legal_actions and not legal_actions_known:
+        if not legal_actions:
             return ActionDecision(
                 action_name="RESET",
                 source="fallback",
                 confidence=0.01,
-                reason="fail-closed unknown legality reset",
+                reason=(
+                    "fail-closed empty legality reset"
+                    if legal_actions_known
+                    else "fail-closed unknown legality reset"
+                ),
                 used_fallback=True,
             )
         suppressed = (
@@ -770,6 +1102,8 @@ class Executive:
                 key=lambda candidate: self._fallback_action_score(
                     context,
                     candidate,
+                    working_memory=working_memory,
+                    trained_prior_bucket=trained_prior_bucket,
                     recommended_rank=recommended_rank.get(candidate),
                     board_probe_action=board_probe_action,
                     exploratory=exploratory,
@@ -833,6 +1167,8 @@ class Executive:
         context: ExecutiveContext,
         action_name: str,
         *,
+        working_memory: dict,
+        trained_prior_bucket: dict[str, int],
         recommended_rank: int | None,
         board_probe_action: str | None,
         exploratory: bool,
@@ -840,16 +1176,38 @@ class Executive:
     ) -> float:
         recent_actions = context.memory.recent_actions()
         score = 0.0
-        if recommended_rank is not None and honor_recommended_actions:
+        focus_rank = self._working_memory_focus_rank(working_memory, action_name)
+        if focus_rank is not None:
+            score += max(0.05, 0.16 - (focus_rank * 0.04))
+        trained_prior_active = action_name in trained_prior_bucket
+        if recommended_rank is not None and (
+            honor_recommended_actions or trained_prior_active
+        ):
             if exploratory:
                 score += max(0.06, 0.18 - (recommended_rank * 0.05))
             else:
                 score += max(0.20, 0.45 - (recommended_rank * 0.10))
+        if trained_prior_active:
+            max_count = max(trained_prior_bucket.values(), default=0)
+            if max_count > 0:
+                normalized_count = float(trained_prior_bucket.get(action_name, 0)) / float(
+                    max_count
+                )
+                score += 0.12 * normalized_count
         if board_probe_action and action_name == board_probe_action:
             score += 0.12 if exploratory else 0.18
         if action_name == context.memory.most_recent_action():
             score -= 0.08
         score += self._fallback_recency_bonus(recent_actions, action_name, exploratory=exploratory)
+        action_failure = self._working_memory_failure_signal_for_action(
+            working_memory,
+            action_name,
+        )
+        score -= min(
+            0.20,
+            (action_failure["failure_streak"] * 0.04)
+            + (action_failure["recent_failure_count"] * 0.03),
+        )
         score -= context.memory.repeated_failure_penalty(action_name)
         score -= context.memory.loop_penalty(action_name)
         score -= context.memory.context_stall_penalty(

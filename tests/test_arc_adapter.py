@@ -98,6 +98,39 @@ class ArcAdapterTests(unittest.TestCase):
 
         self.assertEqual(observation.legal_actions, ["ACTION1", "ACTION4", "ACTION6"])
 
+    def test_observe_filters_unsupported_explicit_actions(self) -> None:
+        frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=["ACTION7", StubGameAction.ACTION2, "bogus"],
+        )
+
+        observation = self.adapter.observe([frame], frame)
+
+        self.assertEqual(observation.legal_actions, ["ACTION2"])
+        self.assertTrue(observation.derived_features["legal_actions_known"])
+
+    def test_observe_fails_closed_when_explicit_actions_are_all_unsupported(self) -> None:
+        frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=["ACTION7", "ACTION9"],
+        )
+
+        observation = self.adapter.observe([frame], frame)
+
+        self.assertEqual(observation.legal_actions, [])
+        self.assertTrue(observation.derived_features["legal_actions_known"])
+
+    def test_observe_reports_explicit_empty_actions_as_known_empty_legality(self) -> None:
+        frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=[],
+        )
+
+        observation = self.adapter.observe([frame], frame)
+
+        self.assertEqual(observation.legal_actions, [])
+        self.assertTrue(observation.derived_features["legal_actions_known"])
+
     def test_reset_state_reports_reset_as_only_action(self) -> None:
         frame = StubFrame(state=StubGameState.GAME_OVER)
         observation = self.adapter.observe([frame], frame)
@@ -105,6 +138,39 @@ class ArcAdapterTests(unittest.TestCase):
         self.assertEqual(observation.legal_actions, ["RESET"])
         fallback = self.adapter.fallback_decision(observation)
         self.assertEqual(fallback.action_name, "RESET")
+
+    def test_reset_state_with_explicit_empty_actions_still_reports_reset(self) -> None:
+        frame = StubFrame(
+            state=StubGameState.GAME_OVER,
+            available_actions=[],
+        )
+
+        observation = self.adapter.observe([frame], frame)
+
+        self.assertEqual(observation.legal_actions, ["RESET"])
+        self.assertTrue(observation.derived_features["legal_actions_known"])
+
+    def test_reset_state_with_only_unsupported_explicit_actions_still_reports_reset(self) -> None:
+        frame = StubFrame(
+            state=StubGameState.GAME_OVER,
+            available_actions=["ACTION7", "ACTION9"],
+        )
+
+        observation = self.adapter.observe([frame], frame)
+
+        self.assertEqual(observation.legal_actions, ["RESET"])
+        self.assertTrue(observation.derived_features["legal_actions_known"])
+
+    def test_reset_state_with_supported_non_reset_actions_still_reports_reset(self) -> None:
+        frame = StubFrame(
+            state=StubGameState.GAME_OVER,
+            available_actions=[StubGameAction.ACTION1, StubGameAction.ACTION2],
+        )
+
+        observation = self.adapter.observe([frame], frame)
+
+        self.assertEqual(observation.legal_actions, ["RESET"])
+        self.assertTrue(observation.derived_features["legal_actions_known"])
 
     def test_active_frame_without_explicit_actions_fails_closed(self) -> None:
         frame = StubFrame(state=StubGameState.ACTIVE)
@@ -282,3 +348,50 @@ class ArcAdapterTests(unittest.TestCase):
 
         self.assertIs(action, StubGameAction.ACTION6)
         self.assertEqual(getattr(action, "payload", None), {"x": 9, "y": 13})
+
+    def test_complex_action_invalid_metadata_falls_back_to_board_probe_default(self) -> None:
+        board = [[1, 2, 3], [4, 5, 6]]
+        frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=[StubGameAction.ACTION6],
+            frame=[board],
+        )
+        self.adapter.observe([frame], frame)
+        decision = ActionDecision(
+            action_name="ACTION6",
+            source="llm",
+            confidence=0.5,
+            reason="bad payload",
+            metadata={"x": "bad", "y": object()},
+        )
+
+        action = self.adapter.to_game_action(decision)
+
+        self.assertIs(action, StubGameAction.ACTION6)
+        self.assertEqual(getattr(action, "payload", None), {"x": 1, "y": 1})
+
+    def test_complex_action_invalid_metadata_falls_back_to_safe_center_without_board(self) -> None:
+        decision = ActionDecision(
+            action_name="ACTION6",
+            source="llm",
+            confidence=0.5,
+            reason="bad payload",
+            metadata={"x": None, "y": "oops"},
+        )
+
+        action = self.adapter.to_game_action(decision)
+
+        self.assertIs(action, StubGameAction.ACTION6)
+        self.assertEqual(getattr(action, "payload", None), {"x": 32, "y": 32})
+
+    def test_unsupported_decision_action_falls_back_to_reset(self) -> None:
+        decision = ActionDecision(
+            action_name="ACTION7",
+            source="symbolic",
+            confidence=0.5,
+            reason="unsupported action",
+        )
+
+        action = self.adapter.to_game_action(decision)
+
+        self.assertIs(action, StubGameAction.RESET)

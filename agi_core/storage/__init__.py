@@ -3,8 +3,10 @@ from .memory_sqlite import (
     initialize_memory_schema,
     load_basin_status,
     load_memory_bundle,
+    load_memory_bundle_from_stores,
     record_transition,
     record_transitions,
+    upsert_abstract_memory_rows,
 )
 from .priors_sqlite import (
     initialize_schema,
@@ -22,8 +24,10 @@ __all__ = [
     "load_best_prior_bucket",
     "load_game_summary",
     "load_memory_bundle",
+    "load_memory_bundle_from_stores",
     "record_transition",
     "record_transitions",
+    "upsert_abstract_memory_rows",
     "upsert_metadata",
     "upsert_training_counts",
 ]

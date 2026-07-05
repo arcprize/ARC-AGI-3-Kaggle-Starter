@@ -27,6 +27,7 @@ class EpisodicMemory:
         self._failure_streaks: defaultdict[str, int] = defaultdict(int)
         self._llm_calls = 0
         self._stagnation_steps = 0
+        self._observation_tick = 0
         self._game_id = ""
         self._pending_observation: Observation | None = None
         self._pending_decision: ActionDecision | None = None
@@ -37,21 +38,13 @@ class EpisodicMemory:
     def bind_game(self, game_id: str) -> None:
         if game_id != self._game_id:
             self._game_id = game_id
-            self._records.clear()
-            self._new_records.clear()
-            self._recent_actions.clear()
-            self._success_counts.clear()
-            self._failure_streaks.clear()
-            self._llm_calls = 0
-            self._stagnation_steps = 0
-            self._pending_observation = None
-            self._pending_decision = None
-            self._pending_score_floor_reopen = None
-            self._recent_score_floor_fallback = None
-            self._recent_probe_dead_end_escape = None
+            self._reset_episode_state()
 
     def note_observation(self, observation: Observation) -> None:
         self.bind_game(observation.game_id)
+        if self._is_same_game_restart_boundary(observation):
+            self._reset_episode_state()
+        self._observation_tick += 1
         if self._pending_observation is not None and self._pending_decision is not None:
             self._finalize_transition(observation)
         self._pending_observation = observation
@@ -68,6 +61,13 @@ class EpisodicMemory:
         ):
             self._recent_score_floor_fallback = {
                 "step_index": int(self._pending_observation.step_index),
+                "step_index_reliable": bool(
+                    self._pending_observation.derived_features.get(
+                        "step_index_reliable",
+                        True,
+                    )
+                ),
+                "observation_tick": int(self._observation_tick),
                 "state_name": str(self._pending_observation.game_state or ""),
             }
         if (
@@ -78,6 +78,13 @@ class EpisodicMemory:
         ):
             self._recent_probe_dead_end_escape = {
                 "step_index": int(self._pending_observation.step_index),
+                "step_index_reliable": bool(
+                    self._pending_observation.derived_features.get(
+                        "step_index_reliable",
+                        True,
+                    )
+                ),
+                "observation_tick": int(self._observation_tick),
                 "state_name": str(self._pending_observation.game_state or ""),
             }
 
@@ -132,6 +139,10 @@ class EpisodicMemory:
         self._pending_score_floor_reopen = {
             "state_name": state_name,
             "step_index": int(observation.step_index),
+            "step_index_reliable": bool(
+                observation.derived_features.get("step_index_reliable", True)
+            ),
+            "observation_tick": int(self._observation_tick),
             "candidate_actions": filtered_actions,
             "frame_signatures": frame_signatures,
             "score_floor_debug": summary,
@@ -153,7 +164,12 @@ class EpisodicMemory:
         ):
             self.clear_pending_score_floor_reopen()
             return None
-        if int(observation.step_index) - int(pending.get("step_index") or 0) > 4:
+        if self._step_delta_exceeds_limit(
+            observation,
+            pending,
+            limit=4,
+            clear_on_negative=False,
+        ):
             self.clear_pending_score_floor_reopen()
             return None
         candidate_actions = [
@@ -185,8 +201,12 @@ class EpisodicMemory:
         if str(observation.game_state or "") != str(pending.get("state_name") or ""):
             self._recent_score_floor_fallback = None
             return False
-        step_delta = int(observation.step_index) - int(pending.get("step_index") or 0)
-        if step_delta < 0 or step_delta > 1:
+        if self._step_delta_exceeds_limit(
+            observation,
+            pending,
+            limit=1,
+            clear_on_negative=True,
+        ):
             self._recent_score_floor_fallback = None
             return False
         return True
@@ -198,8 +218,12 @@ class EpisodicMemory:
         if str(observation.game_state or "") != str(pending.get("state_name") or ""):
             self._recent_probe_dead_end_escape = None
             return False
-        step_delta = int(observation.step_index) - int(pending.get("step_index") or 0)
-        if step_delta < 0 or step_delta > 2:
+        if self._step_delta_exceeds_limit(
+            observation,
+            pending,
+            limit=2,
+            clear_on_negative=True,
+        ):
             self._recent_probe_dead_end_escape = None
             return False
         return True
@@ -574,7 +598,146 @@ class EpisodicMemory:
             "stagnation_steps": self._stagnation_steps,
             "llm_calls": self._llm_calls,
             "current_board_context": _observation_board_context(self._pending_observation),
+            "working_memory": self.working_memory_snapshot(),
             "records": [asdict(record) for record in self._records],
+        }
+
+    def working_memory_snapshot(self) -> dict[str, object]:
+        recent_actions = self.recent_actions()
+        active_subgoal = None
+        pending_action_name = (
+            str(self._pending_decision.action_name or "")
+            if self._pending_decision is not None
+            else ""
+        )
+        recent_failures: list[dict[str, object]] = []
+        open_failure_modes: list[dict[str, object]] = []
+        seen_failure_modes: set[tuple[str, str]] = set()
+        semantic_focus_actions: list[str] = []
+        for record in reversed(self._records):
+            if active_subgoal is None and record.decision_subgoal:
+                active_subgoal = str(record.decision_subgoal)
+            if record.outcome == "progress":
+                action_name = str(record.action_name or "")
+                if action_name and action_name not in semantic_focus_actions:
+                    semantic_focus_actions.append(action_name)
+            if record.outcome == "progress":
+                continue
+            failure_action_name = str(record.action_name or "")
+            failure_subgoal = str(record.decision_subgoal or "")
+            recent_failures.append(
+                {
+                    "action_name": failure_action_name,
+                    "outcome": str(record.outcome or ""),
+                    "prior_game_state": str(record.prior_game_state or ""),
+                    "prior_frame_signature": str(record.prior_frame_signature or ""),
+                    "decision_subgoal": failure_subgoal,
+                    "stagnation_after": int(record.stagnation_after or 0),
+                }
+            )
+            failure_mode_key = (failure_action_name, failure_subgoal)
+            if failure_action_name and failure_mode_key not in seen_failure_modes:
+                seen_failure_modes.add(failure_mode_key)
+                open_failure_modes.append(
+                    {
+                        "action_name": failure_action_name,
+                        "subgoal": failure_subgoal,
+                        "outcome": str(record.outcome or ""),
+                        "stagnation_after": int(record.stagnation_after or 0),
+                        "frame_signature": str(record.prior_frame_signature or ""),
+                    }
+                )
+            if len(recent_failures) >= 4:
+                break
+        if active_subgoal is None and self._pending_decision is not None:
+            pending_subgoal = str(self._pending_decision.subgoal or "")
+            if pending_subgoal:
+                active_subgoal = pending_subgoal
+        procedural_focus_actions = [
+            action_name
+            for action_name, _count in sorted(
+                (
+                    (str(action_name), int(count or 0))
+                    for action_name, count in self._success_counts.items()
+                    if int(count or 0) > 0
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )
+            if action_name
+        ][:3]
+        failure_streaks = sorted(
+            (
+                {
+                    "action_name": str(action_name),
+                    "count": int(count or 0),
+                }
+                for action_name, count in self._failure_streaks.items()
+                if int(count or 0) > 0
+            ),
+            key=lambda item: (-int(item["count"]), str(item["action_name"])),
+        )
+        current_board_context = _observation_board_context(self._pending_observation)
+        active_state = str(self._pending_observation.game_state or "") if self._pending_observation is not None else ""
+        active_frame_signature = (
+            str(self._pending_observation.derived_features.get("frame_signature", "") or "")
+            if self._pending_observation is not None
+            else ""
+        )
+        legal_actions = (
+            list(self._pending_observation.legal_actions)
+            if self._pending_observation is not None
+            else []
+        )
+        basin_exhausted = (
+            self.is_basin_exhausted(self._pending_observation)
+            if self._pending_observation is not None
+            else False
+        )
+        suppressed_actions = list(legal_actions[:6]) if basin_exhausted else []
+        recommended_actions: list[str] = []
+        if (
+            pending_action_name
+            and pending_action_name not in suppressed_actions
+            and pending_action_name != "RESET"
+        ):
+            recommended_actions.append(pending_action_name)
+        for action_name in procedural_focus_actions:
+            if action_name and action_name not in suppressed_actions and action_name not in recommended_actions:
+                recommended_actions.append(action_name)
+        for action_name in semantic_focus_actions[:3]:
+            if action_name and action_name not in suppressed_actions and action_name not in recommended_actions:
+                recommended_actions.append(action_name)
+        basin_visits = 0
+        if self._pending_observation is not None:
+            basin_visits = sum(
+                1
+                for record in self._records
+                if str(record.prior_game_state or "") == active_state
+                and str(record.prior_frame_signature or "") == active_frame_signature
+            )
+        return {
+            "active_state": active_state,
+            "active_frame_signature": active_frame_signature,
+            "active_subgoal": active_subgoal,
+            "current_board_context": current_board_context,
+            "board_context_summary": current_board_context,
+            "legal_actions": legal_actions,
+            "recent_actions": recent_actions[-8:],
+            "recent_action_window": recent_actions[-8:],
+            "recommended_actions": recommended_actions[:4],
+            "suppressed_actions": suppressed_actions,
+            "semantic_focus_actions": semantic_focus_actions[:3],
+            "procedural_focus_actions": procedural_focus_actions,
+            "recent_failures": recent_failures,
+            "open_failure_modes": open_failure_modes[:4],
+            "failure_streaks": failure_streaks[:6],
+            "basin_exhausted": basin_exhausted,
+            "basin_visits": basin_visits,
+            "stagnation_steps": int(self._stagnation_steps),
+            "llm_calls": int(self._llm_calls),
+            "pending_score_floor_reopen": dict(self._pending_score_floor_reopen or {}),
+            "recent_score_floor_fallback": dict(self._recent_score_floor_fallback or {}),
+            "recent_probe_dead_end_escape": dict(self._recent_probe_dead_end_escape or {}),
         }
 
     def _finalize_transition(self, current_observation: Observation) -> None:
@@ -635,6 +798,69 @@ class EpisodicMemory:
         self._records.append(record)
         self._new_records.append(record)
         self._pending_decision = None
+
+    def _reset_episode_state(self) -> None:
+        self._records.clear()
+        self._new_records.clear()
+        self._recent_actions.clear()
+        self._success_counts.clear()
+        self._failure_streaks.clear()
+        self._llm_calls = 0
+        self._stagnation_steps = 0
+        self._observation_tick = 0
+        self._pending_observation = None
+        self._pending_decision = None
+        self._pending_score_floor_reopen = None
+        self._recent_score_floor_fallback = None
+        self._recent_probe_dead_end_escape = None
+
+    def _is_same_game_restart_boundary(self, observation: Observation) -> bool:
+        previous = self._pending_observation
+        if previous is None:
+            return False
+        current_step = int(observation.step_index or 0)
+        previous_step = int(previous.step_index or 0)
+        current_step_reliable = bool(
+            observation.derived_features.get("step_index_reliable", True)
+        )
+        previous_step_reliable = bool(
+            previous.derived_features.get("step_index_reliable", True)
+        )
+        restart_detected = (
+            current_step_reliable
+            and previous_step_reliable
+            and current_step < previous_step
+        )
+        previous_state = str(previous.game_state or "")
+        current_state = str(observation.game_state or "")
+        reset_exit_detected = (
+            bool(previous_state)
+            and previous_state in self._reset_state_names
+            and current_state not in self._reset_state_names
+        )
+        return restart_detected or reset_exit_detected
+
+    def _step_delta_exceeds_limit(
+        self,
+        observation: Observation,
+        pending: dict[str, object],
+        *,
+        limit: int,
+        clear_on_negative: bool,
+    ) -> bool:
+        current_step_reliable = bool(
+            observation.derived_features.get("step_index_reliable", True)
+        )
+        pending_step_reliable = bool(pending.get("step_index_reliable", True))
+        if not current_step_reliable or not pending_step_reliable:
+            observation_tick = int(pending.get("observation_tick") or 0)
+            if observation_tick <= 0:
+                return False
+            return (self._observation_tick - observation_tick) > limit
+        step_delta = int(observation.step_index) - int(pending.get("step_index") or 0)
+        if clear_on_negative and step_delta < 0:
+            return True
+        return step_delta > limit
 
 
 def _observation_board_context(observation: Observation | None) -> dict[str, object]:

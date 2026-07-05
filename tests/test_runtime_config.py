@@ -10,7 +10,7 @@ from agi_core.config import RuntimeConfig
 
 class RuntimeConfigTests(unittest.TestCase):
     def test_from_env_defaults_to_local_provider(self) -> None:
-        with patch.dict("os.environ", {}, clear=False):
+        with patch.dict("os.environ", {}, clear=True):
             config = RuntimeConfig.from_env()
 
         self.assertEqual(config.llm_provider, "local")
@@ -24,15 +24,20 @@ class RuntimeConfigTests(unittest.TestCase):
             root = Path(tmpdir)
             env = {
                 "AGI_MEMORY_DB_PATH": "var/live-memory.sqlite3",
+                "AGI_ARCHIVE_MEMORY_DB_PATH": "var/archive-memory.sqlite3",
                 "AGI_TRAINED_PRIORS_DB_PATH": "var/offline-priors.sqlite3",
             }
 
-            with patch.dict("os.environ", env, clear=False):
+            with patch.dict("os.environ", env, clear=True):
                 config = RuntimeConfig.from_env(project_root=root)
 
             self.assertEqual(
                 config.memory_db_path,
                 root / "var" / "live-memory.sqlite3",
+            )
+            self.assertEqual(
+                config.archive_memory_db_path,
+                root / "var" / "archive-memory.sqlite3",
             )
             self.assertEqual(
                 config.trained_priors_db_path,
@@ -42,6 +47,10 @@ class RuntimeConfigTests(unittest.TestCase):
                 config.memory_db_path,
                 config.trained_priors_db_path,
             )
+            self.assertNotEqual(
+                config.memory_db_path,
+                config.archive_memory_db_path,
+            )
 
     def test_from_env_reads_custom_terminal_state_names(self) -> None:
         env = {
@@ -49,7 +58,7 @@ class RuntimeConfigTests(unittest.TestCase):
             "AGI_WIN_STATE_NAME": "DONE",
         }
 
-        with patch.dict("os.environ", env, clear=False):
+        with patch.dict("os.environ", env, clear=True):
             config = RuntimeConfig.from_env()
 
         self.assertEqual(config.reset_state_names, ("READY", "LOSE"))
@@ -63,7 +72,7 @@ class RuntimeConfigTests(unittest.TestCase):
             "AGI_OPENAI_TIMEOUT_SECONDS": "17.5",
         }
 
-        with patch.dict("os.environ", env, clear=False):
+        with patch.dict("os.environ", env, clear=True):
             config = RuntimeConfig.from_env()
 
         self.assertEqual(config.llm_provider, "openai")

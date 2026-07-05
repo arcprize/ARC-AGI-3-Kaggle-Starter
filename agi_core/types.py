@@ -71,8 +71,18 @@ class EpisodeRecord:
 
 @dataclass(slots=True)
 class MemoryBundle:
+    working_memory: dict[str, Any] = field(default_factory=dict)
+    episodic_recalls: list[dict[str, Any]] = field(default_factory=list)
+    semantic_memories: list[dict[str, Any]] = field(default_factory=list)
+    procedural_memories: list[dict[str, Any]] = field(default_factory=list)
+    abstract_memories: list[dict[str, Any]] = field(default_factory=list)
+    retrieval_summary: dict[str, Any] = field(default_factory=dict)
     board_context_summary: dict[str, Any] = field(default_factory=dict)
     board_context_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pattern_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sequence_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    board_cluster_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    episode_summaries: list[dict[str, Any]] = field(default_factory=list)
     recent_records: list[dict[str, Any]] = field(default_factory=list)
     basin_status: dict[str, Any] = field(default_factory=dict)
     basin_action_stats: dict[str, dict[str, Any]] = field(default_factory=dict)

@@ -229,6 +229,167 @@ class DemoZipTrainingTests(unittest.TestCase):
                 legal_actions=["ACTION1", "ACTION2"],
             )
             self.assertTrue(memory_bundle["recent_records"])
+            self.assertTrue(memory_bundle["semantic_memories"])
+            self.assertTrue(memory_bundle["procedural_memories"])
+            self.assertTrue(memory_bundle["episodic_recalls"])
+
+    def test_infer_training_subgoal_marks_meaningful_action6_as_inspect_active_board(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = Path(tmpdir) / "demo.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr(
+                    "public_games-dataset/ls20/probe.recording.jsonl",
+                    "\n".join(
+                        [
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="probe",
+                                action_id=6,
+                                available_actions=[1, 6],
+                                state="ACTIVE",
+                                levels_completed=0,
+                                frame=[[[0, 2], [0, 0]]],
+                            ),
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="probe",
+                                action_id=1,
+                                available_actions=[1, 6],
+                                state="ACTIVE",
+                                levels_completed=1,
+                                frame=[[[2, 2], [2, 2]]],
+                            ),
+                        ]
+                    )
+                    + "\n",
+                )
+
+            steps = list(iter_steps(zip_path, "public_games-dataset/ls20/probe.recording.jsonl"))
+            subgoal = demo_zip_module._infer_training_subgoal(
+                step=steps[0],
+                next_step=steps[1],
+                future_steps=[],
+                outcome=demo_zip_module._infer_step_outcome(steps[0], steps[1]),
+                stall_streak=0,
+            )
+
+            self.assertEqual(subgoal, "inspect-active-board")
+
+    def test_build_action_prior_artifact_persists_action6_board_probe_subgoal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            zip_path = root / "demo.zip"
+            output_path = root / "artifact.sqlite3"
+            probe_frame = [[[0, 2], [0, 0]]]
+            probe_signature = compute_frame_signature(probe_frame) or ""
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr(
+                    "public_games-dataset/ls20/probe.recording.jsonl",
+                    "\n".join(
+                        [
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="probe",
+                                action_id=6,
+                                available_actions=[1, 6],
+                                state="ACTIVE",
+                                levels_completed=0,
+                                frame=probe_frame,
+                            ),
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="probe",
+                                action_id=1,
+                                available_actions=[1, 6],
+                                state="ACTIVE",
+                                levels_completed=1,
+                                frame=[[[2, 2], [2, 2]]],
+                            ),
+                        ]
+                    )
+                    + "\n",
+                )
+
+            build_action_prior_artifact(zip_path, output_path=output_path, workers=1)
+            subgoal_bucket = load_best_prior_bucket(
+                output_path,
+                "ls20",
+                "ACTIVE",
+                "missing",
+                ["ACTION1", "ACTION6"],
+                subgoal="inspect-active-board",
+            )
+            bundle = load_memory_bundle(
+                output_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature=probe_signature,
+                subgoal="inspect-active-board",
+                legal_actions=["ACTION1", "ACTION6"],
+                last_action="ACTION6",
+            )
+
+            self.assertTrue(bundle["recent_records"])
+            self.assertEqual(bundle["recent_records"][0]["action_name"], "ACTION6")
+            self.assertEqual(subgoal_bucket, {"ACTION6": 5})
+            self.assertEqual(
+                bundle["recent_records"][0]["decision_subgoal"],
+                "inspect-active-board",
+            )
+            self.assertEqual(
+                bundle["recent_records"][0]["board_context_summary"]["board_default_probe"],
+                {"x": 1, "y": 0},
+            )
+            self.assertEqual(
+                bundle["working_memory"]["active_subgoal"],
+                "inspect-active-board",
+            )
+
+    def test_infer_training_subgoal_uses_hold_win_for_terminal_setup_move(self) -> None:
+        step = demo_zip_module.TrainingStep(
+            game_id="ls20-9607627b",
+            recording_guid="demo",
+            step_index=1,
+            timestamp="2026-01-01T00:00:00+00:00",
+            frame=None,
+            available_actions=["ACTION1"],
+            action_id=1,
+            action_name="ACTION1",
+            action_data={},
+            levels_completed=0,
+            state="ACTIVE",
+            win_levels=2,
+            full_reset=False,
+            frame_signature="sig-a",
+            image_input=None,
+        )
+        win_step = demo_zip_module.TrainingStep(
+            game_id="ls20-9607627b",
+            recording_guid="demo",
+            step_index=2,
+            timestamp="2026-01-01T00:00:01+00:00",
+            frame=None,
+            available_actions=["ACTION1"],
+            action_id=1,
+            action_name="ACTION1",
+            action_data={},
+            levels_completed=1,
+            state="WIN",
+            win_levels=2,
+            full_reset=False,
+            frame_signature="sig-b",
+            image_input=None,
+        )
+
+        subgoal = demo_zip_module._infer_training_subgoal(
+            step=step,
+            next_step=win_step,
+            future_steps=[],
+            outcome=demo_zip_module._infer_step_outcome(step, win_step),
+            stall_streak=0,
+        )
+
+        self.assertEqual(subgoal, "hold-win")
 
     def test_custom_terminal_state_names_drive_demo_zip_outcome_helpers(self) -> None:
         step = demo_zip_module.TrainingStep(
@@ -1065,6 +1226,150 @@ class DemoZipTrainingTests(unittest.TestCase):
 
             self.assertGreater(bucket["ACTION1"], raw_count)
 
+    def test_cross_recording_support_populates_subgoal_priors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            zip_path = root / "demo.zip"
+            probe_frame = [[[0, 3], [0, 0]]]
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr(
+                    "public_games-dataset/ls20/probe-a.recording.jsonl",
+                    "\n".join(
+                        [
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="probe-a",
+                                action_id=6,
+                                available_actions=[1, 6],
+                                state="ACTIVE",
+                                levels_completed=0,
+                                frame=probe_frame,
+                            ),
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="probe-a",
+                                action_id=1,
+                                available_actions=[1, 6],
+                                state="ACTIVE",
+                                levels_completed=1,
+                                frame=[[[5, 5], [5, 5]]],
+                            ),
+                        ]
+                    )
+                    + "\n",
+                )
+                archive.writestr(
+                    "public_games-dataset/ls20/probe-b.recording.jsonl",
+                    "\n".join(
+                        [
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="probe-b",
+                                action_id=6,
+                                available_actions=[1, 6],
+                                state="ACTIVE",
+                                levels_completed=0,
+                                frame=probe_frame,
+                            ),
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="probe-b",
+                                action_id=1,
+                                available_actions=[1, 6],
+                                state="ACTIVE",
+                                levels_completed=1,
+                                frame=[[[6, 6], [6, 6]]],
+                            ),
+                        ]
+                    )
+                    + "\n",
+                )
+            output_path = root / "artifact.sqlite3"
+
+            artifact = build_action_prior_artifact(zip_path, output_path=output_path, workers=1)
+            raw_count = artifact["games"]["ls20"]["subgoals"]["inspect-active-board"]["actions"]["ACTION6"]
+            subgoal_bucket = load_best_prior_bucket(
+                output_path,
+                "ls20",
+                "ACTIVE",
+                "missing-frame",
+                ["ACTION1", "ACTION6"],
+                subgoal="inspect-active-board",
+            )
+
+            self.assertIn("inspect-active-board", artifact["games"]["ls20"]["subgoals"])
+            self.assertGreater(subgoal_bucket["ACTION6"], raw_count)
+            self.assertNotIn("ACTION1", subgoal_bucket)
+
+    def test_conflicting_recordings_do_not_leak_non_consensus_game_priors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            zip_path = root / "demo.zip"
+            output_path = root / "artifact.sqlite3"
+            shared_frame = [[[1, 0], [0, 1]]]
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr(
+                    "public_games-dataset/ls20/a.recording.jsonl",
+                    "\n".join(
+                        [
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="a",
+                                action_id=1,
+                                available_actions=[1, 2],
+                                state="ACTIVE",
+                                frame=shared_frame,
+                            ),
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="a",
+                                action_id=2,
+                                available_actions=[1, 2],
+                                state="ACTIVE",
+                                levels_completed=1,
+                                frame=[[[2, 2], [2, 2]]],
+                            ),
+                        ]
+                    )
+                    + "\n",
+                )
+                archive.writestr(
+                    "public_games-dataset/ls20/b.recording.jsonl",
+                    "\n".join(
+                        [
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="b",
+                                action_id=2,
+                                available_actions=[1, 2],
+                                state="ACTIVE",
+                                frame=shared_frame,
+                            ),
+                            make_line(
+                                game_id="ls20-9607627b",
+                                guid="b",
+                                action_id=1,
+                                available_actions=[1, 2],
+                                state="ACTIVE",
+                                levels_completed=1,
+                                frame=[[[3, 3], [3, 3]]],
+                            ),
+                        ]
+                    )
+                    + "\n",
+                )
+
+            build_action_prior_artifact(zip_path, output_path=output_path, workers=1)
+            bucket = load_best_prior_bucket(
+                output_path,
+                "ls20",
+                "ACTIVE",
+                "missing-frame",
+                ["ACTION1", "ACTION2"],
+            )
+
+            self.assertEqual(bucket, {})
+
     def test_endgame_progress_gets_extra_weight(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = Path(tmpdir) / "demo.zip"
@@ -1715,7 +2020,7 @@ class DemoZipTrainingTests(unittest.TestCase):
                 artifact["games"]["ls20"]["frame_signatures"][inefficient_signature]["actions"]["ACTION1"],
             )
 
-    def test_conflicting_frame_context_falls_back_to_game_prior(self) -> None:
+    def test_conflicting_frame_context_does_not_fall_back_to_non_consensus_game_prior(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             zip_path = root / "demo.zip"
@@ -1786,7 +2091,7 @@ class DemoZipTrainingTests(unittest.TestCase):
                 shared_signature,
                 ["ACTION1", "ACTION2"],
             )
-            self.assertEqual(bucket, {"ACTION1": 7, "ACTION2": 7})
+            self.assertEqual(bucket, {})
 
     def test_state_consensus_keeps_only_clear_leader(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1858,6 +2163,142 @@ class DemoZipTrainingTests(unittest.TestCase):
                 metadata = dict(connection.execute("SELECT key, value FROM metadata"))
 
             self.assertEqual(metadata["offline_memory_records"], "3")
+
+    def test_build_action_prior_artifact_refuses_live_memory_database_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            zip_path = self._build_zip(root)
+            output_path = root / "live-memory.sqlite3"
+
+            with patch.object(
+                demo_zip_module.RuntimeConfig,
+                "from_env",
+                return_value=demo_zip_module.RuntimeConfig(
+                    project_root=root,
+                    hyperon_rules_path=root / "arc.metta",
+                    hyperon_learning_path=root / "arc_learned.json",
+                    memory_db_path=output_path,
+                    archive_memory_db_path=root / "archive.sqlite3",
+                    trained_priors_db_path=root / "trained.sqlite3",
+                    hyperon_wheel_dir=root / "hyperon",
+                    extra_wheel_dir=root / "wheels",
+                    hyperon_enabled=False,
+                    hyperon_skip_probe=True,
+                    hyperon_probe_timeout_seconds=0.1,
+                    llm_provider="local",
+                    llm_model_dir=root / "models",
+                    llm_model_path=root / "models" / "executive.gguf",
+                    openai_model="gpt-4.1-mini",
+                    openai_base_url=None,
+                    openai_timeout_seconds=None,
+                    llm_max_calls_per_episode=2,
+                    llm_max_tokens=192,
+                    llm_temperature=0.1,
+                    symbolic_confidence_gate=0.7,
+                    executive_replan_stagnation_threshold=12,
+                    deterministic_fallback_action="ACTION1",
+                    reset_state_names=("LOSE", "GAME_OVER"),
+                    win_state_name="WIN",
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "refusing to overwrite live memory database"):
+                    build_action_prior_artifact(
+                        zip_path,
+                        output_path=output_path,
+                        workers=1,
+                    )
+
+    def test_build_action_prior_artifact_builds_shared_abstractions_across_games(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = Path(tmpdir) / "demo.zip"
+            output_path = Path(tmpdir) / "artifact.sqlite3"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                for game_name, runtime_game_id in (
+                    ("ar25", "ar25-11111111"),
+                    ("bp35", "bp35-22222222"),
+                ):
+                    archive.writestr(
+                        f"public_games-dataset/{game_name}/demo.recording.jsonl",
+                        "\n".join(
+                            [
+                                make_line(
+                                    game_id=runtime_game_id,
+                                    guid=f"{game_name}-demo",
+                                    action_id=2,
+                                    available_actions=[1, 2, 6],
+                                    state="ACTIVE",
+                                    levels_completed=0,
+                                    frame=[[[1, 0], [0, 1]]],
+                                ),
+                                make_line(
+                                    game_id=runtime_game_id,
+                                    guid=f"{game_name}-demo",
+                                    action_id=1,
+                                    available_actions=[1, 2, 6],
+                                    state="ACTIVE",
+                                    levels_completed=1,
+                                    frame=[[[1, 1], [1, 1]]],
+                                ),
+                            ]
+                        )
+                        + "\n",
+                    )
+
+            artifact = build_action_prior_artifact(zip_path, output_path=output_path)
+            self.assertGreaterEqual(artifact["abstract_memory_rows"], 2)
+            with closing(sqlite3.connect(output_path)) as connection:
+                row = connection.execute(
+                    """
+                    SELECT action_name, source_game_count, source_games_json
+                    FROM abstract_memories
+                    WHERE action_name = 'ACTION2'
+                    """
+                ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row[0], "ACTION2")
+            self.assertEqual(int(row[1] or 0), 2)
+            self.assertEqual(sorted(json.loads(row[2])), ["ar25", "bp35"])
+
+    def test_build_action_prior_artifact_skips_non_progress_only_abstractions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = Path(tmpdir) / "demo.zip"
+            output_path = Path(tmpdir) / "artifact.sqlite3"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr(
+                    "public_games-dataset/ar25/stalled.recording.jsonl",
+                    "\n".join(
+                        [
+                            make_line(
+                                game_id="ar25-11111111",
+                                guid="stalled",
+                                action_id=2,
+                                available_actions=[1, 2],
+                                state="ACTIVE",
+                                levels_completed=0,
+                                frame=[[[1, 0], [0, 1]]],
+                            ),
+                            make_line(
+                                game_id="ar25-11111111",
+                                guid="stalled",
+                                action_id=2,
+                                available_actions=[1, 2],
+                                state="ACTIVE",
+                                levels_completed=0,
+                                frame=[[[1, 0], [0, 1]]],
+                            ),
+                        ]
+                    )
+                    + "\n",
+                )
+
+            artifact = build_action_prior_artifact(zip_path, output_path=output_path)
+            self.assertEqual(artifact["abstract_memory_rows"], 0)
+            with closing(sqlite3.connect(output_path)) as connection:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM abstract_memories"
+                ).fetchone()[0]
+            self.assertEqual(int(count or 0), 0)
 
 
 if __name__ == "__main__":

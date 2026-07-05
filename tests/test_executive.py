@@ -14,6 +14,7 @@ from agi_core.specialists.symbolic import SymbolicSpecialist
 from agi_core.types import (
     ActionDecision,
     ActionProposal,
+    EpisodeRecord,
     ExecutiveContext,
     GoalState,
     MemoryBundle,
@@ -76,6 +77,7 @@ class FakeContextualHyperon:
         self.contextual_calls.append((subgoal, list(legal_actions)))
         return MemoryBundle(
             recommended_actions=["ACTION2"],
+            trained_prior_bucket={"ACTION2": 9, "ACTION1": 2},
             subgoal_action_stats={
                 "ACTION2": {"progress": 2, "failed": 0, "stalled": 0, "total": 2},
             },
@@ -127,6 +129,23 @@ def build_context(
         config=config,
         episode_id=observation.game_id,
     )
+
+
+def make_ar25_opening_board(
+    *,
+    reflected_origin: tuple[int, int],
+    target_origin: tuple[int, int] = (17, 15),
+) -> list[list[int]]:
+    board = [[0 for _ in range(21)] for _ in range(21)]
+    reflected_shape = ((0, 0), (1, 0), (2, 0), (0, 1), (0, 2))
+    target_shape = ((0, 0), (1, 0), (2, 0), (0, 1), (0, 2))
+    rx, ry = reflected_origin
+    tx, ty = target_origin
+    for dx, dy in reflected_shape:
+        board[ry + dy][rx + dx] = 4
+    for dx, dy in target_shape:
+        board[ty + dy][tx + dx] = 11
+    return board
 
 
 class ExecutiveTests(unittest.TestCase):
@@ -470,6 +489,25 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(decision.action_name, "RESET")
         self.assertEqual(decision.reason, "fail-closed unknown legality reset")
 
+    def test_known_empty_legality_fails_closed_to_reset(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=[],
+            derived_features={"legal_actions_known": True},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+
+        decision = self.executive.decide(context)
+
+        self.assertTrue(decision.used_fallback)
+        self.assertEqual(decision.action_name, "RESET")
+        self.assertEqual(decision.reason, "fail-closed empty legality reset")
+
     def test_reactive_no_explicit_legal_actions_keeps_board_probe_metadata_and_subgoal(self) -> None:
         memory = EpisodicMemory()
         board = [[0, 0, 0], [0, 6, 6], [0, 6, 6]]
@@ -597,6 +635,76 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(decision.reason, "memory-aware legal fallback")
         self.assertEqual(decision.metadata, {"x": 2, "y": 2})
         self.assertEqual(decision.subgoal, "inspect-active-board")
+
+    def test_fallback_prefers_working_memory_focus_action_without_recommendations(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=9,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION2"],
+                "semantic_focus_actions": ["ACTION3"],
+            }
+        )
+
+        decision = self.executive._memory_aware_fallback(context)
+
+        self.assertTrue(decision.used_fallback)
+        self.assertEqual(decision.action_name, "ACTION2")
+        self.assertEqual(decision.reason, "memory-aware legal fallback")
+
+    def test_fallback_uses_trained_prior_recommended_order_without_explicit_honor_flag(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=9,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            recommended_actions=["ACTION2", "ACTION3", "ACTION1"],
+            trained_prior_bucket={"ACTION1": 1, "ACTION2": 9, "ACTION3": 2},
+        )
+
+        decision = self.executive._memory_aware_fallback(context)
+
+        self.assertTrue(decision.used_fallback)
+        self.assertEqual(decision.action_name, "ACTION2")
+        self.assertEqual(decision.reason, "memory-aware executive fallback")
+
+    def test_fallback_demotes_working_memory_failure_action(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=9,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION3"],
+                "recent_failures": [{"action_name": "ACTION2", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION2", "count": 3}],
+            }
+        )
+
+        decision = self.executive._memory_aware_fallback(context)
+
+        self.assertTrue(decision.used_fallback)
+        self.assertEqual(decision.action_name, "ACTION3")
 
     def test_fallback_avoids_repeating_stalled_board_probe_action(self) -> None:
         memory = EpisodicMemory()
@@ -1647,6 +1755,57 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(proposals[0].action_name, "ACTION3")
         self.assertEqual(proposals[0].reason, "memory-informed reactive baseline")
 
+    def test_reactive_uses_memory_focus_baseline_when_recommendations_are_absent(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=1,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-reactive-focus-baseline"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION2"],
+                "semantic_focus_actions": ["ACTION3"],
+            },
+            suppressed_actions=["ACTION1"],
+        )
+
+        proposals = self.executive.reactive.propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertEqual(proposals[0].reason, "memory-focus reactive baseline")
+
+    def test_reactive_uses_trained_prior_baseline_when_recommendations_are_absent(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=1,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-reactive-trained-prior-baseline"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            trained_prior_bucket={"ACTION1": 1, "ACTION2": 9, "ACTION3": 2},
+            suppressed_actions=["ACTION1"],
+        )
+
+        proposals = self.executive.reactive.propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertEqual(proposals[0].reason, "trained-prior reactive baseline")
+
     def test_reactive_memory_baseline_assigns_default_metadata_for_complex_action(self) -> None:
         memory = EpisodicMemory()
         memory.bind_game("ls20")
@@ -1732,6 +1891,155 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(proposals[0].metadata, {"x": 2, "y": 2})
         self.assertEqual(proposals[0].subgoal, "inspect-active-board")
 
+    def test_reactive_ar25_opening_alignment_prefers_left_before_board_probe(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ar25")
+        board = make_ar25_opening_board(reflected_origin=(12, 5))
+        observation = Observation(
+            game_id="ar25",
+            step_index=0,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action=None,
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "ACTION7"],
+            image_input=BoardImageInput(
+                board=board,
+                height=21,
+                width=21,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-ar25-opening-left"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+
+        proposals = self.executive.reactive.propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION3")
+        self.assertEqual(proposals[0].reason, "ar25 mirrored opening alignment")
+
+    def test_reactive_ar25_opening_alignment_switches_to_down_after_horizontal_match(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ar25")
+        memory._records.append(
+            EpisodeRecord(
+                game_id="ar25",
+                step_index=15,
+                action_name="ACTION1",
+                outcome="progress",
+                progress_delta=1,
+                game_state="NOT_FINISHED",
+                prior_game_state="NOT_FINISHED",
+                levels_completed=1,
+            )
+        )
+        for step_index, action_name in enumerate(("ACTION3", "ACTION3", "ACTION5"), start=16):
+            memory._records.append(
+                EpisodeRecord(
+                    game_id="ar25",
+                    step_index=step_index,
+                    action_name=action_name,
+                    outcome="stalled",
+                    progress_delta=0,
+                    game_state="NOT_FINISHED",
+                    prior_game_state="NOT_FINISHED",
+                    levels_completed=1,
+                )
+            )
+        board = make_ar25_opening_board(reflected_origin=(17, 5))
+        observation = Observation(
+            game_id="ar25",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=1,
+            last_action="ACTION3",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "ACTION7"],
+            image_input=BoardImageInput(
+                board=board,
+                height=21,
+                width=21,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-ar25-opening-down"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+
+        proposals = self.executive.reactive.propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertEqual(proposals[0].reason, "ar25 mirrored opening alignment")
+
+    def test_reactive_ar25_level2_start_aligns_control_before_switching_selection(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ar25")
+        memory._records.append(
+            EpisodeRecord(
+                game_id="ar25",
+                step_index=15,
+                action_name="ACTION1",
+                outcome="progress",
+                progress_delta=1,
+                game_state="NOT_FINISHED",
+                prior_game_state="NOT_FINISHED",
+                levels_completed=1,
+            )
+        )
+        board = make_ar25_opening_board(reflected_origin=(17, 5))
+        observation = Observation(
+            game_id="ar25",
+            step_index=15,
+            game_state="NOT_FINISHED",
+            levels_completed=1,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "ACTION7"],
+            image_input=BoardImageInput(
+                board=board,
+                height=21,
+                width=21,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-ar25-level2-start"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+
+        proposals = self.executive.reactive.propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION3")
+        self.assertEqual(proposals[0].reason, "ar25 mirrored opening alignment")
+
+    def test_executive_fast_paths_ar25_opening_alignment(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ar25")
+        board = make_ar25_opening_board(reflected_origin=(12, 5))
+        observation = Observation(
+            game_id="ar25",
+            step_index=0,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action=None,
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6", "ACTION7"],
+            image_input=BoardImageInput(
+                board=board,
+                height=21,
+                width=21,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-ar25-opening-fast-path"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+
+        decision = self.executive.decide(context)
+
+        self.assertEqual(decision.action_name, "ACTION3")
+        self.assertEqual(decision.source, "reactive")
+        self.assertEqual(decision.reason, "ar25 mirrored opening alignment")
+
     def test_symbolic_assigns_adapter_metadata_for_complex_action(self) -> None:
         memory = EpisodicMemory()
         board = [[0, 0, 0], [4, 4, 0], [4, 4, 0]]
@@ -1773,6 +2081,95 @@ class ExecutiveTests(unittest.TestCase):
         self.assertTrue(proposals)
         self.assertEqual(proposals[0].action_name, "ACTION6")
         self.assertEqual(proposals[0].metadata, {"x": 1, "y": 2})
+
+    def test_symbolic_prefers_working_memory_focus_action(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=2,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-symbolic-working-focus"},
+        )
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(payload=None, available=False),
+        )
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION2"],
+            }
+        )
+
+        class FocusHyperon(FakeContextualHyperon):
+            def run_rules(self, query: str):
+                if query == "goal-hints":
+                    return [{"subgoal": "break-stall", "confidence": 0.8}]
+                if query == "reset-needed":
+                    return []
+                if query == "action-priors:break-stall":
+                    return [
+                        {"action_name": "ACTION1", "confidence": 0.68, "reason": "base prior"},
+                        {"action_name": "ACTION2", "confidence": 0.60, "reason": "focus prior"},
+                    ]
+                if query == "action-priors":
+                    return []
+                return []
+
+        context.hyperon = FocusHyperon()
+
+        proposals = self.executive.symbolic.propose(context)
+
+        self.assertGreaterEqual(len(proposals), 2)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+
+    def test_symbolic_demotes_working_memory_failure_action(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=2,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-symbolic-working-failure"},
+        )
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(payload=None, available=False),
+        )
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION1", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 3}],
+            }
+        )
+
+        class FailureHyperon(FakeContextualHyperon):
+            def run_rules(self, query: str):
+                if query == "goal-hints":
+                    return [{"subgoal": "break-stall", "confidence": 0.8}]
+                if query == "reset-needed":
+                    return []
+                if query == "action-priors:break-stall":
+                    return [
+                        {"action_name": "ACTION1", "confidence": 0.72, "reason": "repeat prior"},
+                        {"action_name": "ACTION2", "confidence": 0.64, "reason": "clean prior"},
+                    ]
+                if query == "action-priors":
+                    return []
+                return []
+
+        context.hyperon = FailureHyperon()
+
+        proposals = self.executive.symbolic.propose(context)
+
+        self.assertGreaterEqual(len(proposals), 2)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
 
     def test_symbolic_adds_board_target_fallback_when_priors_are_absent(self) -> None:
         memory = EpisodicMemory()
@@ -2039,6 +2436,180 @@ class ExecutiveTests(unittest.TestCase):
 
         self.assertEqual(selected, "inspect-centroid")
 
+    def test_executive_prefers_current_memory_focus_subgoal_when_confidence_is_close(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-contextual-focus-priority"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION2"],
+            }
+        )
+
+        selected = self.executive._select_contextual_subgoal(
+            context,
+            [
+                ActionProposal(
+                    action_name="ACTION1",
+                    source="symbolic",
+                    confidence=0.62,
+                    reason="slightly higher raw confidence",
+                    subgoal="advance-level",
+                ),
+                ActionProposal(
+                    action_name="ACTION2",
+                    source="symbolic",
+                    confidence=0.58,
+                    reason="memory-focused option",
+                    subgoal="break-stall",
+                ),
+            ],
+            [],
+        )
+
+        self.assertEqual(selected, "break-stall")
+
+    def test_executive_prefers_trained_prior_subgoal_when_confidence_is_close(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-contextual-trained-prior"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle()
+        context.contextual_memory_bundles["advance-level"] = MemoryBundle(
+            trained_prior_bucket={"ACTION1": 9, "ACTION2": 1},
+        )
+        context.contextual_memory_bundles["break-stall"] = MemoryBundle(
+            trained_prior_bucket={"ACTION1": 1, "ACTION2": 11},
+        )
+
+        selected = self.executive._select_contextual_subgoal(
+            context,
+            [
+                ActionProposal(
+                    action_name="ACTION1",
+                    source="symbolic",
+                    confidence=0.62,
+                    reason="slightly higher raw confidence",
+                    subgoal="advance-level",
+                ),
+                ActionProposal(
+                    action_name="ACTION2",
+                    source="symbolic",
+                    confidence=0.58,
+                    reason="trained-prior-backed option",
+                    subgoal="break-stall",
+                ),
+            ],
+            [],
+        )
+
+        self.assertEqual(selected, "break-stall")
+
+    def test_executive_contextual_subgoal_selection_uses_subgoal_specific_trained_priors(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-contextual-subgoal-trained-prior"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            recommended_actions=["ACTION1"],
+            trained_prior_bucket={"ACTION1": 9, "ACTION2": 1},
+        )
+        context.contextual_memory_bundles["advance-level"] = MemoryBundle(
+            recommended_actions=["ACTION1"],
+            trained_prior_bucket={"ACTION1": 9, "ACTION2": 1},
+        )
+        context.contextual_memory_bundles["break-stall"] = MemoryBundle(
+            recommended_actions=["ACTION2"],
+            trained_prior_bucket={"ACTION1": 1, "ACTION2": 11},
+        )
+
+        selected = self.executive._select_contextual_subgoal(
+            context,
+            [
+                ActionProposal(
+                    action_name="ACTION1",
+                    source="symbolic",
+                    confidence=0.62,
+                    reason="global-bundle favorite",
+                    subgoal="advance-level",
+                ),
+                ActionProposal(
+                    action_name="ACTION2",
+                    source="symbolic",
+                    confidence=0.58,
+                    reason="subgoal-trained-prior favorite",
+                    subgoal="break-stall",
+                ),
+            ],
+            [],
+        )
+
+        self.assertEqual(selected, "break-stall")
+
+    def test_executive_demotes_current_memory_failure_subgoal_when_confidence_is_close(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-contextual-failure-priority"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION1", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 3}],
+            }
+        )
+
+        selected = self.executive._select_contextual_subgoal(
+            context,
+            [
+                ActionProposal(
+                    action_name="ACTION1",
+                    source="symbolic",
+                    confidence=0.63,
+                    reason="slightly higher raw confidence",
+                    subgoal="repeat-failure",
+                ),
+                ActionProposal(
+                    action_name="ACTION2",
+                    source="symbolic",
+                    confidence=0.60,
+                    reason="cleaner alternative",
+                    subgoal="break-stall",
+                ),
+            ],
+            [],
+        )
+
+        self.assertEqual(selected, "break-stall")
+
     def test_executive_replan_mode_suppresses_reactive_under_deep_stagnation(self) -> None:
         memory = EpisodicMemory()
         memory.bind_game("ls20")
@@ -2210,6 +2781,123 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(decision.source, "llm")
         self.assertEqual(decision.action_name, "ACTION2")
 
+    def test_emergency_llm_replan_uses_working_memory_failure_pressure_before_old_threshold(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        memory.note_llm_call()
+        memory.note_llm_call()
+        frame_signature = "sig-emergency-working-memory"
+        for index, action_name in enumerate(("ACTION1", "ACTION2", "ACTION1", "ACTION2")):
+            before = Observation(
+                game_id="ls20",
+                step_index=index,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=None,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+                derived_features={"frame_signature": frame_signature},
+            )
+            after = Observation(
+                game_id="ls20",
+                step_index=index + 1,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=action_name,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+                derived_features={"frame_signature": frame_signature},
+            )
+            memory.note_observation(before)
+            memory.note_decision(
+                ActionDecision(
+                    action_name=action_name,
+                    source="fallback",
+                    confidence=0.05,
+                    reason="score-floor executive fallback",
+                )
+            )
+            memory.note_observation(after)
+
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION2",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": frame_signature},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            working_memory={
+                "recent_failures": [
+                    {"action_name": "ACTION1", "outcome": "stalled"},
+                    {"action_name": "ACTION2", "outcome": "stalled"},
+                ],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 3}],
+            },
+            suppressed_actions=["ACTION1", "ACTION2"],
+        )
+
+        self.assertEqual(memory.stagnation_steps, 4)
+        self.assertTrue(self.executive._should_force_emergency_llm_replan(context))
+
+    def test_emergency_llm_replan_ignores_weak_working_memory_failure_pressure(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        memory.note_llm_call()
+        memory.note_llm_call()
+        for index, action_name in enumerate(("ACTION1", "ACTION2", "ACTION1", "ACTION2")):
+            before = Observation(
+                game_id="ls20",
+                step_index=index,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=None,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+                derived_features={"frame_signature": "sig-emergency-working-memory-weak"},
+            )
+            after = Observation(
+                game_id="ls20",
+                step_index=index + 1,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=action_name,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+                derived_features={"frame_signature": "sig-emergency-working-memory-weak"},
+            )
+            memory.note_observation(before)
+            memory.note_decision(
+                ActionDecision(
+                    action_name=action_name,
+                    source="fallback",
+                    confidence=0.05,
+                    reason="score-floor executive fallback",
+                )
+            )
+            memory.note_observation(after)
+
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION2",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-emergency-working-memory-weak"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION1", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            },
+        )
+
+        self.assertEqual(memory.stagnation_steps, 4)
+        self.assertFalse(self.executive._should_force_emergency_llm_replan(context))
+
     def test_basin_exhaustion_drops_symbolic_below_gate_and_triggers_llm(self) -> None:
         memory = EpisodicMemory()
         memory.bind_game("ls20")
@@ -2358,6 +3046,226 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(decision.source, "llm")
         self.assertEqual(decision.action_name, "ACTION2")
         self.assertTrue(context.probe_dead_end_replan)
+
+    def test_probe_dead_end_replan_uses_working_memory_action6_failure_signal(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        board = [[0, 0, 0], [0, 5, 5], [0, 5, 5]]
+        first = Observation(
+            game_id="ls20",
+            step_index=0,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action=None,
+            legal_actions=["ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-working-memory"},
+        )
+        second = Observation(
+            game_id="ls20",
+            step_index=1,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION6",
+            legal_actions=["ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-working-memory"},
+        )
+        third = Observation(
+            game_id="ls20",
+            step_index=2,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION2",
+            legal_actions=["ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-working-memory"},
+        )
+        fourth = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION6",
+            legal_actions=["ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-working-memory"},
+        )
+        memory.note_observation(first)
+        memory.note_decision(
+            ActionDecision(
+                action_name="ACTION6",
+                source="symbolic",
+                confidence=0.70,
+                reason="board probe",
+                subgoal="inspect-active-board",
+            )
+        )
+        memory.note_observation(second)
+        memory.note_decision(
+            ActionDecision(
+                action_name="ACTION2",
+                source="symbolic",
+                confidence=0.55,
+                reason="non-probe detour",
+                subgoal="break-stall",
+            )
+        )
+        memory.note_observation(third)
+        memory.note_decision(
+            ActionDecision(
+                action_name="ACTION6",
+                source="symbolic",
+                confidence=0.50,
+                reason="probe revisit",
+                subgoal="inspect-active-board",
+            )
+        )
+        memory.note_observation(fourth)
+        context = build_context(fourth, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION6", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION6", "count": 2}],
+            }
+        )
+
+        self.assertEqual(memory.stagnation_steps, 3)
+        self.assertTrue(self.executive._should_force_probe_dead_end_llm_replan(context))
+
+    def test_probe_dead_end_replan_ignores_weak_working_memory_action6_failure_signal(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        board = [[0, 0, 0], [0, 5, 5], [0, 5, 5]]
+        first = Observation(
+            game_id="ls20",
+            step_index=0,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action=None,
+            legal_actions=["ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-working-memory-weak"},
+        )
+        second = Observation(
+            game_id="ls20",
+            step_index=1,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION6",
+            legal_actions=["ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-working-memory-weak"},
+        )
+        third = Observation(
+            game_id="ls20",
+            step_index=2,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION2",
+            legal_actions=["ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-working-memory-weak"},
+        )
+        fourth = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION6",
+            legal_actions=["ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-working-memory-weak"},
+        )
+        memory.note_observation(first)
+        memory.note_decision(
+            ActionDecision(
+                action_name="ACTION6",
+                source="symbolic",
+                confidence=0.70,
+                reason="board probe",
+                subgoal="inspect-active-board",
+            )
+        )
+        memory.note_observation(second)
+        memory.note_decision(
+            ActionDecision(
+                action_name="ACTION2",
+                source="symbolic",
+                confidence=0.50,
+                reason="non-probe detour",
+                subgoal="break-stall",
+            )
+        )
+        memory.note_observation(third)
+        memory.note_decision(
+            ActionDecision(
+                action_name="ACTION6",
+                source="symbolic",
+                confidence=0.48,
+                reason="probe revisit",
+                subgoal="inspect-active-board",
+            )
+        )
+        memory.note_observation(fourth)
+        context = build_context(fourth, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [],
+                "failure_streaks": [{"action_name": "ACTION6", "count": 1}],
+            }
+        )
+
+        self.assertEqual(memory.stagnation_steps, 3)
+        self.assertFalse(self.executive._should_force_probe_dead_end_llm_replan(context))
 
     def test_llm_specialist_filters_action6_during_probe_dead_end_replan(self) -> None:
         memory = EpisodicMemory()
@@ -2574,6 +3482,74 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(decision.source, "fallback")
         self.assertEqual(decision.reason, "probe-dead-end executive escape")
         self.assertTrue(decision.used_fallback)
+
+    def test_probe_dead_end_escape_actions_prefer_working_memory_focus_action(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        board = [[0, 0, 0], [0, 5, 5], [0, 5, 5]]
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION6",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-focus-order"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION2"],
+                "semantic_focus_actions": ["ACTION3"],
+            }
+        )
+
+        ranked = self.executive._probe_dead_end_escape_actions(context)
+
+        self.assertGreaterEqual(len(ranked), 3)
+        self.assertEqual(ranked[0], "ACTION2")
+
+    def test_probe_dead_end_escape_actions_demote_working_memory_failure_action(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        board = [[0, 0, 0], [0, 5, 5], [0, 5, 5]]
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION6",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-probe-dead-end-failure-order"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION2", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION2", "count": 3}],
+                "procedural_focus_actions": ["ACTION3"],
+            }
+        )
+
+        ranked = self.executive._probe_dead_end_escape_actions(context)
+
+        self.assertGreaterEqual(len(ranked), 3)
+        self.assertEqual(ranked[0], "ACTION3")
+        self.assertGreater(ranked.index("ACTION2"), ranked.index("ACTION1"))
 
     def test_probe_dead_end_followup_escape_blocks_immediate_symbolic_rebound(self) -> None:
         class StubSpecialist:
@@ -3677,7 +4653,7 @@ class ExecutiveTests(unittest.TestCase):
 
         self.assertEqual(decision.source, "fallback")
         self.assertEqual(decision.reason, "score-floor memory escape")
-        self.assertEqual(decision.action_name, "ACTION1")
+        self.assertEqual(decision.action_name, "ACTION4")
         self.assertEqual(decision.subgoal, "replan")
         self.assertIn("score_floor_debug", decision.metadata)
 
@@ -3810,7 +4786,7 @@ class ExecutiveTests(unittest.TestCase):
 
         self.assertEqual(decision.source, "fallback")
         self.assertEqual(decision.reason, "score-floor memory escape")
-        self.assertEqual(decision.action_name, "ACTION1")
+        self.assertEqual(decision.action_name, "ACTION4")
 
     def test_score_floor_memory_escape_stays_within_score_floor_candidate_set(self) -> None:
         class StubSpecialist:
@@ -4752,6 +5728,100 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(decision.source, "fallback")
         self.assertNotEqual(decision.reason, "score-floor memory escape")
 
+    def test_score_floor_memory_escape_prefers_working_memory_focus_action_in_preferred_order(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION3",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-score-floor-focus-order"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION2"],
+                "semantic_focus_actions": ["ACTION3"],
+            },
+        )
+        context.score_floor_proposals = [
+            ActionProposal("ACTION1", "symbolic", 0.05, "symbolic floor"),
+            ActionProposal("ACTION2", "symbolic", 0.05, "symbolic floor"),
+            ActionProposal("ACTION3", "symbolic", 0.05, "symbolic floor"),
+        ]
+
+        preferred_actions = self.executive._score_floor_escape_preferred_actions(context)
+
+        self.assertEqual(preferred_actions[0], "ACTION2")
+
+    def test_score_floor_memory_escape_demotes_working_memory_failure_action_in_preferred_order(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION3",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-score-floor-failure-order"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION3"],
+                "recent_failures": [{"action_name": "ACTION2", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION2", "count": 3}],
+            },
+        )
+        context.score_floor_proposals = [
+            ActionProposal("ACTION1", "symbolic", 0.05, "symbolic floor"),
+            ActionProposal("ACTION2", "symbolic", 0.05, "symbolic floor"),
+            ActionProposal("ACTION3", "symbolic", 0.05, "symbolic floor"),
+        ]
+
+        preferred_actions = self.executive._score_floor_escape_preferred_actions(context)
+
+        self.assertEqual(preferred_actions[0], "ACTION3")
+        self.assertGreater(
+            preferred_actions.index("ACTION2"),
+            preferred_actions.index("ACTION1"),
+        )
+
+    def test_score_floor_memory_escape_prefers_trained_prior_order_when_focus_is_absent(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION3",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-score-floor-trained-prior-order"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            recommended_actions=["ACTION2", "ACTION1", "ACTION3"],
+            trained_prior_bucket={"ACTION1": 1, "ACTION2": 9, "ACTION3": 2},
+        )
+        context.score_floor_proposals = [
+            ActionProposal("ACTION1", "symbolic", 0.05, "symbolic floor"),
+            ActionProposal("ACTION2", "symbolic", 0.05, "symbolic floor"),
+            ActionProposal("ACTION3", "symbolic", 0.05, "symbolic floor"),
+        ]
+
+        preferred_actions = self.executive._score_floor_escape_preferred_actions(context)
+
+        self.assertEqual(preferred_actions[0], "ACTION2")
+        self.assertLess(
+            preferred_actions.index("ACTION1"),
+            preferred_actions.index("ACTION3"),
+        )
+
     def test_episode_only_basin_exhaustion_enters_replan_without_persisted_bundle(self) -> None:
         memory = EpisodicMemory()
         memory.bind_game("ls20")
@@ -4871,6 +5941,124 @@ class ExecutiveTests(unittest.TestCase):
         self.assertLess(memory.stagnation_steps, context.config.executive_replan_stagnation_threshold)
         self.assertEqual(llm_backend.calls, 1)
         self.assertEqual(decision.source, "llm")
+
+    def test_working_memory_failure_streak_enters_replan_before_global_threshold(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        for index, action_name in enumerate(("ACTION1", "ACTION1")):
+            before = Observation(
+                game_id="ls20",
+                step_index=index,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=None,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                derived_features={"frame_signature": "sig-working-memory-failure"},
+            )
+            after = Observation(
+                game_id="ls20",
+                step_index=index + 1,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=action_name,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                derived_features={"frame_signature": "sig-working-memory-failure"},
+            )
+            memory.note_observation(before)
+            memory.note_decision(
+                ActionDecision(
+                    action_name=action_name,
+                    source="symbolic",
+                    confidence=0.5,
+                    reason="working-memory-failure-seed",
+                    subgoal="break-stall",
+                )
+            )
+            memory.note_observation(after)
+
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-working-memory-failure"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [
+                    {"action_name": "ACTION1", "outcome": "stalled"},
+                    {"action_name": "ACTION1", "outcome": "stalled"},
+                ],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 3}],
+            }
+        )
+
+        self.assertEqual(memory.stagnation_steps, 2)
+        self.assertLess(
+            memory.stagnation_steps,
+            context.config.executive_replan_stagnation_threshold,
+        )
+        self.assertTrue(self.executive._should_enter_replan_mode(context))
+
+    def test_working_memory_failure_streak_below_threshold_does_not_enter_replan(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        for index, action_name in enumerate(("ACTION1", "ACTION1")):
+            before = Observation(
+                game_id="ls20",
+                step_index=index,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=None,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                derived_features={"frame_signature": "sig-working-memory-failure-low"},
+            )
+            after = Observation(
+                game_id="ls20",
+                step_index=index + 1,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=action_name,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                derived_features={"frame_signature": "sig-working-memory-failure-low"},
+            )
+            memory.note_observation(before)
+            memory.note_decision(
+                ActionDecision(
+                    action_name=action_name,
+                    source="symbolic",
+                    confidence=0.5,
+                    reason="working-memory-failure-low-seed",
+                    subgoal="break-stall",
+                )
+            )
+            memory.note_observation(after)
+
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-working-memory-failure-low"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [
+                    {"action_name": "ACTION1", "outcome": "stalled"},
+                    {"action_name": "ACTION1", "outcome": "stalled"},
+                ],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            }
+        )
+
+        self.assertEqual(memory.stagnation_steps, 2)
+        self.assertFalse(self.executive._should_enter_replan_mode(context))
 
     def test_replan_mode_rescoring_biases_llm_above_stale_symbolic_candidates(self) -> None:
         class StubSpecialist:
@@ -5070,7 +6258,22 @@ class ExecutiveTests(unittest.TestCase):
         self.assertTrue(proposals)
         self.assertIn("state_json=", llm_backend.last_prompt)
         self.assertIn('"basin_status"', llm_backend.last_prompt)
+        self.assertIn('"working_memory"', llm_backend.last_prompt)
+        self.assertIn('"recent_failures"', llm_backend.last_prompt)
+        self.assertIn('"failure_streaks"', llm_backend.last_prompt)
+        self.assertIn('"board_context_summary"', llm_backend.last_prompt)
+        self.assertIn('"basin_visits":1', llm_backend.last_prompt)
+        self.assertIn('"episodic_recalls"', llm_backend.last_prompt)
+        self.assertIn('"semantic_memories"', llm_backend.last_prompt)
+        self.assertIn('"procedural_memories"', llm_backend.last_prompt)
+        self.assertIn('"retrieval_summary"', llm_backend.last_prompt)
+        self.assertIn('"active_subgoal":"break-stall"', llm_backend.last_prompt)
+        self.assertIn('"runtime_has_working_memory":true', llm_backend.last_prompt)
+        self.assertIn('"episode_summaries"', llm_backend.last_prompt)
         self.assertIn('"recent_records"', llm_backend.last_prompt)
+        self.assertIn('"pattern_action_stats"', llm_backend.last_prompt)
+        self.assertIn('"sequence_action_stats"', llm_backend.last_prompt)
+        self.assertIn('"board_cluster_action_stats"', llm_backend.last_prompt)
         self.assertIn('"basin_action_stats"', llm_backend.last_prompt)
         self.assertIn("If memory_basin_exhausted=true", llm_backend.last_prompt)
         self.assertIn('"height":2', llm_backend.last_prompt)
@@ -5081,6 +6284,10 @@ class ExecutiveTests(unittest.TestCase):
         self.assertIn('"matrix":[[1,2],[3,4]]', llm_backend.last_prompt)
         self.assertIn(
             "When board_active_cells>0 and ACTION6 is legal, use board_default_probe",
+            llm_backend.last_prompt,
+        )
+        self.assertIn(
+            "If memory_trained_prior_focus or memory_trained_prior_bucket has a clear unsuppressed leader",
             llm_backend.last_prompt,
         )
 
@@ -5217,6 +6424,44 @@ class ExecutiveTests(unittest.TestCase):
 
         self.assertEqual(rescored[0].action_name, "ACTION2")
 
+    def test_critic_uses_trained_prior_strength_to_break_close_proposal_ties(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=6,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-critic-trained-prior"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            trained_prior_bucket={"ACTION1": 1, "ACTION2": 9},
+        )
+
+        rescored = self.executive.critic.rescore(
+            context,
+            [
+                ActionProposal(
+                    action_name="ACTION1",
+                    source="symbolic",
+                    confidence=0.74,
+                    reason="close-default",
+                ),
+                ActionProposal(
+                    action_name="ACTION2",
+                    source="symbolic",
+                    confidence=0.69,
+                    reason="trained-prior-backed",
+                ),
+            ],
+        )
+
+        self.assertEqual(rescored[0].action_name, "ACTION2")
+        self.assertGreater(rescored[0].score, rescored[1].score)
+
     def test_critic_demotes_memory_suppressed_action(self) -> None:
         memory = EpisodicMemory()
         memory.bind_game("ls20")
@@ -5251,6 +6496,212 @@ class ExecutiveTests(unittest.TestCase):
                     source="symbolic",
                     confidence=0.70,
                     reason="fresh",
+                ),
+            ],
+        )
+
+        self.assertEqual(rescored[0].action_name, "ACTION2")
+
+    def test_reactive_stall_breaker_uses_working_memory_failures_and_focus(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        for index, action_name in enumerate(("ACTION3", "ACTION4")):
+            before = Observation(
+                game_id="ls20",
+                step_index=index,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=None,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                derived_features={"frame_signature": "sig-reactive-working-memory-rank"},
+            )
+            after = Observation(
+                game_id="ls20",
+                step_index=index + 1,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=action_name,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                derived_features={"frame_signature": "sig-reactive-working-memory-rank"},
+            )
+            memory.note_observation(before)
+            memory.note_decision(
+                ActionDecision(
+                    action_name=action_name,
+                    source="symbolic",
+                    confidence=0.5,
+                    reason="stall-seed",
+                )
+            )
+            memory.note_observation(after)
+
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION4",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-reactive-working-memory-rank"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION1", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 3}],
+                "procedural_focus_actions": ["ACTION2"],
+                "semantic_focus_actions": ["ACTION2"],
+            }
+        )
+
+        proposals = self.executive.reactive.propose(context)
+
+        self.assertGreaterEqual(len(proposals), 2)
+        ranked_actions = [proposal.action_name for proposal in proposals]
+        self.assertEqual(ranked_actions[0], "ACTION2")
+        self.assertGreater(ranked_actions.index("ACTION1"), ranked_actions.index("ACTION2"))
+
+    def test_reactive_stall_breaker_uses_trained_prior_rank_when_focus_is_absent(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        for index, action_name in enumerate(("ACTION3", "ACTION4")):
+            before = Observation(
+                game_id="ls20",
+                step_index=index,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=None,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                derived_features={"frame_signature": "sig-reactive-trained-prior-rank"},
+            )
+            after = Observation(
+                game_id="ls20",
+                step_index=index + 1,
+                game_state="NOT_FINISHED",
+                levels_completed=0,
+                last_action=action_name,
+                legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+                derived_features={"frame_signature": "sig-reactive-trained-prior-rank"},
+            )
+            memory.note_observation(before)
+            memory.note_decision(
+                ActionDecision(
+                    action_name=action_name,
+                    source="symbolic",
+                    confidence=0.5,
+                    reason="stall-seed",
+                )
+            )
+            memory.note_observation(after)
+
+        observation = Observation(
+            game_id="ls20",
+            step_index=3,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION4",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-reactive-trained-prior-rank"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle(
+            trained_prior_bucket={"ACTION1": 1, "ACTION2": 9, "ACTION3": 2, "ACTION4": 1},
+        )
+
+        proposals = self.executive.reactive.propose(context)
+
+        self.assertGreaterEqual(len(proposals), 2)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertLess(
+            [proposal.action_name for proposal in proposals].index("ACTION3"),
+            [proposal.action_name for proposal in proposals].index("ACTION1"),
+        )
+
+    def test_critic_demotes_action_with_contextual_working_memory_failures(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=6,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-critic-working-failure"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle()
+        context.contextual_memory_bundles["break-stall"] = MemoryBundle(
+            working_memory={
+                "open_failure_modes": [
+                    {"action_name": "ACTION1", "subgoal": "break-stall", "outcome": "stalled"}
+                ],
+                "recent_failures": [
+                    {"action_name": "ACTION1", "subgoal": "break-stall", "outcome": "stalled"}
+                ],
+                "failure_streaks": [
+                    {"action_name": "ACTION1", "count": 3}
+                ],
+            }
+        )
+
+        rescored = self.executive.critic.rescore(
+            context,
+            [
+                ActionProposal(
+                    action_name="ACTION1",
+                    source="symbolic",
+                    confidence=0.76,
+                    reason="repeat failure",
+                    subgoal="break-stall",
+                ),
+                ActionProposal(
+                    action_name="ACTION2",
+                    source="symbolic",
+                    confidence=0.73,
+                    reason="alternative",
+                    subgoal="break-stall",
+                ),
+            ],
+        )
+
+        self.assertEqual(rescored[0].action_name, "ACTION2")
+
+    def test_critic_prefers_contextual_working_memory_focus_action(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=6,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-critic-working-focus"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.memory_bundle = MemoryBundle()
+        context.contextual_memory_bundles["break-stall"] = MemoryBundle(
+            working_memory={
+                "semantic_focus_actions": ["ACTION2"],
+                "procedural_focus_actions": ["ACTION2"],
+            }
+        )
+
+        rescored = self.executive.critic.rescore(
+            context,
+            [
+                ActionProposal(
+                    action_name="ACTION1",
+                    source="symbolic",
+                    confidence=0.74,
+                    reason="default",
+                    subgoal="break-stall",
+                ),
+                ActionProposal(
+                    action_name="ACTION2",
+                    source="symbolic",
+                    confidence=0.70,
+                    reason="focus",
+                    subgoal="break-stall",
                 ),
             ],
         )
@@ -5765,7 +7216,16 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(context.memory_bundle.recommended_actions, ["ACTION1"])
         self.assertEqual(context.llm_memory_bundle.recommended_actions, ["ACTION2"])
         self.assertIn('"recommended_actions":["ACTION2"]', llm_backend.last_prompt)
+        self.assertIn('"trained_prior_bucket":{"ACTION1":2,"ACTION2":9}', llm_backend.last_prompt)
+        self.assertIn(
+            '"trained_prior_focus":[{"action_name":"ACTION2","count":9},{"action_name":"ACTION1","count":2}]',
+            llm_backend.last_prompt,
+        )
         self.assertIn('"current_subgoal_hint":"break-stall"', llm_backend.last_prompt)
+        self.assertIn(
+            "If memory_trained_prior_focus or memory_trained_prior_bucket has a clear unsuppressed leader",
+            llm_backend.last_prompt,
+        )
         self.assertEqual(decision.source, "llm")
 
     def test_llm_specialist_falls_back_to_memory_recommendation_when_payload_invalid(self) -> None:
@@ -5912,6 +7372,728 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(proposals[0].action_name, "ACTION3")
         self.assertNotIn("ACTION1", [proposal.action_name for proposal in proposals[:1]])
         self.assertNotIn("ACTION2", [proposal.action_name for proposal in proposals[:1]])
+
+    def test_llm_specialist_fallback_prefers_working_memory_focus_action(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-llm-focus-fallback"},
+        )
+        memory.note_observation(observation)
+        context = build_context(observation, memory, FakeLLMBackend(payload={"action_candidates": []}))
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            working_memory={
+                "procedural_focus_actions": ["ACTION2"],
+                "semantic_focus_actions": ["ACTION3"],
+            },
+            suppressed_actions=["ACTION1"],
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+
+    def test_llm_specialist_fallback_prefers_trained_prior_when_recommendations_missing(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-llm-trained-prior-fallback"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(payload={"action_candidates": []}),
+        )
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            trained_prior_bucket={"ACTION2": 9, "ACTION3": 2, "ACTION1": 1},
+            suppressed_actions=["ACTION1"],
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertEqual(proposals[1].action_name, "ACTION3")
+
+    def test_llm_specialist_reranks_close_candidates_toward_trained_prior_leader(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-close-trained-prior"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.62, "reason": "slightly higher raw"},
+                        {"action": "ACTION2", "confidence": 0.60, "reason": "trained prior option"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            trained_prior_bucket={"ACTION1": 1, "ACTION2": 9},
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual([proposal.action_name for proposal in proposals[:2]], ["ACTION2", "ACTION1"])
+        self.assertGreater(proposals[0].confidence, proposals[1].confidence)
+        self.assertGreater(proposals[0].confidence, 0.60)
+        self.assertIn("memory-rerank=trained-prior", proposals[0].reason)
+
+    def test_llm_specialist_reranks_small_gap_when_trained_prior_leader_is_clear(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-clear-trained-prior"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.65, "reason": "higher raw"},
+                        {"action": "ACTION2", "confidence": 0.58, "reason": "dominant trained prior"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            recommended_actions=["ACTION2"],
+            trained_prior_bucket={"ACTION1": 2, "ACTION2": 9},
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual([proposal.action_name for proposal in proposals[:2]], ["ACTION2", "ACTION1"])
+        self.assertIn("memory-rerank=memory-recommended+trained-prior", proposals[0].reason)
+
+    def test_llm_specialist_reranks_close_candidates_away_from_recent_failure_action(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-failure-rerank"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.62, "reason": "repeat raw choice"},
+                        {"action": "ACTION2", "confidence": 0.59, "reason": "alternate option"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION1", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual([proposal.action_name for proposal in proposals[:2]], ["ACTION2", "ACTION1"])
+        self.assertIn("memory-rerank=failure-demotion", proposals[1].reason)
+        self.assertLess(proposals[1].confidence, 0.62)
+
+    def test_llm_specialist_reranks_small_gap_away_from_recent_failure_action(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-failure-rerank-wide"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.68, "reason": "repeat raw choice"},
+                        {"action": "ACTION2", "confidence": 0.59, "reason": "alternate option"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION1", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual([proposal.action_name for proposal in proposals[:2]], ["ACTION2", "ACTION1"])
+        self.assertIn("memory-rerank=failure-demotion", proposals[1].reason)
+
+    def test_llm_specialist_does_not_rerank_on_stale_failure_context(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-rerank-current"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.62, "reason": "stale failure action"},
+                        {"action": "ACTION2", "confidence": 0.59, "reason": "clean alternate"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "active_subgoal": "advance-level",
+                "recent_failures": [
+                    {
+                        "action_name": "ACTION1",
+                        "outcome": "stalled",
+                        "frame_signature": "sig-llm-rerank-old",
+                        "subgoal": "break-stall",
+                    }
+                ],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual([proposal.action_name for proposal in proposals[:2]], ["ACTION1", "ACTION2"])
+        self.assertNotIn("failure-demotion", proposals[0].reason)
+        self.assertNotIn("failure-demotion", proposals[1].reason)
+
+    def test_llm_specialist_reranks_away_from_suppressed_raw_leader(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-suppressed-rerank"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.69, "reason": "suppressed raw leader"},
+                        {"action": "ACTION2", "confidence": 0.60, "reason": "unsuppressed alternative"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            suppressed_actions=["ACTION1"],
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual([proposal.action_name for proposal in proposals[:2]], ["ACTION2", "ACTION1"])
+        self.assertIn("memory-rerank=suppression-demotion", proposals[1].reason)
+
+    def test_llm_specialist_drops_single_suppressed_candidate_and_falls_back(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-single-suppressed"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.91, "reason": "only suppressed option"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            recommended_actions=["ACTION2"],
+            suppressed_actions=["ACTION1"],
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertIn("memory-guided llm fallback", proposals[0].reason)
+
+    def test_llm_specialist_falls_back_when_all_candidates_are_suppressed(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-all-suppressed"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.74, "reason": "suppressed option one"},
+                        {"action": "ACTION2", "confidence": 0.70, "reason": "suppressed option two"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            suppressed_actions=["ACTION1", "ACTION2"],
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual({proposal.action_name for proposal in proposals[:2]}, {"ACTION1", "ACTION2"})
+        self.assertIn("memory-guided llm fallback", proposals[0].reason)
+
+    def test_llm_specialist_keeps_single_failure_candidate_when_failure_context_is_stale(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-current"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.83, "reason": "current best option"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "active_subgoal": "advance-level",
+                "recent_failures": [
+                    {
+                        "action_name": "ACTION1",
+                        "outcome": "stalled",
+                        "frame_signature": "sig-old",
+                        "subgoal": "break-stall",
+                    }
+                ],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0].action_name, "ACTION1")
+        self.assertNotIn("memory-guided llm fallback", proposals[0].reason)
+
+    def test_llm_specialist_keeps_single_failure_candidate_when_failure_row_has_no_context(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-partial-row"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.83, "reason": "generic failure row only"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            recommended_actions=["ACTION2"],
+            working_memory={
+                "recent_failures": [
+                    {
+                        "action_name": "ACTION1",
+                        "outcome": "stalled",
+                    }
+                ],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 1}],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0].action_name, "ACTION1")
+        self.assertNotIn("memory-guided llm fallback", proposals[0].reason)
+
+    def test_llm_specialist_falls_back_when_all_candidates_are_contextual_failures(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-failure-all-blocked"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.72, "reason": "repeat failure one"},
+                        {"action": "ACTION2", "confidence": 0.70, "reason": "repeat failure two"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            working_memory={
+                "active_subgoal": "break-stall",
+                "recent_failures": [
+                    {
+                        "action_name": "ACTION1",
+                        "outcome": "stalled",
+                        "frame_signature": "sig-llm-failure-all-blocked",
+                        "subgoal": "break-stall",
+                    },
+                    {
+                        "action_name": "ACTION2",
+                        "outcome": "stalled",
+                        "frame_signature": "sig-llm-failure-all-blocked",
+                        "subgoal": "break-stall",
+                    },
+                ],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual({proposal.action_name for proposal in proposals[:2]}, {"ACTION1", "ACTION2"})
+        self.assertIn("memory-guided llm fallback", proposals[0].reason)
+
+    def test_llm_specialist_drops_blocked_leaders_when_clean_tail_exists(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-llm-blocked-leader-tail"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.95, "reason": "suppressed leader"},
+                        {"action": "ACTION2", "confidence": 0.90, "reason": "failed leader"},
+                        {"action": "ACTION3", "confidence": 0.10, "reason": "clean tail"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            suppressed_actions=["ACTION1"],
+            working_memory={
+                "active_subgoal": "break-stall",
+                "recent_failures": [
+                    {
+                        "action_name": "ACTION2",
+                        "outcome": "stalled",
+                        "frame_signature": "sig-llm-blocked-leader-tail",
+                        "subgoal": "break-stall",
+                    }
+                ],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual([proposal.action_name for proposal in proposals], ["ACTION3"])
+
+    def test_llm_specialist_drops_single_failure_candidate_from_failure_streak_only_signal(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-streak-only"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.88, "reason": "streaked action"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            recommended_actions=["ACTION2"],
+            working_memory={
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertIn("memory-guided llm fallback", proposals[0].reason)
+
+    def test_llm_specialist_blocks_single_failure_when_later_row_matches_context(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-llm-later-match"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.88, "reason": "candidate with mixed failure history"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            recommended_actions=["ACTION2"],
+            working_memory={
+                "active_subgoal": "break-stall",
+                "recent_failures": [
+                    {
+                        "action_name": "ACTION1",
+                        "outcome": "stalled",
+                        "frame_signature": "sig-old",
+                        "subgoal": "advance-level",
+                    },
+                    {
+                        "action_name": "ACTION1",
+                        "outcome": "stalled",
+                        "frame_signature": "sig-llm-later-match",
+                        "subgoal": "break-stall",
+                    },
+                ],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertIn("memory-guided llm fallback", proposals[0].reason)
+
+    def test_llm_specialist_reranks_top_pair_even_with_low_confidence_third_candidate(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-llm-third-candidate-spread"},
+        )
+        memory.note_observation(observation)
+        context = build_context(
+            observation,
+            memory,
+            FakeLLMBackend(
+                payload={
+                    "action_candidates": [
+                        {"action": "ACTION1", "confidence": 0.69, "reason": "suppressed raw leader"},
+                        {"action": "ACTION2", "confidence": 0.60, "reason": "unsuppressed alternative"},
+                        {"action": "ACTION3", "confidence": 0.10, "reason": "low confidence tail"},
+                    ]
+                }
+            ),
+        )
+        context.memory_bundle = MemoryBundle(
+            suppressed_actions=["ACTION1"],
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertEqual([proposal.action_name for proposal in proposals[:3]], ["ACTION2", "ACTION1", "ACTION3"])
+        self.assertIn("memory-rerank=suppression-demotion", proposals[1].reason)
+
+    def test_llm_specialist_fallback_uses_focus_guidance_without_basin_exhaustion(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-llm-focus-nonexhausted"},
+        )
+        memory.note_observation(observation)
+        context = build_context(observation, memory, FakeLLMBackend(payload={"action_candidates": []}))
+        context.memory_bundle = MemoryBundle(
+            working_memory={
+                "procedural_focus_actions": ["ACTION2"],
+            }
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+
+    def test_llm_specialist_fallback_demotes_working_memory_failure_action(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        observation = Observation(
+            game_id="ls20",
+            step_index=5,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3"],
+            derived_features={"frame_signature": "sig-llm-failure-fallback"},
+        )
+        memory.note_observation(observation)
+        context = build_context(observation, memory, FakeLLMBackend(payload={"action_candidates": []}))
+        context.memory_bundle = MemoryBundle(
+            basin_status={"is_exhausted": True},
+            suppressed_actions=["ACTION3"],
+            working_memory={
+                "recent_failures": [{"action_name": "ACTION1", "outcome": "stalled"}],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            },
+        )
+
+        proposals = LLMSpecialist().propose(context)
+
+        self.assertTrue(proposals)
+        self.assertEqual(proposals[0].action_name, "ACTION2")
+        self.assertGreater(
+            [proposal.action_name for proposal in proposals].index("ACTION1"),
+            [proposal.action_name for proposal in proposals].index("ACTION2"),
+        )
 
     def test_llm_specialist_fallback_prefers_board_probe_action(self) -> None:
         memory = EpisodicMemory()

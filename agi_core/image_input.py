@@ -82,6 +82,68 @@ def board_context_match_score(
     return score
 
 
+def extract_board_motif_tags(
+    image_input: BoardImageInput | None,
+    *,
+    board_context: dict[str, Any] | None = None,
+    legal_actions: list[str] | None = None,
+    levels_completed: int | None = None,
+    next_levels_completed: int | None = None,
+) -> list[str]:
+    summary = _normalized_board_context_summary(
+        board_context if board_context is not None else board_context_summary(image_input)
+    )
+    tags: set[str] = set()
+    board = image_input.board if image_input is not None else []
+    active_cells = _active_cells(board) if board else []
+    active_cell_set = set(active_cells)
+    default_probe = dict(summary.get("board_default_probe") or {})
+    probe_cell = (
+        int(default_probe.get("x", -1) or -1),
+        int(default_probe.get("y", -1) or -1),
+    )
+    components = _connected_active_components(board) if board else []
+    legal = {str(action_name or "").upper() for action_name in list(legal_actions or [])}
+    board_height = int(summary.get("board_height", 0) or 0)
+    board_width = int(summary.get("board_width", 0) or 0)
+    board_active_cells = int(summary.get("board_active_cells", 0) or 0)
+
+    if board and _is_horizontally_symmetric(board):
+        tags.add("axis_horizontal")
+    if board and _is_vertically_symmetric(board):
+        tags.add("axis_vertical")
+    if len(active_cells) == 1:
+        tags.add("single_control_selected")
+    if len(components) >= 2:
+        tags.add("multiple_piece_candidates")
+        tags.add("multi_piece_level")
+    elif len({int(cell or 0) for row in board for cell in row if int(cell or 0) != 0}) >= 2:
+        tags.add("multi_piece_level")
+    if len(active_cells) == 1 and probe_cell in active_cell_set:
+        tags.add("selection_on_control")
+    if active_cells and probe_cell in active_cell_set:
+        tags.add("selection_on_piece")
+    if board_active_cells > 1 and len(components) >= 1:
+        tags.add("piece_translation_required")
+    if active_cells and probe_cell not in active_cell_set:
+        tags.add("control_translation_required")
+    if (
+        "axis_horizontal" in tags or "axis_vertical" in tags
+    ) and board_active_cells >= 2:
+        tags.add("mirror_alignment_candidate")
+    if "ACTION6" in legal and board_height > 0 and board_width > 0:
+        area = max(1, board_height * board_width)
+        if board_active_cells >= max(4, area // 3):
+            tags.add("probe_legal_and_dense_board")
+    if (
+        levels_completed is not None
+        and next_levels_completed is not None
+        and int(next_levels_completed) > int(levels_completed)
+    ):
+        tags.add("post_progress_new_level")
+    return sorted(tags)
+
+
 def default_click_target(image_input: BoardImageInput | None) -> dict[str, int]:
     if image_input is None:
         return {"x": 32, "y": 32}
@@ -281,6 +343,47 @@ def _active_cells(board: list[list[int]]) -> list[tuple[int, int]]:
             if int(cell) != 0:
                 active.append((x, y))
     return active
+
+
+def _connected_active_components(board: list[list[int]]) -> list[list[tuple[int, int]]]:
+    active = set(_active_cells(board))
+    if not active:
+        return []
+    components: list[list[tuple[int, int]]] = []
+    while active:
+        start = active.pop()
+        stack = [start]
+        component = [start]
+        while stack:
+            x, y = stack.pop()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                neighbor = (x + dx, y + dy)
+                if neighbor not in active:
+                    continue
+                active.remove(neighbor)
+                stack.append(neighbor)
+                component.append(neighbor)
+        components.append(component)
+    return components
+
+
+def _is_horizontally_symmetric(board: list[list[int]]) -> bool:
+    if not board:
+        return False
+    height = len(board)
+    for y in range(height):
+        if board[y] != board[height - 1 - y]:
+            return False
+    return True
+
+
+def _is_vertically_symmetric(board: list[list[int]]) -> bool:
+    if not board:
+        return False
+    for row in board:
+        if row != list(reversed(row)):
+            return False
+    return True
 
 
 def _dense_board_contrast_target(

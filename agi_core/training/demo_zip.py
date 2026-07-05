@@ -18,12 +18,15 @@ from agi_core.image_input import (
     BoardImageInput,
     board_image_input_from_source,
     compute_board_signature,
+    default_click_target,
+    extract_board_motif_tags,
     extract_board_image_input,
     normalize_visible_board,
 )
 from agi_core.storage import (
     initialize_memory_schema,
     record_transitions,
+    upsert_abstract_memory_rows,
     upsert_metadata,
     upsert_training_counts,
 )
@@ -193,7 +196,8 @@ def build_action_prior_artifact(
     games: set[str] | None = None,
     limit_recordings: int | None = None,
     workers: int = 1,
-    ) -> dict[str, Any]:
+    build_abstractions: bool = True,
+) -> dict[str, Any]:
     archive_path = Path(zip_path)
     wanted_games = {game.strip() for game in games or set() if game.strip()}
     artifact: dict[str, Any] = {
@@ -210,6 +214,7 @@ def build_action_prior_artifact(
     )
     training_rows: list[dict[str, Any]] = []
     memory_records: list[EpisodeRecord] = []
+    abstract_rows: list[dict[str, Any]] = []
     for payload in _collect_recording_aggregates(
         archive_path,
         selected_recordings=selected_recordings,
@@ -217,8 +222,11 @@ def build_action_prior_artifact(
     ):
         _merge_recording_payload(artifact, payload)
         memory_records.extend(payload.get("memory_records", []))
+        if build_abstractions:
+            abstract_rows.extend(payload.get("abstract_rows", []))
     if output_path is not None:
         destination = Path(output_path)
+        _assert_safe_output_database(destination)
         initialize_memory_schema(destination)
         _reset_output_database(destination)
         for game_id, game_entry in sorted(artifact["games"].items()):
@@ -230,6 +238,8 @@ def build_action_prior_artifact(
             )
         upsert_training_counts(destination, training_rows)
         record_transitions(destination, memory_records)
+        if build_abstractions:
+            upsert_abstract_memory_rows(destination, abstract_rows)
         upsert_metadata(
             destination,
             {
@@ -240,9 +250,24 @@ def build_action_prior_artifact(
                 "steps_seen": str(artifact["steps_seen"]),
                 "steps_used": str(artifact["steps_used"]),
                 "offline_memory_records": str(len(memory_records)),
+                "abstract_memory_rows": str(len(abstract_rows)),
             },
         )
+    artifact["abstract_memory_rows"] = len(abstract_rows)
     return artifact
+
+
+def _assert_safe_output_database(output_path: str | Path) -> None:
+    destination = Path(output_path).resolve()
+    config = RuntimeConfig.from_env(Path(__file__).resolve().parents[2])
+    protected_paths = {
+        Path(config.memory_db_path).resolve(),
+        Path(config.archive_memory_db_path).resolve(),
+    }
+    if destination in protected_paths:
+        raise ValueError(
+            "refusing to overwrite live memory database; choose a dedicated training artifact path"
+        )
 
 
 def _reset_output_database(db_path: str | Path) -> None:
@@ -250,12 +275,20 @@ def _reset_output_database(db_path: str | Path) -> None:
         connection.execute("DELETE FROM game_action_priors")
         connection.execute("DELETE FROM state_action_priors")
         connection.execute("DELETE FROM frame_action_priors")
+        connection.execute("DELETE FROM subgoal_action_priors")
         connection.execute("DELETE FROM live_episode_records")
         connection.execute("DELETE FROM live_action_stats")
         connection.execute("DELETE FROM live_state_action_stats")
         connection.execute("DELETE FROM live_frame_action_stats")
         connection.execute("DELETE FROM live_subgoal_action_stats")
         connection.execute("DELETE FROM live_basin_stats")
+        connection.execute("DELETE FROM live_episode_summaries")
+        connection.execute("DELETE FROM live_pattern_stats")
+        connection.execute("DELETE FROM live_sequence_stats")
+        connection.execute("DELETE FROM live_board_cluster_stats")
+        connection.execute("DELETE FROM live_semantic_memory")
+        connection.execute("DELETE FROM live_procedural_memory")
+        connection.execute("DELETE FROM abstract_memories")
         connection.execute("DELETE FROM metadata")
         connection.commit()
 
@@ -277,6 +310,7 @@ def _new_game_entry() -> dict[str, Any]:
         "actions": {},
         "action_supports": {},
         "states": {},
+        "subgoals": {},
         "frame_signatures": {},
     }
 
@@ -309,6 +343,7 @@ def _process_recording(
         "steps_used": 0,
         "games": {short_game_id: _new_game_entry()},
         "memory_records": [],
+        "abstract_rows": [],
     }
     game_entry = payload["games"][short_game_id]
     game_entry["recordings"] = 1
@@ -318,6 +353,7 @@ def _process_recording(
     seen_context_actions: dict[tuple[str, str | None, str], int] = {}
     seen_game_actions: set[str] = set()
     seen_state_actions: set[tuple[str, str]] = set()
+    seen_subgoal_actions: set[tuple[str, str]] = set()
     seen_frame_actions: set[tuple[str, str]] = set()
     for index, step in enumerate(steps):
         previous_step = steps[index - 1] if index > 0 else None
@@ -348,6 +384,13 @@ def _process_recording(
         )
         if weight <= 0:
             continue
+        decision_subgoal = _infer_training_subgoal(
+            step=step,
+            next_step=next_step,
+            future_steps=future_steps,
+            outcome=_infer_step_outcome(step, next_step),
+            stall_streak=stall_streak,
+        )
         payload["steps_used"] += 1
         game_entry["steps_used"] += 1
         payload["memory_records"].append(
@@ -356,8 +399,20 @@ def _process_recording(
                 next_step=next_step,
                 future_steps=future_steps,
                 stall_streak=stall_streak,
+                decision_subgoal=decision_subgoal,
             )
         )
+        abstract_row = _build_abstract_memory_row(
+            short_game_id=short_game_id,
+            steps=steps,
+            index=index,
+            step=step,
+            next_step=next_step,
+            future_steps=future_steps,
+            decision_subgoal=decision_subgoal,
+        )
+        if abstract_row is not None:
+            payload["abstract_rows"].append(abstract_row)
         _increment_count_by(game_entry["actions"], action_name, weight)
         _increment_support_once(game_entry["action_supports"], seen_game_actions, action_name)
         state_entry = game_entry["states"].setdefault(step.state, {"actions": {}})
@@ -368,6 +423,15 @@ def _process_recording(
             seen_state_actions,
             (step.state, action_name),
         )
+        if decision_subgoal:
+            subgoal_entry = game_entry["subgoals"].setdefault(decision_subgoal, {"actions": {}})
+            subgoal_entry.setdefault("action_supports", {})
+            _increment_count_by(subgoal_entry["actions"], action_name, weight)
+            _increment_support_once(
+                subgoal_entry["action_supports"],
+                seen_subgoal_actions,
+                (decision_subgoal, action_name),
+            )
         if step.frame_signature:
             frame_entry = game_entry["frame_signatures"].setdefault(
                 step.frame_signature,
@@ -774,6 +838,8 @@ def _merge_recording_payload(
     artifact["steps_used"] += int(payload.get("steps_used", 0) or 0)
     artifact.setdefault("offline_memory_records", 0)
     artifact["offline_memory_records"] += len(payload.get("memory_records", []))
+    artifact.setdefault("abstract_memory_rows", 0)
+    artifact["abstract_memory_rows"] += len(payload.get("abstract_rows", []))
     for game_id, game_payload in sorted(payload.get("games", {}).items()):
         target_game_entry = artifact["games"].setdefault(game_id, _new_game_entry())
         target_game_entry["recordings"] += int(game_payload.get("recordings", 0) or 0)
@@ -800,6 +866,22 @@ def _merge_recording_payload(
                     int(target_state_entry["action_supports"].get(action_name, 0) or 0)
                     + int(count or 0)
                 )
+        for subgoal_name, subgoal_entry in sorted(game_payload.get("subgoals", {}).items()):
+            target_subgoal_entry = target_game_entry["subgoals"].setdefault(
+                subgoal_name,
+                {"actions": {}},
+            )
+            target_subgoal_entry.setdefault("action_supports", {})
+            for action_name, count in sorted(subgoal_entry.get("actions", {}).items()):
+                target_subgoal_entry["actions"][action_name] = (
+                    int(target_subgoal_entry["actions"].get(action_name, 0) or 0)
+                    + int(count or 0)
+                )
+            for action_name, count in sorted(subgoal_entry.get("action_supports", {}).items()):
+                target_subgoal_entry["action_supports"][action_name] = (
+                    int(target_subgoal_entry["action_supports"].get(action_name, 0) or 0)
+                    + int(count or 0)
+                )
         for frame_signature, frame_entry in sorted(game_payload.get("frame_signatures", {}).items()):
             target_frame_entry = target_game_entry["frame_signatures"].setdefault(
                 frame_signature,
@@ -824,11 +906,26 @@ def _build_memory_record(
     next_step: TrainingStep | None,
     future_steps: list[TrainingStep],
     stall_streak: int,
+    decision_subgoal: str | None = None,
 ) -> EpisodeRecord:
     outcome = _infer_step_outcome(step, next_step)
     progress_delta = _step_progress_delta(step, next_step)
     next_state = next_step.state if next_step is not None else step.state
     next_frame_signature = next_step.frame_signature if next_step is not None else step.frame_signature
+    board_height = int(step.image_input.height if step.image_input is not None else 0)
+    board_width = int(step.image_input.width if step.image_input is not None else 0)
+    board_active_cells = 0
+    board_source_attr = None
+    board_default_probe: dict[str, int] = {}
+    if step.image_input is not None:
+        board_active_cells = sum(
+            1
+            for row in step.image_input.board
+            for value in row
+            if int(value or 0) != 0
+        )
+        board_source_attr = step.image_input.source_attr
+        board_default_probe = default_click_target(step.image_input)
     return EpisodeRecord(
         game_id=step.game_id.split("-")[0],
         step_index=int(step.step_index),
@@ -844,7 +941,8 @@ def _build_memory_record(
         prior_legal_actions=list(step.available_actions),
         stagnation_before=max(0, stall_streak),
         stagnation_after=max(0, stall_streak + (0 if outcome == "progress" else 1)),
-        decision_subgoal=_infer_training_subgoal(
+        decision_subgoal=decision_subgoal
+        or _infer_training_subgoal(
             step=step,
             next_step=next_step,
             future_steps=future_steps,
@@ -852,7 +950,80 @@ def _build_memory_record(
             stall_streak=stall_streak,
         ),
         decision_source="offline-demo-trainer",
+        prior_board_height=board_height,
+        prior_board_width=board_width,
+        prior_board_active_cells=board_active_cells,
+        prior_board_source_attr=board_source_attr,
+        prior_board_default_probe=board_default_probe,
     )
+
+
+def _build_abstract_memory_row(
+    *,
+    short_game_id: str,
+    steps: list[TrainingStep],
+    index: int,
+    step: TrainingStep,
+    next_step: TrainingStep | None,
+    future_steps: list[TrainingStep],
+    decision_subgoal: str | None,
+) -> dict[str, Any] | None:
+    outcome = _infer_step_outcome(step, next_step)
+    future_progress_delta, _ = _lookahead_progress(step, future_steps)
+    if outcome != "progress" and future_progress_delta <= 0:
+        return None
+    board_height = int(step.image_input.height if step.image_input is not None else 0)
+    board_width = int(step.image_input.width if step.image_input is not None else 0)
+    board_active_cells = 0
+    board_source_attr = ""
+    if step.image_input is not None:
+        board_active_cells = sum(
+            1
+            for row in step.image_input.board
+            for value in row
+            if int(value or 0) != 0
+        )
+        board_source_attr = str(step.image_input.source_attr or "")
+    motif_tags = extract_board_motif_tags(
+        step.image_input,
+        legal_actions=step.available_actions,
+        levels_completed=step.levels_completed,
+        next_levels_completed=(
+            next_step.levels_completed if next_step is not None else step.levels_completed
+        ),
+    )
+    lead_in_actions = [
+        str(prior_step.action_name or "")
+        for prior_step in steps[max(0, index - 3) : index]
+        if str(prior_step.action_name or "")
+    ]
+    progress = 1 if outcome == "progress" else 0
+    stalled = 1 if outcome == "stalled" else 0
+    return {
+        "subgoal": str(decision_subgoal or ""),
+        "state": str(step.state or ""),
+        "board_height": board_height,
+        "board_width": board_width,
+        "board_active_cells": board_active_cells,
+        "board_source_attr": board_source_attr,
+        "motif_tags": motif_tags,
+        "action_name": str(step.action_name or ""),
+        "lead_in_actions": lead_in_actions,
+        "lesson_text": _abstract_lesson_text(
+            action_name=str(step.action_name or ""),
+            subgoal=str(decision_subgoal or ""),
+            motif_tags=motif_tags,
+        ),
+        "salience": 1.0 + (0.5 if outcome == "progress" else 0.2 * min(3, future_progress_delta)),
+        "confidence": 0.8 if outcome == "progress" else 0.62,
+        "progress": progress,
+        "failed": 0,
+        "stalled": stalled,
+        "total": 1,
+        "last_outcome": outcome,
+        "last_step_index": int(step.step_index),
+        "source_games": [short_game_id],
+    }
 
 
 def _infer_training_subgoal(
@@ -865,6 +1036,18 @@ def _infer_training_subgoal(
 ) -> str:
     if step.action_name == "RESET" or _is_reset_state(step.state):
         return "re-enter-level"
+    if (
+        step.action_name == "ACTION6"
+        and step.image_input is not None
+        and any(int(value or 0) != 0 for row in step.image_input.board for value in row)
+    ):
+        if outcome == "progress":
+            return "inspect-active-board"
+        future_progress_delta, _ = _lookahead_progress(step, future_steps)
+        if future_progress_delta > 0:
+            return "inspect-active-board"
+    if next_step is not None and _is_win_state(next_step.state):
+        return "hold-win"
     if outcome == "progress":
         return "advance-level"
     if stall_streak >= 2:
@@ -872,9 +1055,17 @@ def _infer_training_subgoal(
     future_progress_delta, _ = _lookahead_progress(step, future_steps)
     if future_progress_delta > 0:
         return "advance-level"
-    if next_step is not None and _is_win_state(next_step.state):
-        return "hold-win"
     return "break-stall"
+
+
+def _abstract_lesson_text(
+    *,
+    action_name: str,
+    subgoal: str,
+    motif_tags: list[str],
+) -> str:
+    motif_text = ", ".join(motif_tags[:4]) if motif_tags else "generic-board"
+    return f"{action_name} transfers for {subgoal or 'current-subgoal'} under {motif_text}"
 
 
 def _count_rows_for_game(
@@ -883,9 +1074,11 @@ def _count_rows_for_game(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for action_name, count in sorted(
-        _apply_recording_support_bonus(
-            game_entry.get("actions", {}),
-            game_entry.get("action_supports", {}),
+        _consensus_filter_actions(
+            _apply_recording_support_bonus(
+                game_entry.get("actions", {}),
+                game_entry.get("action_supports", {}),
+            )
         ).items()
     ):
         rows.append(
@@ -910,6 +1103,24 @@ def _count_rows_for_game(
                     "scope": "state",
                     "game_id": game_id,
                     "state": state_name,
+                    "action_name": action_name,
+                    "count": count,
+                }
+            )
+    for subgoal_name, subgoal_entry in sorted(game_entry.get("subgoals", {}).items()):
+        for action_name, count in sorted(
+            _consensus_filter_actions(
+                _apply_recording_support_bonus(
+                    subgoal_entry.get("actions", {}),
+                    subgoal_entry.get("action_supports", {}),
+                )
+            ).items()
+        ):
+            rows.append(
+                {
+                    "scope": "subgoal",
+                    "game_id": game_id,
+                    "subgoal": subgoal_name,
                     "action_name": action_name,
                     "count": count,
                 }

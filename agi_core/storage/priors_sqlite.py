@@ -6,6 +6,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+def game_id_aliases(game_id: str) -> list[str]:
+    normalized = str(game_id or "").strip()
+    if not normalized:
+        return [""]
+    aliases = [normalized]
+    short_id = normalized.split("-", 1)[0].strip()
+    if short_id and short_id not in aliases:
+        aliases.append(short_id)
+    return aliases
+
+
 def initialize_schema(db_path: str | Path) -> None:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +63,17 @@ def initialize_schema(db_path: str | Path) -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS subgoal_action_priors (
+                game_id TEXT NOT NULL,
+                subgoal TEXT NOT NULL,
+                action_name TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (game_id, subgoal, action_name)
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_state_lookup
             ON state_action_priors(game_id, state)
             """
@@ -60,6 +82,12 @@ def initialize_schema(db_path: str | Path) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_frame_lookup
             ON frame_action_priors(game_id, frame_signature)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_subgoal_lookup
+            ON subgoal_action_priors(game_id, subgoal)
             """
         )
         connection.commit()
@@ -84,6 +112,7 @@ def upsert_training_counts(db_path: str | Path, rows: Iterable[dict[str, Any]]) 
     game_rows: list[tuple[str, str, int]] = []
     state_rows: list[tuple[str, str, str, int]] = []
     frame_rows: list[tuple[str, str, str, int]] = []
+    subgoal_rows: list[tuple[str, str, str, int]] = []
     for row in rows:
         scope = str(row.get("scope", ""))
         game_id = str(row.get("game_id", ""))
@@ -98,6 +127,10 @@ def upsert_training_counts(db_path: str | Path, rows: Iterable[dict[str, Any]]) 
         elif scope == "frame":
             frame_rows.append(
                 (game_id, str(row.get("frame_signature", "")), action_name, count)
+            )
+        elif scope == "subgoal":
+            subgoal_rows.append(
+                (game_id, str(row.get("subgoal", "")), action_name, count)
             )
     with closing(sqlite3.connect(Path(db_path))) as connection:
         if game_rows:
@@ -130,6 +163,16 @@ def upsert_training_counts(db_path: str | Path, rows: Iterable[dict[str, Any]]) 
                 """,
                 frame_rows,
             )
+        if subgoal_rows:
+            connection.executemany(
+                """
+                INSERT INTO subgoal_action_priors(game_id, subgoal, action_name, count)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(game_id, subgoal, action_name)
+                DO UPDATE SET count=subgoal_action_priors.count + excluded.count
+                """,
+                subgoal_rows,
+            )
         connection.commit()
 
 
@@ -139,51 +182,70 @@ def load_best_prior_bucket(
     state: str,
     frame_signature: str,
     legal_actions: list[str],
+    subgoal: str | None = None,
 ) -> dict[str, int]:
     path = Path(db_path)
     if not path.exists() or not legal_actions:
         return {}
+    aliases = [alias for alias in game_id_aliases(game_id) if alias]
     with closing(sqlite3.connect(path)) as connection:
-        frame_bucket = _load_bucket(
-            connection,
-            """
-            SELECT action_name, count
-            FROM frame_action_priors
-            WHERE game_id = ? AND frame_signature = ?
-            """,
-            [game_id, frame_signature],
-            legal_actions,
-        )
-        if frame_bucket:
-            return frame_bucket
-        state_bucket = _load_bucket(
-            connection,
-            """
-            SELECT action_name, count
-            FROM state_action_priors
-            WHERE game_id = ? AND state = ?
-            """,
-            [game_id, state],
-            legal_actions,
-        )
-        if state_bucket:
-            return state_bucket
-        return _load_bucket(
-            connection,
-            """
-            SELECT action_name, count
-            FROM game_action_priors
-            WHERE game_id = ?
-            """,
-            [game_id],
-            legal_actions,
-        )
+        merged_bucket: dict[str, int] = {}
+        if subgoal:
+            for alias in aliases:
+                subgoal_bucket = _load_bucket(
+                    connection,
+                    """
+                    SELECT action_name, count
+                    FROM subgoal_action_priors
+                    WHERE game_id = ? AND subgoal = ?
+                    """,
+                    [alias, str(subgoal)],
+                    legal_actions,
+                )
+                _merge_missing_actions(merged_bucket, subgoal_bucket)
+        for alias in aliases:
+            frame_bucket = _load_bucket(
+                connection,
+                """
+                SELECT action_name, count
+                FROM frame_action_priors
+                WHERE game_id = ? AND frame_signature = ?
+                """,
+                [alias, frame_signature],
+                legal_actions,
+            )
+            _merge_missing_actions(merged_bucket, frame_bucket)
+        for alias in aliases:
+            state_bucket = _load_bucket(
+                connection,
+                """
+                SELECT action_name, count
+                FROM state_action_priors
+                WHERE game_id = ? AND state = ?
+                """,
+                [alias, state],
+                legal_actions,
+            )
+            _merge_missing_actions(merged_bucket, state_bucket)
+        for alias in aliases:
+            game_bucket = _load_bucket(
+                connection,
+                """
+                SELECT action_name, count
+                FROM game_action_priors
+                WHERE game_id = ?
+                """,
+                [alias],
+                legal_actions,
+            )
+            _merge_missing_actions(merged_bucket, game_bucket)
+        return merged_bucket
 
 
 def load_game_summary(db_path: str | Path, game_id: str) -> dict[str, Any]:
     path = Path(db_path)
     if not path.exists():
-        return {"actions": {}, "states": {}, "frame_signatures": {}}
+        return {"actions": {}, "states": {}, "frame_signatures": {}, "subgoals": {}}
     with closing(sqlite3.connect(path)) as connection:
         summary = {
             "actions": _query_pairs(
@@ -193,6 +255,7 @@ def load_game_summary(db_path: str | Path, game_id: str) -> dict[str, Any]:
             ),
             "states": {},
             "frame_signatures": {},
+            "subgoals": {},
         }
         for state_name, action_name, count in connection.execute(
             """
@@ -218,6 +281,19 @@ def load_game_summary(db_path: str | Path, game_id: str) -> dict[str, Any]:
                 str(frame_signature), {"actions": {}}
             )
             frame_entry["actions"][str(action_name)] = int(count)
+        for subgoal, action_name, count in connection.execute(
+            """
+            SELECT subgoal, action_name, count
+            FROM subgoal_action_priors
+            WHERE game_id = ?
+            ORDER BY subgoal, action_name
+            """,
+            [game_id],
+        ):
+            subgoal_entry = summary["subgoals"].setdefault(
+                str(subgoal), {"actions": {}}
+            )
+            subgoal_entry["actions"][str(action_name)] = int(count)
         return summary
 
 
@@ -242,3 +318,8 @@ def _query_pairs(
 ) -> dict[str, int]:
     rows = connection.execute(query, parameters).fetchall()
     return {str(action_name): int(count) for action_name, count in rows}
+
+
+def _merge_missing_actions(target: dict[str, int], source: dict[str, int]) -> None:
+    for action_name, count in source.items():
+        target.setdefault(str(action_name), int(count))

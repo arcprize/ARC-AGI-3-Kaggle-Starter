@@ -110,12 +110,12 @@ class ArcAdapter:
         return self._default_metadata_for(action_name)
 
     def to_game_action(self, decision: ActionDecision) -> Any:
-        action_name = (decision.action_name or "RESET").upper()
+        action_name = self._resolve_game_action_name(decision.action_name)
         action = self._game_action_cls[action_name]
         if hasattr(action, "is_complex") and action.is_complex():
-            metadata = decision.metadata or {}
-            x = int(metadata.get("x", 32))
-            y = int(metadata.get("y", 32))
+            metadata = self._complex_action_metadata(decision)
+            x = metadata["x"]
+            y = metadata["y"]
             if hasattr(action, "set_data"):
                 action.set_data({"x": x, "y": y})
             if hasattr(action, "reasoning"):
@@ -153,6 +153,9 @@ class ArcAdapter:
             ]
         return [name for name in action_names if name != "RESET"]
 
+    def _supported_action_names(self) -> set[str]:
+        return {"RESET", *self._default_legal_actions}
+
     def _default_metadata_for(self, action_name: str) -> dict[str, Any]:
         if action_name == "ACTION6":
             if self._last_image_input is not None and self._last_image_input.width > 0 and self._last_image_input.height > 0:
@@ -160,15 +163,36 @@ class ArcAdapter:
             return {"x": 32, "y": 32}
         return {}
 
+    def _complex_action_metadata(self, decision: ActionDecision) -> dict[str, int]:
+        default_metadata = dict(self._default_metadata_for(decision.action_name))
+        metadata = dict(decision.metadata or {})
+        x = self._coerce_coordinate(metadata.get("x"))
+        y = self._coerce_coordinate(metadata.get("y"))
+        if x is None or y is None:
+            x = self._coerce_coordinate(default_metadata.get("x"))
+            y = self._coerce_coordinate(default_metadata.get("y"))
+        return {
+            "x": 32 if x is None else x,
+            "y": 32 if y is None else y,
+        }
+
+    def _coerce_coordinate(self, value: Any) -> int | None:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def _default_complex_click_metadata(self) -> dict[str, int]:
         return default_click_target(self._last_image_input)
 
     def _extract_legal_actions(self, latest_frame: Any, game_state: str) -> tuple[list[str], bool]:
-        explicit = self._extract_explicit_actions(latest_frame)
-        if explicit:
-            return explicit, True
+        explicit, explicit_known = self._extract_explicit_actions(latest_frame)
         if game_state in self._reset_state_names:
             return ["RESET"], True
+        if explicit_known:
+            return explicit, True
         return [], False
 
     def _extract_step_index(self, frames: list[Any], latest_frame: Any) -> tuple[int, bool]:
@@ -181,22 +205,43 @@ class ArcAdapter:
                 continue
         return max(len(frames) - 1, 0), False
 
-    def _extract_explicit_actions(self, latest_frame: Any) -> list[str]:
+    def _extract_explicit_actions(self, latest_frame: Any) -> tuple[list[str], bool]:
         for name in ("legal_actions", "available_actions", "valid_actions", "actions"):
             value = getattr(latest_frame, name, None)
             if value is None:
                 continue
             if isinstance(value, str):
                 normalized = self._normalize_name(value)
-                return [normalized] if normalized else []
+                return (
+                    [normalized] if self._is_supported_action_name(normalized) else [],
+                    True,
+                )
             try:
                 actions = [self._normalize_name(item) for item in value]
             except TypeError:
                 continue
-            actions = [item for item in actions if item]
-            if actions:
-                return actions
-        return []
+            actions = [
+                item for item in actions if self._is_supported_action_name(item)
+            ]
+            return actions, True
+        return [], False
+
+    def _resolve_game_action_name(self, value: Any) -> str:
+        normalized = self._normalize_name(value)
+        if self._is_supported_action_name(normalized):
+            return str(normalized)
+        if self._is_supported_action_name("RESET"):
+            return "RESET"
+        if self._is_supported_action_name(self._deterministic_action):
+            return self._deterministic_action
+        if self._default_legal_actions:
+            return self._default_legal_actions[0]
+        return "RESET"
+
+    def _is_supported_action_name(self, value: Any) -> bool:
+        if not value:
+            return False
+        return str(value) in self._supported_action_names()
 
     def _get_attr(self, obj: Any, *names: str, default: Any = None) -> Any:
         for name in names:

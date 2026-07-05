@@ -26,6 +26,7 @@ class RuntimeConfig:
     hyperon_rules_path: Path
     hyperon_learning_path: Path
     memory_db_path: Path
+    archive_memory_db_path: Path
     trained_priors_db_path: Path
     hyperon_wheel_dir: Path
     extra_wheel_dir: Path
@@ -87,6 +88,11 @@ class RuntimeConfig:
             env.get("AGI_MEMORY_DB_PATH"),
             "training_artifacts/arc_memory.sqlite3",
         )
+        archive_memory_db_path = _resolve_path(
+            root,
+            env.get("AGI_ARCHIVE_MEMORY_DB_PATH"),
+            "training_artifacts/arc_memory_archive.sqlite3",
+        )
         trained_priors_db_path = _resolve_path(
             root,
             env.get("AGI_TRAINED_PRIORS_DB_PATH"),
@@ -112,6 +118,7 @@ class RuntimeConfig:
                 "agi_core/knowledge/rules/arc_learned.json",
             ),
             memory_db_path=memory_db_path,
+            archive_memory_db_path=archive_memory_db_path,
             trained_priors_db_path=trained_priors_db_path,
             hyperon_wheel_dir=_resolve_path(
                 root,

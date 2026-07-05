@@ -60,6 +60,7 @@ class MyAgent(Agent):
             rules_path=config.hyperon_rules_path,
             learning_path=config.hyperon_learning_path,
             memory_db_path=config.memory_db_path,
+            archive_memory_db_path=config.archive_memory_db_path,
             trained_priors_db_path=config.trained_priors_db_path,
             project_root=config.project_root,
             reset_state_names=config.reset_state_names,
@@ -92,7 +93,7 @@ class MyAgent(Agent):
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         # Stop once we win. Do not stop on GAME_OVER because reset is a valid recovery action.
-        if latest_frame.state is GameState.WIN:
+        if self._normalize_state_name(latest_frame.state) == self.runtime.config.win_state_name:
             self.runtime.bind_game(self.game_id)
             self.runtime.note_terminal_observation(frames, latest_frame)
             return True
@@ -123,6 +124,13 @@ class MyAgent(Agent):
             ,
             flush=True,
         )
+
+    def _normalize_state_name(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "name"):
+            return str(value.name).upper()
+        return str(value).strip().upper()
 
     def _format_debug_metadata(self, metadata: dict[str, Any]) -> str:
         extras: list[str] = []

@@ -27,11 +27,20 @@ class ProposalCritic:
         for proposal in proposals:
             proposal_bundle = self._bundle_for_proposal(context, proposal, bundle_cache)
             basin_status = dict(proposal_bundle.basin_status or {})
+            working_memory = dict(proposal_bundle.working_memory or {})
             recommended_actions = list(proposal_bundle.recommended_actions or [])
+            trained_prior_bucket = {
+                str(action_name): int(count)
+                for action_name, count in dict(proposal_bundle.trained_prior_bucket or {}).items()
+                if str(action_name) and int(count or 0) > 0
+            }
             suppressed_actions = set(proposal_bundle.suppressed_actions or [])
             basin_action_stats = dict(proposal_bundle.basin_action_stats or {})
             state_action_stats = dict(proposal_bundle.state_action_stats or {})
             subgoal_action_stats = dict(proposal_bundle.subgoal_action_stats or {})
+            semantic_memories = list(proposal_bundle.semantic_memories or [])
+            procedural_memories = list(proposal_bundle.procedural_memories or [])
+            episodic_recalls = list(proposal_bundle.episodic_recalls or [])
             basin_exhausted = bool(basin_status.get("is_exhausted")) or context.memory.is_basin_exhausted(
                 context.observation
             )
@@ -56,6 +65,10 @@ class ProposalCritic:
             score += self._recommended_action_bonus(
                 proposal.action_name,
                 recommended_actions,
+            )
+            score += self._trained_prior_bonus(
+                proposal.action_name,
+                trained_prior_bucket,
             )
             score -= self._suppressed_action_penalty(
                 proposal.action_name,
@@ -84,6 +97,17 @@ class ProposalCritic:
                 stalled_scale=0.01,
                 positive_cap=0.16,
                 negative_cap=0.10,
+            )
+            score += self._memory_row_bonus(proposal.action_name, semantic_memories, scale=0.10)
+            score += self._memory_row_bonus(proposal.action_name, procedural_memories, scale=0.12)
+            score += self._episodic_recall_bonus(proposal.action_name, episodic_recalls)
+            score += self._working_memory_focus_bonus(
+                proposal.action_name,
+                working_memory,
+            )
+            score -= self._working_memory_failure_penalty(
+                proposal.action_name,
+                working_memory,
             )
             if (
                 proposal.action_name == "RESET"
@@ -192,6 +216,19 @@ class ProposalCritic:
             return 0.0
         return 0.18
 
+    def _trained_prior_bonus(
+        self,
+        action_name: str,
+        trained_prior_bucket: dict[str, int],
+    ) -> float:
+        if action_name not in trained_prior_bucket or not trained_prior_bucket:
+            return 0.0
+        max_count = max(trained_prior_bucket.values(), default=0)
+        if max_count <= 0:
+            return 0.0
+        normalized = float(trained_prior_bucket.get(action_name, 0)) / float(max_count)
+        return min(0.10, 0.10 * normalized)
+
     def _bundle_context_bias(
         self,
         stats: dict[str, object],
@@ -210,6 +247,85 @@ class ProposalCritic:
         positive = min(positive_cap, progress * success_scale)
         negative = min(negative_cap, (failed * failed_scale) + (stalled * stalled_scale))
         return positive - negative
+
+    def _memory_row_bonus(
+        self,
+        action_name: str,
+        rows: list[dict[str, object]],
+        *,
+        scale: float,
+    ) -> float:
+        best = 0.0
+        for row in rows:
+            if str(row.get("action_name", "") or "") != action_name:
+                continue
+            confidence = float(row.get("confidence", 0.0) or 0.0)
+            score = float(row.get("score", 0.0) or 0.0)
+            best = max(best, min(scale, (confidence * 0.08) + (score * 0.01)))
+        return best
+
+    def _episodic_recall_bonus(
+        self,
+        action_name: str,
+        recalls: list[dict[str, object]],
+    ) -> float:
+        bonus = 0.0
+        for row in recalls:
+            if str(row.get("action_name", "") or "") != action_name:
+                continue
+            outcome = str(row.get("outcome", "") or "")
+            if outcome == "progress":
+                bonus = max(bonus, 0.08)
+            elif outcome in {"failed", "stalled"}:
+                bonus = min(bonus, -0.04)
+        return bonus
+
+    def _working_memory_focus_bonus(
+        self,
+        action_name: str,
+        working_memory: dict[str, object],
+    ) -> float:
+        semantic_focus = [
+            str(name or "")
+            for name in list(working_memory.get("semantic_focus_actions", []) or [])
+            if str(name or "")
+        ]
+        procedural_focus = [
+            str(name or "")
+            for name in list(working_memory.get("procedural_focus_actions", []) or [])
+            if str(name or "")
+        ]
+        bonus = 0.0
+        if action_name in semantic_focus:
+            bonus += max(0.01, 0.04 - (semantic_focus.index(action_name) * 0.01))
+        if action_name in procedural_focus:
+            bonus += max(0.01, 0.05 - (procedural_focus.index(action_name) * 0.015))
+        return min(0.08, bonus)
+
+    def _working_memory_failure_penalty(
+        self,
+        action_name: str,
+        working_memory: dict[str, object],
+    ) -> float:
+        penalty = 0.0
+        recent_failures = list(working_memory.get("recent_failures", []) or [])
+        if any(
+            str(row.get("action_name", "") or "") == action_name
+            for row in recent_failures
+        ):
+            penalty += 0.06
+        open_failure_modes = list(working_memory.get("open_failure_modes", []) or [])
+        if any(
+            str(row.get("action_name", "") or "") == action_name
+            for row in open_failure_modes
+        ):
+            penalty += 0.05
+        for row in list(working_memory.get("failure_streaks", []) or []):
+            if str(row.get("action_name", "") or "") != action_name:
+                continue
+            penalty += min(0.08, int(row.get("count", 0) or 0) * 0.02)
+            break
+        return min(0.16, penalty)
 
     def _board_probe_bonus(
         self,

@@ -102,6 +102,25 @@ class LLMSpecialist:
                 )
             )
         if proposals:
+            proposals = self._drop_memory_blocked_llm_proposals(
+                context,
+                bundle,
+                proposals,
+            )
+            if not proposals:
+                return self._memory_fallback_proposals(
+                    context,
+                    bundle,
+                    self._failure_reason_with_backend(
+                        context,
+                        "memory-blocked llm candidates",
+                    ),
+                )
+            proposals = self._rerank_close_llm_proposals(
+                context,
+                bundle,
+                proposals,
+            )
             if self._should_replace_emergency_candidates_with_memory_escape(
                 context,
                 bundle,
@@ -141,6 +160,317 @@ class LLMSpecialist:
             bundle,
             failure_reason,
             preferred_actions=preferred_actions,
+        )
+
+    def _rerank_close_llm_proposals(
+        self,
+        context: ExecutiveContext,
+        bundle: MemoryBundle,
+        proposals: list[ActionProposal],
+    ) -> list[ActionProposal]:
+        if len(proposals) < 2:
+            return proposals
+        recommended_actions = [
+            str(action_name or "")
+            for action_name in list(bundle.recommended_actions or [])
+            if str(action_name or "")
+        ]
+        suppressed_actions = {
+            str(action_name or "")
+            for action_name in list(bundle.suppressed_actions or [])
+            if str(action_name or "")
+        }
+        working_memory = dict(bundle.working_memory or {})
+        contextual_failure_actions = {
+            str(proposal.action_name or "")
+            for proposal in proposals
+            if str(proposal.action_name or "")
+            and self._has_contextual_failure_block(
+                context,
+                bundle,
+                proposal,
+            )
+        }
+        trained_prior_bucket = {
+            str(action_name or ""): int(count or 0)
+            for action_name, count in dict(bundle.trained_prior_bucket or {}).items()
+            if str(action_name or "") and int(count or 0) > 0
+        }
+        prior_peak = max(trained_prior_bucket.values(), default=0)
+        sorted_by_confidence = sorted(
+            proposals,
+            key=lambda proposal: float(proposal.confidence or 0.0),
+            reverse=True,
+        )
+        leading_gap = (
+            float(sorted_by_confidence[0].confidence or 0.0)
+            - float(sorted_by_confidence[1].confidence or 0.0)
+        )
+        allowed_gap = 0.08
+        if self._has_clear_trained_prior_leader(
+            proposals,
+            trained_prior_bucket=trained_prior_bucket,
+            recommended_actions=recommended_actions,
+        ):
+            allowed_gap = 0.12
+        elif self._has_clear_failure_demoted_leader(
+            proposals,
+            failure_actions=contextual_failure_actions,
+            working_memory=working_memory,
+        ):
+            allowed_gap = 0.11
+        elif self._has_clear_suppressed_raw_leader(
+            proposals,
+            suppressed_actions=suppressed_actions,
+        ):
+            allowed_gap = 0.12
+        if leading_gap > allowed_gap:
+            return proposals
+        if (
+            not recommended_actions
+            and prior_peak <= 0
+            and not contextual_failure_actions
+            and not suppressed_actions
+        ):
+            return proposals
+        ranked: list[tuple[tuple[float, float, int, str], int, ActionProposal]] = []
+        for index, proposal in enumerate(proposals):
+            action_name = str(proposal.action_name or "")
+            memory_bonus = 0.0
+            reason_tags: list[str] = []
+            if action_name in recommended_actions:
+                memory_bonus += max(
+                    0.02,
+                    0.06 - (recommended_actions.index(action_name) * 0.015),
+                )
+                reason_tags.append("memory-recommended")
+            if action_name in suppressed_actions:
+                memory_bonus -= 0.12
+                reason_tags.append("suppression-demotion")
+            if prior_peak > 0 and action_name in trained_prior_bucket:
+                memory_bonus += 0.08 * (
+                    float(trained_prior_bucket.get(action_name, 0)) / float(prior_peak)
+                )
+                reason_tags.append("trained-prior")
+            if action_name in contextual_failure_actions:
+                memory_bonus -= 0.10
+                reason_tags.append("failure-demotion")
+            if memory_bonus != 0.0:
+                confidence_delta = 0.0
+                if memory_bonus > 0.0:
+                    confidence_delta = min(0.06, memory_bonus * 0.5)
+                else:
+                    confidence_delta = max(-0.05, memory_bonus * 0.35)
+                proposal.confidence = min(
+                    0.98,
+                    max(0.01, float(proposal.confidence or 0.0) + confidence_delta),
+                )
+                if reason_tags:
+                    proposal.reason = (
+                        f"{proposal.reason}; memory-rerank={'+'.join(reason_tags)}"
+                    )
+            ranked.append(
+                (
+                    (
+                        float(proposal.confidence or 0.0) + memory_bonus,
+                        memory_bonus,
+                        -index,
+                        action_name,
+                    ),
+                    index,
+                    proposal,
+                )
+            )
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [proposal for _, _, proposal in ranked]
+
+    def _drop_memory_blocked_llm_proposals(
+        self,
+        context: ExecutiveContext,
+        bundle: MemoryBundle,
+        proposals: list[ActionProposal],
+    ) -> list[ActionProposal]:
+        suppressed_actions = {
+            str(action_name or "")
+            for action_name in list(bundle.suppressed_actions or [])
+            if str(action_name or "")
+        }
+        failure_actions = self._working_memory_failure_actions(
+            dict(bundle.working_memory or {})
+        )
+        blocked_flags: list[bool] = []
+        blocked_candidates: list[ActionProposal] = []
+        clean_candidates: list[ActionProposal] = []
+        for proposal in proposals:
+            action_name = str(proposal.action_name or "")
+            blocked = action_name in suppressed_actions
+            if not blocked and action_name in failure_actions:
+                blocked = self._has_contextual_failure_block(
+                    context,
+                    bundle,
+                    proposal,
+                )
+            blocked_flags.append(blocked)
+            if blocked:
+                blocked_candidates.append(proposal)
+            else:
+                clean_candidates.append(proposal)
+        if blocked_flags and all(blocked_flags):
+            return []
+        if blocked_candidates and clean_candidates:
+            top_blocked = max(
+                float(proposal.confidence or 0.0)
+                for proposal in blocked_candidates
+            )
+            top_clean = max(
+                float(proposal.confidence or 0.0)
+                for proposal in clean_candidates
+            )
+            if (top_blocked - top_clean) > 0.12:
+                return clean_candidates
+        return proposals
+
+    def _has_contextual_failure_block(
+        self,
+        context: ExecutiveContext,
+        bundle: MemoryBundle,
+        proposal: ActionProposal,
+    ) -> bool:
+        action_name = str(proposal.action_name or "")
+        if not action_name:
+            return False
+        working_memory = dict(bundle.working_memory or {})
+        current_frame_signature = str(
+            context.observation.derived_features.get("frame_signature", "") or ""
+        )
+        current_subgoal = str(
+            proposal.subgoal
+            or context.llm_subgoal_hint
+            or working_memory.get("active_subgoal")
+            or ""
+        )
+        has_detailed_action_row = False
+        for row in list(working_memory.get("recent_failures", []) or []) + list(
+            working_memory.get("open_failure_modes", []) or []
+        ):
+            if str(row.get("action_name", "") or "") != action_name:
+                continue
+            row_frame_signature = str(
+                row.get("frame_signature", row.get("prior_frame_signature", "")) or ""
+            )
+            row_subgoal = str(
+                row.get("subgoal", row.get("decision_subgoal", "")) or ""
+            )
+            if not row_frame_signature and not row_subgoal:
+                continue
+            has_detailed_action_row = True
+            frame_matches = True
+            if row_frame_signature:
+                frame_matches = (
+                    bool(current_frame_signature)
+                    and row_frame_signature == current_frame_signature
+                )
+            subgoal_matches = True
+            if row_subgoal:
+                subgoal_matches = (
+                    bool(current_subgoal)
+                    and row_subgoal == current_subgoal
+                )
+            if frame_matches and subgoal_matches:
+                return True
+        if has_detailed_action_row:
+            # A concrete mismatched failure context is stronger evidence than a
+            # generic streak count; do not block on streaks alone in that case.
+            return False
+        failure_streaks = {
+            str(row.get("action_name", "") or ""): int(row.get("count", 0) or 0)
+            for row in list(working_memory.get("failure_streaks", []) or [])
+            if str(row.get("action_name", "") or "")
+        }
+        if int(failure_streaks.get(action_name, 0) or 0) >= 2:
+            return True
+        return False
+
+    def _has_clear_trained_prior_leader(
+        self,
+        proposals: list[ActionProposal],
+        *,
+        trained_prior_bucket: dict[str, int],
+        recommended_actions: list[str],
+    ) -> bool:
+        if len(proposals) < 2 or not trained_prior_bucket:
+            return False
+        proposal_actions = {
+            str(proposal.action_name or "")
+            for proposal in proposals
+            if str(proposal.action_name or "")
+        }
+        ranked = sorted(
+            (
+                (int(count or 0), str(action_name or ""))
+                for action_name, count in trained_prior_bucket.items()
+                if str(action_name or "") in proposal_actions and int(count or 0) > 0
+            ),
+            key=lambda item: (-item[0], item[1]),
+        )
+        if len(ranked) < 2:
+            return False
+        top_count, top_action = ranked[0]
+        second_count = ranked[1][0]
+        if top_count < 4 or top_count < (second_count * 2):
+            return False
+        if recommended_actions and top_action not in recommended_actions[:2]:
+            return False
+        return True
+
+    def _has_clear_failure_demoted_leader(
+        self,
+        proposals: list[ActionProposal],
+        *,
+        failure_actions: set[str],
+        working_memory: dict[str, Any],
+    ) -> bool:
+        if len(proposals) < 2 or not failure_actions:
+            return False
+        ranked = sorted(
+            proposals,
+            key=lambda proposal: float(proposal.confidence or 0.0),
+            reverse=True,
+        )
+        top_action = str(ranked[0].action_name or "")
+        if top_action not in failure_actions:
+            return False
+        if any(
+            str(proposal.action_name or "") not in failure_actions
+            for proposal in ranked[1:]
+        ):
+            return True
+        failure_streaks = {
+            str(row.get("action_name", "") or ""): int(row.get("count", 0) or 0)
+            for row in list(working_memory.get("failure_streaks", []) or [])
+            if str(row.get("action_name", "") or "")
+        }
+        return int(failure_streaks.get(top_action, 0) or 0) >= 3
+
+    def _has_clear_suppressed_raw_leader(
+        self,
+        proposals: list[ActionProposal],
+        *,
+        suppressed_actions: set[str],
+    ) -> bool:
+        if len(proposals) < 2 or not suppressed_actions:
+            return False
+        ranked = sorted(
+            proposals,
+            key=lambda proposal: float(proposal.confidence or 0.0),
+            reverse=True,
+        )
+        top_action = str(ranked[0].action_name or "")
+        if top_action not in suppressed_actions:
+            return False
+        return any(
+            str(proposal.action_name or "") not in suppressed_actions
+            for proposal in ranked[1:]
         )
 
     def _build_prompt(self, context: ExecutiveContext) -> str:
@@ -198,6 +528,7 @@ class LLMSpecialist:
             "When board_active_cells>0 and ACTION6 is legal, use board_default_probe unless a better target is obvious.\n"
             "If current_subgoal_hint=inspect-active-board, prioritize ACTION6 with board_default_probe.\n"
             "If memory_basin_exhausted=true, do not repeat suppressed or recently stalled actions.\n"
+            "If memory_trained_prior_focus or memory_trained_prior_bucket has a clear unsuppressed leader, prefer it unless recent failures strongly contradict it.\n"
             "When exhausted, prefer memory_recommended_actions or any unsuppressed legal action.\n"
         )
 
@@ -221,27 +552,205 @@ class LLMSpecialist:
         if bundle is None:
             return {
                 "recommended_actions": [],
+                "trained_prior_bucket": {},
                 "suppressed_actions": [],
                 "basin_exhausted": basin_exhausted,
                 "basin_status": {},
+                "working_memory": {},
+                "episodic_recalls": [],
+                "semantic_memories": [],
+                "procedural_memories": [],
+                "retrieval_summary": {},
+                "episode_summaries": [],
                 "recent_records": [],
+                "pattern_action_stats": {},
+                "sequence_action_stats": {},
+                "board_cluster_action_stats": {},
                 "board_context_action_stats": {},
                 "basin_action_stats": {},
                 "frame_action_stats": {},
                 "state_action_stats": {},
                 "subgoal_action_stats": {},
             }
+        compact_trained_prior_bucket = self._compact_trained_prior_bucket(
+            bundle.trained_prior_bucket
+        )
+        trained_prior_focus = [
+            {"action_name": action_name, "count": count}
+            for action_name, count in compact_trained_prior_bucket.items()
+        ]
+        compact_working_memory = self._compact_working_memory(bundle.working_memory)
+        if not list(compact_working_memory.get("trained_prior_focus", []) or []):
+            compact_working_memory["trained_prior_focus"] = list(trained_prior_focus)
+        compact_retrieval_summary = self._compact_retrieval_summary(
+            bundle.retrieval_summary
+        )
+        if not list(compact_retrieval_summary.get("trained_prior_focus", []) or []):
+            compact_retrieval_summary["trained_prior_focus"] = list(trained_prior_focus)
         return {
             "recommended_actions": list(bundle.recommended_actions[:3]),
+            "trained_prior_bucket": compact_trained_prior_bucket,
             "suppressed_actions": list(bundle.suppressed_actions[:6]),
             "basin_exhausted": basin_exhausted,
             "basin_status": self._compact_basin_status(bundle.basin_status),
+            "working_memory": compact_working_memory,
+            "episodic_recalls": self._compact_memory_rows(bundle.episodic_recalls),
+            "semantic_memories": self._compact_memory_rows(bundle.semantic_memories),
+            "procedural_memories": self._compact_memory_rows(bundle.procedural_memories),
+            "retrieval_summary": compact_retrieval_summary,
+            "episode_summaries": self._compact_episode_summaries(bundle.episode_summaries),
             "recent_records": self._compact_recent_records(bundle.recent_records),
+            "pattern_action_stats": self._compact_action_stats(bundle.pattern_action_stats),
+            "sequence_action_stats": self._compact_action_stats(bundle.sequence_action_stats),
+            "board_cluster_action_stats": self._compact_action_stats(bundle.board_cluster_action_stats),
             "board_context_action_stats": self._compact_action_stats(bundle.board_context_action_stats),
             "basin_action_stats": self._compact_action_stats(bundle.basin_action_stats),
             "frame_action_stats": self._compact_action_stats(bundle.frame_action_stats),
             "state_action_stats": self._compact_action_stats(bundle.state_action_stats),
             "subgoal_action_stats": self._compact_action_stats(bundle.subgoal_action_stats),
+        }
+
+    def _compact_trained_prior_bucket(
+        self,
+        bucket: dict[str, Any],
+    ) -> dict[str, int]:
+        ranked: list[tuple[str, int]] = []
+        for action_name, count in dict(bucket or {}).items():
+            name = str(action_name or "")
+            value = int(count or 0)
+            if not name or value <= 0:
+                continue
+            ranked.append((name, value))
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        return {action_name: count for action_name, count in ranked[:4]}
+
+    def _compact_episode_summaries(
+        self,
+        summaries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        for summary in list(summaries or [])[:4]:
+            normalized = dict(summary or {})
+            compact.append(
+                {
+                    "prior_game_state": str(normalized.get("prior_game_state", "") or ""),
+                    "prior_frame_signature": str(
+                        normalized.get("prior_frame_signature", "") or ""
+                    ),
+                    "decision_subgoal": str(normalized.get("decision_subgoal", "") or ""),
+                    "first_step_index": int(normalized.get("first_step_index", 0) or 0),
+                    "last_step_index": int(normalized.get("last_step_index", 0) or 0),
+                    "total_events": int(normalized.get("total_events", 0) or 0),
+                    "recent_action_sequence": list(
+                        normalized.get("recent_action_sequence", []) or []
+                    )[:6],
+                    "recent_outcome_sequence": list(
+                        normalized.get("recent_outcome_sequence", []) or []
+                    )[:6],
+                    "decision_sources": {
+                        str(key): int(value or 0)
+                        for key, value in dict(
+                            normalized.get("decision_sources", {}) or {}
+                        ).items()
+                    },
+                    "max_stagnation_after": int(
+                        normalized.get("max_stagnation_after", 0) or 0
+                    ),
+                    "board_context": self._compact_board_context(
+                        normalized.get("board_context_summary", {})
+                    ),
+                    "action_outcomes": self._compact_action_stats(
+                        normalized.get("action_outcomes", {})
+                    ),
+                }
+            )
+        return compact
+
+    def _compact_working_memory(self, working_memory: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(working_memory or {})
+        return {
+            "active_state": str(normalized.get("active_state", "") or ""),
+            "active_frame_signature": str(normalized.get("active_frame_signature", "") or ""),
+            "active_subgoal": str(normalized.get("active_subgoal", "") or ""),
+            "board_context_summary": self._compact_board_context(
+                normalized.get("board_context_summary", {})
+            ),
+            "recent_action_window": list(normalized.get("recent_action_window", []) or [])[:8],
+            "recommended_actions": list(normalized.get("recommended_actions", []) or [])[:4],
+            "trained_prior_focus": list(normalized.get("trained_prior_focus", []) or [])[:4],
+            "suppressed_actions": list(normalized.get("suppressed_actions", []) or [])[:6],
+            "open_failure_modes": list(normalized.get("open_failure_modes", []) or [])[:4],
+            "recent_failures": list(normalized.get("recent_failures", []) or [])[:4],
+            "failure_streaks": list(normalized.get("failure_streaks", []) or [])[:6],
+            "semantic_focus_actions": list(normalized.get("semantic_focus_actions", []) or [])[:3],
+            "procedural_focus_actions": list(normalized.get("procedural_focus_actions", []) or [])[:3],
+            "basin_exhausted": bool(normalized.get("basin_exhausted", False)),
+            "basin_visits": int(normalized.get("basin_visits", 0) or 0),
+            "stagnation_steps": int(normalized.get("stagnation_steps", 0) or 0),
+            "llm_calls": int(normalized.get("llm_calls", 0) or 0),
+            "pending_score_floor_reopen": self._compact_runtime_recovery_marker(
+                normalized.get("pending_score_floor_reopen", {})
+            ),
+            "recent_score_floor_fallback": self._compact_runtime_recovery_marker(
+                normalized.get("recent_score_floor_fallback", {})
+            ),
+            "recent_probe_dead_end_escape": self._compact_runtime_recovery_marker(
+                normalized.get("recent_probe_dead_end_escape", {})
+            ),
+        }
+
+    def _compact_runtime_recovery_marker(self, marker: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(marker or {})
+        return {
+            "state_name": str(normalized.get("state_name", "") or ""),
+            "step_index": int(normalized.get("step_index", 0) or 0),
+            "observation_tick": int(normalized.get("observation_tick", 0) or 0),
+            "candidate_actions": list(normalized.get("candidate_actions", []) or [])[:4],
+            "frame_signatures": list(normalized.get("frame_signatures", []) or [])[:4],
+        }
+
+    def _compact_memory_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        for row in list(rows or [])[:4]:
+            normalized = dict(row or {})
+            compact.append(
+                {
+                    "memory_type": str(
+                        normalized.get("memory_type", normalized.get("recall_type", "")) or ""
+                    ),
+                    "action_name": str(normalized.get("action_name", "") or ""),
+                    "state": str(normalized.get("state", normalized.get("prior_game_state", "")) or ""),
+                    "subgoal": str(normalized.get("subgoal", normalized.get("decision_subgoal", "")) or ""),
+                    "previous_action_name": str(normalized.get("previous_action_name", "") or ""),
+                    "lesson": str(normalized.get("lesson", "") or ""),
+                    "strategy_tag": str(normalized.get("strategy_tag", "") or ""),
+                    "outcome": str(normalized.get("outcome", "") or ""),
+                    "score": round(float(normalized.get("score", 0.0) or 0.0), 4),
+                    "salience": round(float(normalized.get("salience", 0.0) or 0.0), 4),
+                    "confidence": round(float(normalized.get("confidence", 0.0) or 0.0), 4),
+                    "retrieval_provenance": str(normalized.get("retrieval_provenance", "") or ""),
+                }
+            )
+        return compact
+
+    def _compact_retrieval_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(summary or {})
+        return {
+            "retrieval_version": str(normalized.get("retrieval_version", "") or ""),
+            "state": str(normalized.get("state", "") or ""),
+            "subgoal": str(normalized.get("subgoal", "") or ""),
+            "active_subgoal": str(normalized.get("active_subgoal", "") or ""),
+            "recent_record_count": int(normalized.get("recent_record_count", 0) or 0),
+            "episode_summary_count": int(normalized.get("episode_summary_count", 0) or 0),
+            "semantic_memory_count": int(normalized.get("semantic_memory_count", 0) or 0),
+            "procedural_memory_count": int(normalized.get("procedural_memory_count", 0) or 0),
+            "top_recall_sources": list(normalized.get("top_recall_sources", []) or [])[:4],
+            "suggested_actions": list(normalized.get("suggested_actions", []) or [])[:4],
+            "trained_prior_focus": list(normalized.get("trained_prior_focus", []) or [])[:4],
+            "suppressed_actions": list(normalized.get("suppressed_actions", []) or [])[:6],
+            "runtime_has_working_memory": bool(
+                normalized.get("runtime_has_working_memory", False)
+            ),
         }
 
     def _compact_basin_status(self, basin_status: dict[str, Any]) -> dict[str, Any]:
@@ -371,7 +880,19 @@ class LLMSpecialist:
         basin_exhausted = bool(bundle.basin_status.get("is_exhausted", False)) or (
             context.memory.is_basin_exhausted(context.observation)
         )
-        has_memory_guidance = bool(bundle.suppressed_actions)
+        working_memory = dict(bundle.working_memory or {})
+        focus_actions = self._working_memory_focus_actions(
+            working_memory,
+            legal_actions,
+        )
+        failure_actions = self._working_memory_failure_actions(working_memory)
+        has_memory_guidance = bool(
+            bundle.suppressed_actions
+            or bundle.recommended_actions
+            or bundle.trained_prior_bucket
+            or focus_actions
+            or failure_actions
+        )
         if not basin_exhausted and not has_memory_guidance:
             return []
         base_suppressed = set(bundle.suppressed_actions)
@@ -427,6 +948,7 @@ class LLMSpecialist:
         )
         if basin_exhausted and self._board_probe_action_is_stale(context, board_probe_action):
             board_probe_action = None
+        focus_actions = self._working_memory_focus_actions(working_memory, candidate_actions)
         ranked_actions: list[str] = []
         if preferred_order and basin_exhausted:
             ranked_actions.extend(
@@ -442,9 +964,29 @@ class LLMSpecialist:
             )
         ranked_actions.extend(
             action
+            for action in focus_actions
+            if action in candidate_actions
+            and action not in suppressed
+            and action != recent_action
+            and action not in failure_actions
+            and action not in ranked_actions
+        )
+        ranked_actions.extend(
+            action
             for action in bundle.recommended_actions
             if action in candidate_actions
             and action not in suppressed
+            and action not in ranked_actions
+        )
+        ranked_actions.extend(
+            action
+            for action in self._trained_prior_order(
+                bundle,
+                candidate_actions,
+            )
+            if action not in suppressed
+            and action != recent_action
+            and action not in failure_actions
             and action not in ranked_actions
         )
         if (
@@ -457,8 +999,17 @@ class LLMSpecialist:
             action
             for action in candidate_actions
             if action not in suppressed
+            and action not in failure_actions
             and action != recent_action
             and action not in ranked_actions
+        )
+        ranked_actions.extend(
+            action
+            for action in candidate_actions
+            if action not in suppressed
+            and action != recent_action
+            and action not in ranked_actions
+            and action in failure_actions
         )
         ranked_actions.extend(
             action
@@ -509,6 +1060,51 @@ class LLMSpecialist:
                 )
             )
         return proposals
+
+    def _working_memory_focus_actions(
+        self,
+        working_memory: dict[str, Any],
+        candidate_actions: list[str],
+    ) -> list[str]:
+        ranked: list[str] = []
+        for action_name in list(working_memory.get("procedural_focus_actions", []) or []):
+            normalized = str(action_name or "")
+            if (
+                normalized
+                and normalized in candidate_actions
+                and normalized not in ranked
+            ):
+                ranked.append(normalized)
+        for action_name in list(working_memory.get("semantic_focus_actions", []) or []):
+            normalized = str(action_name or "")
+            if (
+                normalized
+                and normalized in candidate_actions
+                and normalized not in ranked
+            ):
+                ranked.append(normalized)
+        return ranked
+
+    def _working_memory_failure_actions(
+        self,
+        working_memory: dict[str, Any],
+    ) -> set[str]:
+        failure_actions: set[str] = set()
+        for row in list(working_memory.get("recent_failures", []) or []):
+            action_name = str(row.get("action_name", "") or "")
+            if action_name:
+                failure_actions.add(action_name)
+        for row in list(working_memory.get("open_failure_modes", []) or []):
+            action_name = str(row.get("action_name", "") or "")
+            if action_name:
+                failure_actions.add(action_name)
+        for row in list(working_memory.get("failure_streaks", []) or []):
+            action_name = str(row.get("action_name", "") or "")
+            if not action_name:
+                continue
+            if int(row.get("count", 0) or 0) > 0:
+                failure_actions.add(action_name)
+        return failure_actions
 
     def _board_probe_metadata(self, context: ExecutiveContext) -> dict[str, int]:
         image_input = context.observation.image_input
@@ -708,6 +1304,26 @@ class LLMSpecialist:
             ordered.remove(board_probe_action)
             ordered.insert(0, board_probe_action)
         return ordered
+
+    def _trained_prior_order(
+        self,
+        bundle: MemoryBundle,
+        legal_actions: list[str],
+    ) -> list[str]:
+        ranked: list[tuple[int, str]] = []
+        legal = {
+            str(action_name or "")
+            for action_name in list(legal_actions or [])
+            if str(action_name or "")
+        }
+        for action_name, count in dict(bundle.trained_prior_bucket or {}).items():
+            normalized = str(action_name or "")
+            value = int(count or 0)
+            if normalized not in legal or value <= 0:
+                continue
+            ranked.append((value, normalized))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [action_name for _, action_name in ranked]
 
     def _normalize_candidate(self, raw_candidate: Any) -> dict[str, Any]:
         if isinstance(raw_candidate, str):
