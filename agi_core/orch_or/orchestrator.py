@@ -108,10 +108,16 @@ class ObjectiveReduction:
         # --- Hyperon integration: query rules for decision support ---
         hyperon_priors: dict[str, float] = {}
         subgoal_from_hints: str | None = None
-        # Query beam strategy hints (game/level-specific direction bias).
+        # Query game-agnostic board-level rules.
         beam_strategy: list[dict[str, Any]] = []
+        board_explore_bias: list[dict[str, Any]] = []
+        board_interact_range: list[dict[str, Any]] = []
+        board_move_bias: list[dict[str, Any]] = []
         try:
             beam_strategy = context.hyperon.run_rules("beam-strategy") or []
+            board_explore_bias = context.hyperon.run_rules("board-explore-bias") or []
+            board_interact_range = context.hyperon.run_rules("board-interact-range") or []
+            board_move_bias = context.hyperon.run_rules("board-move-bias") or []
         except Exception:
             pass
         try:
@@ -162,6 +168,9 @@ class ObjectiveReduction:
             "stable_goal": self._stable_goal,
             "action_priors": hyperon_priors,
             "beam_strategy": beam_strategy,
+            "board_explore_bias": board_explore_bias,
+            "board_interact_range": board_interact_range,
+            "board_move_bias": board_move_bias,
         }
         if subgoal_from_hints:
             plan_context["goal_hints"] = goal_hints

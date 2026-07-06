@@ -81,5 +81,30 @@
 (= (game-subgoal ar25 2) explore-board)
 (= (game-subgoal ar25 3) explore-board)
 
+; Board-type reset thresholds — how many stagnation steps before RESET.
+(= (board-reset-threshold puzzle) 8)
+(= (board-reset-threshold platformer) 12)
+(= (board-reset-threshold unknown) 6)
+
+; Board-type explore bias — which axis to prioritize when exploring.
+; platformer: horizontal movement covers more ground.
+; puzzle: vertical movement explores layers.
+(= (board-explore-bias platformer) horizontal)
+(= (board-explore-bias puzzle) vertical)
+(= (board-explore-bias unknown) horizontal)
+
+; Board-type interaction range — max distance for clicking on interactive
+; objects.  Puzzles need wider range, platformers are tighter.
+(= (board-interact-range puzzle) 4)
+(= (board-interact-range platformer) 2)
+(= (board-interact-range unknown) 3)
+
+; Board-type movement step preference — which direction to try first.
+; platformer: right/down (scrolling direction)
+; puzzle: down/up (vertical exploration)
+(= (board-move-bias platformer) right)
+(= (board-move-bias puzzle) down)
+(= (board-move-bias unknown) right)
+
 (= (prefer-novel-action stalled) True)
 (= (prefer-successful-pattern repeated-progress) True)

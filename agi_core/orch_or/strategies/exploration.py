@@ -104,7 +104,18 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                     if not game_model.walkable or (nx, ny) in game_model.walkable:
                         steps.append(_explore_step(dir))
                         return steps
-                search_dirs = ["down", "up", "right", "left"] if features.has_beam else ["right", "left", "down", "up"]
+                # Board-type explore bias overrides the default search order.
+                _explore_bias = "vertical" if features.has_beam else "horizontal"
+                try:
+                    board_bias_rows = ctx.get("board_explore_bias", [])
+                    if board_bias_rows:
+                        _explore_bias = str(board_bias_rows[0].get("axis", _explore_bias))
+                except Exception:
+                    pass
+                if _explore_bias == "vertical":
+                    search_dirs = ["down", "up", "right", "left"]
+                else:
+                    search_dirs = ["right", "left", "down", "up"]
                 search_dirs = _bias_candidates_by_priors(search_dirs, ctx.get("action_priors", {}))
                 for d in search_dirs:
                     dvx, dvy = _direction_vec(d)
@@ -170,16 +181,23 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
             return steps
         # Search order fallback for puzzle boards with goal detectable
         if features.board_type == "puzzle":
-            search_order = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-            if features.has_beam:
-                search_order = [(0, 1), (0, -1), (1, 0), (-1, 0)]
-            for dx, dy_ in search_order:
-                nx, ny = px + dx, py + dy_
+            _explore_bias = "vertical"
+            try:
+                board_bias_rows = (context or {}).get("board_explore_bias", [])
+                if board_bias_rows:
+                    _explore_bias = str(board_bias_rows[0].get("axis", "vertical"))
+            except Exception:
+                pass
+            if _explore_bias == "vertical":
+                search_dirs = ["down", "up", "right", "left"]
+            else:
+                search_dirs = ["right", "left", "down", "up"]
+            for d in search_dirs:
+                dvx, dvy = _direction_vec(d)
+                nx, ny = px + dvx, py + dvy
                 if (nx, ny) in game_model.walkable:
-                    d = {1: "right", -1: "left"}.get(dx, "") or {1: "down", -1: "up"}.get(dy_, "")
-                    if d:
-                        steps.append(_explore_step(d))
-                        return steps
+                    steps.append(_explore_step(d))
+                    return steps
     return steps
 
 

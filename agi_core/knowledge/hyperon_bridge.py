@@ -457,6 +457,22 @@ class HyperonBridge:
             if level in game_levels:
                 return [{"direction": d, "confidence": c} for d, c in game_levels[level]]
             return []
+        if query_name == "board-reset-threshold":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_RESET: dict[str, int] = {"puzzle": 8, "platformer": 12, "unknown": 6}
+            return [{"threshold": _BOARD_RESET.get(board_type, 6), "board_type": board_type}]
+        if query_name == "board-explore-bias":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_BIAS: dict[str, str] = {"puzzle": "vertical", "platformer": "horizontal", "unknown": "horizontal"}
+            return [{"axis": _BOARD_BIAS.get(board_type, "horizontal"), "board_type": board_type}]
+        if query_name == "board-interact-range":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_RANGE: dict[str, int] = {"puzzle": 4, "platformer": 2, "unknown": 3}
+            return [{"range": _BOARD_RANGE.get(board_type, 3), "board_type": board_type}]
+        if query_name == "board-move-bias":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_MOVE: dict[str, str] = {"puzzle": "down", "platformer": "right", "unknown": "right"}
+            return [{"direction": _BOARD_MOVE.get(board_type, "right"), "board_type": board_type}]
         return []
 
     def _working_memory_goal_hint(

@@ -302,6 +302,66 @@ class HyperonBridgeTests(unittest.TestCase):
         self.assertTrue(len(result) >= 1)
         self.assertEqual(result[0].get("direction"), "right")
 
+    def test_board_explore_bias_puzzle_vertical(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-beb-puzzle"},
+        )
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        result = bridge.run_rules("board-explore-bias")
+        self.assertEqual(result[0].get("axis"), "vertical")
+
+    def test_board_explore_bias_platformer_horizontal(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-beb-platformer"},
+        )
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "platformer"
+        result = bridge.run_rules("board-explore-bias")
+        self.assertEqual(result[0].get("axis"), "horizontal")
+
+    def test_board_interact_range_puzzle_wider(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"],
+            derived_features={"frame_signature": "sig-bir-puzzle"},
+        )
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        result = bridge.run_rules("board-interact-range")
+        self.assertEqual(result[0].get("range"), 4)
+
+    def test_board_move_bias_puzzle_down(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-bmb-puzzle"},
+        )
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        result = bridge.run_rules("board-move-bias")
+        self.assertEqual(result[0].get("direction"), "down")
+
+    def test_board_move_bias_platformer_right(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-bmb-platformer"},
+        )
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "platformer"
+        result = bridge.run_rules("board-move-bias")
+        self.assertEqual(result[0].get("direction"), "right")
+
     def test_sync_records_live_board_summary_without_persisting_board(self) -> None:
         bridge = HyperonBridge(enabled=False)
         memory = EpisodicMemory()
