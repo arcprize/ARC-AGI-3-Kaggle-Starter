@@ -19,7 +19,7 @@ from agi_core.orch_or.plan_executor import (
     plan_step_to_proposal,
 )
 from agi_core.orch_or.plan_generator import generate_plan
-from agi_core.types import ActionDecision
+from agi_core.types import ActionDecision, ActionProposal
 
 if TYPE_CHECKING:
     from agi_core.orch_or.game_model import GameModel, MonitorStatus
@@ -112,6 +112,69 @@ class ObjectiveReduction:
                 self._persist_plan(context)
         self._skip_monitoring = False
 
+        # --- Hyperon integration: query rules for decision support ---
+        hyperon_priors: dict[str, float] = {}
+        subgoal_from_hints: str | None = None
+        try:
+            # Check for reset-needed
+            for row in context.hyperon.run_rules("reset-needed"):
+                if row.get("action_name"):
+                    logger.debug("hyperon reset-needed: %s", row)
+                    return ActionDecision(
+                        action_name=row["action_name"],
+                        source="orch_or:hyperon",
+                        confidence=float(row.get("confidence", 0.95)),
+                        reason=str(row.get("reason", "hyperon reset")),
+                        subgoal="re-enter-level",
+                        proposals=[ActionProposal(
+                            action_name=row["action_name"],
+                            source="orch_or:hyperon",
+                            confidence=float(row.get("confidence", 0.95)),
+                            reason=str(row.get("reason", "hyperon reset")),
+                            subgoal="re-enter-level",
+                        )],
+                    )
+            # Query goal hints
+            goal_hints = context.hyperon.run_rules("goal-hints")
+            if goal_hints:
+                logger.debug("hyperon goal-hints: %s", goal_hints)
+                subgoal_from_hints = goal_hints[0].get("subgoal")
+            # Query action priors for current subgoal
+            prior_query = "action-priors"
+            if subgoal_from_hints:
+                prior_query = f"action-priors:{subgoal_from_hints}"
+            for row in context.hyperon.run_rules(prior_query):
+                action_name = str(row.get("action_name", "")).upper()
+                if not action_name:
+                    continue
+                hyperon_priors[action_name] = float(row.get("confidence", 0.5))
+            if hyperon_priors:
+                logger.debug("hyperon action-priors: %s", hyperon_priors)
+        except Exception:
+            logger.debug("hyperon rules query failed (disabled?)", exc_info=True)
+
+        # --- Hyperon integration: contextual memory bundle ---
+        try:
+            if context.memory_bundle is not None and context.observation is not None:
+                legal = list(context.observation.legal_actions) if hasattr(context.observation, "legal_actions") else []
+                ctx_bundle = context.hyperon.contextual_memory_bundle(
+                    context.observation, subgoal_from_hints, legal,
+                )
+                if ctx_bundle is not None:
+                    context.memory_bundle = ctx_bundle
+        except Exception:
+            logger.debug("hyperon contextual bundle failed", exc_info=True)
+
+        # Write structured working memory fields that hyperon can consume.
+        wm = self._get_working_memory(context)
+        wm["active_subgoal"] = subgoal_from_hints or "unknown"
+        wm["stable_goal"] = self._stable_goal
+        wm["switch_attempted"] = self._switch_attempted
+        wm["failed_directions"] = list(self._failed_directions)
+        if hyperon_priors:
+            wm["recommended_actions"] = sorted(hyperon_priors, key=hyperon_priors.get, reverse=True)
+        plan_context["action_priors"] = hyperon_priors
+
         if self._active_plan is None or not self._active_plan.is_active:
             parallel = bool(getattr(self._config, "planner_parallel", False))
             p_timeout = getattr(self._config, "planner_parallel_timeout", None)
@@ -177,6 +240,12 @@ class ObjectiveReduction:
         )
         context.memory.note_decision(decision)
         self._persist_plan(context)
+        # Feed the proposals back to hyperon so the MeTTa runtime can learn
+        # about the actions ORCH-OR considered.
+        try:
+            context.hyperon.update_proposals(decision.proposals)
+        except Exception:
+            pass
         return decision
 
     def _check_previous_action(

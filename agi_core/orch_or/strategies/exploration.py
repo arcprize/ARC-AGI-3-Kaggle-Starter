@@ -32,7 +32,9 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                 candidates.append("up")
             elif gy > py:
                 candidates.append("down")
-            # Skip directions that have failed before (no movement produced).
+            # Reorder by hyperon action priors, then skip failed directions.
+            priors = ctx.get("action_priors", {})
+            candidates = _bias_candidates_by_priors(candidates, priors)
             failed = ctx.get("failed_directions", set())
             candidates = [d for d in candidates if d not in failed] + [d for d in candidates if d in failed]
             for d in candidates:
@@ -93,14 +95,14 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                     if not game_model.walkable or (nx, ny) in game_model.walkable:
                         steps.append(_explore_step(dir))
                         return steps
-                search_order = [(0, 1), (0, -1), (1, 0), (-1, 0)] if features.has_beam else [(1, 0), (-1, 0), (0, 1), (0, -1)]
-                for dx, dy_ in search_order:
-                    nx, ny = px + dx, py + dy_
+                search_dirs = ["down", "up", "right", "left"] if features.has_beam else ["right", "left", "down", "up"]
+                search_dirs = _bias_candidates_by_priors(search_dirs, ctx.get("action_priors", {}))
+                for d in search_dirs:
+                    dvx, dvy = _direction_vec(d)
+                    nx, ny = px + dvx, py + dvy
                     if not game_model.walkable or (nx, ny) in game_model.walkable:
-                        d = {1: "right", -1: "left"}.get(dx, "") or {1: "down", -1: "up"}.get(dy_, "")
-                        if d:
-                            steps.append(_explore_step(d))
-                            return steps
+                        steps.append(_explore_step(d))
+                        return steps
                 # Last resort: try the stable goal when beam nav gives nothing.
                 if stable_goal is not None and features.goal_detectable:
                     gx, gy = stable_goal
@@ -139,11 +141,11 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                 candidates.append("up")
             elif gy > py:
                 candidates.append("down")
-            # Rotate order so a previously-failed direction doesn't keep
-            # getting picked first.
+            # Order by hyperon priors, then push failed directions to back.
+            priors = (context or {}).get("action_priors", {})
+            candidates = _bias_candidates_by_priors(candidates, priors)
             failed = (context or {}).get("failed_directions", set())
-            if failed:
-                candidates = [d for d in candidates if d not in failed] + [d for d in candidates if d in failed]
+            candidates = [d for d in candidates if d not in failed] + [d for d in candidates if d in failed]
             for d in candidates:
                 dvx, dvy = _direction_vec(d)
                 nx, ny = px + dvx, py + dvy
@@ -313,6 +315,20 @@ def _beam_gradient_step(
         if not gm.walkable or (nx, ny) in gm.walkable:
             return last_dir
     return None
+
+
+def _bias_candidates_by_priors(
+    candidates: list[str],
+    priors: dict[str, float],
+) -> list[str]:
+    """Reorder candidate directions so that the one with the highest hyperon
+    action prior is tried first."""
+    _DIR_TO_ACTION = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
+    if not priors:
+        return candidates
+    scored = [(priors.get(_DIR_TO_ACTION.get(d, ""), 0.0), d) for d in candidates]
+    scored.sort(key=lambda x: -x[0])
+    return [d for _, d in scored]
 
 
 def _explore_step(direction: str) -> PlanStep:

@@ -65,15 +65,29 @@ def movement_strategy(game_model: GameModel, context: dict | None = None) -> lis
     gx, gy = target
     dx = gx - px
     dy = gy - py
+    if dx == 0 and dy == 0:
+        return steps
+    # When both axes need movement, let hyperon action priors break the tie.
+    _DIR_TO_ACTION = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
+    action_priors = (context or {}).get("action_priors", {})
+    horiz = "right" if dx > 0 else "left"
+    vert = "down" if dy > 0 else "up"
     if abs(dx) > abs(dy):
-        nx, ny = (px + (1 if dx > 0 else -1), py)
+        primary, secondary = horiz, vert
+    elif abs(dy) > abs(dx):
+        primary, secondary = vert, horiz
     else:
-        nx, ny = (px, py + (1 if dy > 0 else -1))
-    if not game_model.walkable or (nx, ny) in game_model.walkable:
-        if abs(dx) > abs(dy):
-            steps.append(_move_step("right" if dx > 0 else "left"))
-        elif dy != 0:
-            steps.append(_move_step("down" if dy > 0 else "up"))
+        pri_h = action_priors.get(_DIR_TO_ACTION.get(horiz, ""), 0.0)
+        pri_v = action_priors.get(_DIR_TO_ACTION.get(vert, ""), 0.0)
+        primary = horiz if pri_h >= pri_v else vert
+        secondary = vert if pri_h >= pri_v else horiz
+    for d in (primary, secondary):
+        off = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
+        dvx, dvy = off.get(d, (0, 0))
+        nx, ny = px + dvx, py + dvy
+        if not game_model.walkable or (nx, ny) in game_model.walkable:
+            steps.append(_move_step(d))
+            return steps
     return steps
 
 
