@@ -57,20 +57,25 @@ def generate_plan(
                 steps = puzzle_fn(game_model, context)
     if not steps:
         return None
-    # Boost plan confidence when hyperon action priors reinforce the plan.
+    # Adjust plan confidence from hyperon action priors.
     _DIR_TO_ACTION = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
     action_priors = (context or {}).get("action_priors", {})
     conf_boost = 0.0
+    conf_penalty = 0.0
     for step in steps:
+        action_name = None
         if step.action == "switch":
-            conf_boost = max(conf_boost, action_priors.get("ACTION5", 0.0))
+            action_name = "ACTION5"
         elif step.action == "click":
-            conf_boost = max(conf_boost, action_priors.get("ACTION6", 0.0))
+            action_name = "ACTION6"
         elif step.action == "move" and step.params and "direction" in step.params:
             action_name = _DIR_TO_ACTION.get(step.params["direction"])
-            if action_name:
-                conf_boost = max(conf_boost, action_priors.get(action_name, 0.0))
-    confidence = min(0.5 + conf_boost * 0.3, 0.8)
+        if action_name and action_name in action_priors:
+            prior = action_priors[action_name]
+            conf_boost = max(conf_boost, prior)
+            if prior < 0.15:
+                conf_penalty = max(conf_penalty, 0.15 - prior)
+    confidence = min(0.5 + conf_boost * 0.3 - conf_penalty * 0.5, 0.8)
     return Plan(
         objective_id=leaf.description,
         steps=steps,

@@ -64,6 +64,17 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
             ctx = context or {}
             non_beam = ctx.get("non_beam_controllers", set())
             if features.player_color not in non_beam:
+                # If hyperon has a very high confidence direction, try it first
+                # before falling through to beam navigation.
+                _AP_TO_DIR = {"ACTION1": "up", "ACTION2": "down", "ACTION3": "left", "ACTION4": "right"}
+                ap = ctx.get("action_priors", {})
+                hyperon_best_dir = max(((d, ap.get(a, 0.0)) for a, d in _AP_TO_DIR.items()), key=lambda x: x[1], default=(None, 0.0))
+                if hyperon_best_dir[0] and hyperon_best_dir[1] > 0.8:
+                    dvx, dvy = _direction_vec(hyperon_best_dir[0])
+                    nx, ny = px + dvx, py + dvy
+                    if not game_model.walkable or (nx, ny) in game_model.walkable:
+                        steps.append(_explore_step(hyperon_best_dir[0]))
+                        return steps
                 mirror_dir = _mirror_axis_direction(game_model)
                 if mirror_dir is not None:
                     dx, dy_ = _direction_vec(mirror_dir)

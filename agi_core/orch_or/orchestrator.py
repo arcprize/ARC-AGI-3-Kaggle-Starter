@@ -52,6 +52,7 @@ class ObjectiveReduction:
         self._failed_directions: set[str] = set()
         self._pending_failed_dir: str | None = None
         self._stable_goal: tuple[int, int] | None = None
+        self._hyperon_priors: dict[str, float] = {}
 
     def decide(self, context: ExecutiveContext) -> ActionDecision:
         context.hyperon.sync(context.observation, context.memory, context.goals)
@@ -138,6 +139,7 @@ class ObjectiveReduction:
                 logger.debug("hyperon action-priors: %s", hyperon_priors)
         except Exception:
             logger.debug("hyperon rules query failed (disabled?)", exc_info=True)
+        self._hyperon_priors = hyperon_priors
 
         logger.debug("orchestrator state: switch_attempted=%s non_beam=%s stable_goal=%s", self._switch_attempted, self._non_beam_controllers, self._stable_goal)
         plan_context: dict[str, Any] = {
@@ -233,7 +235,11 @@ class ObjectiveReduction:
             step = self._active_plan.steps[current_step_index]
             proposal = plan_step_to_proposal(step, game_model, self._active_plan)
             if proposal is not None:
-                logger.debug("proposal resolved: action=%s", proposal.action_name)
+                # Boost proposal confidence from hyperon action priors.
+                hyperon_action_prior = hyperon_priors.get(proposal.action_name, 0.0)
+                if hyperon_action_prior > 0.0:
+                    proposal.confidence = min(proposal.confidence + hyperon_action_prior * 0.25, 0.95)
+                logger.debug("proposal resolved: action=%s conf=%.3f", proposal.action_name, proposal.confidence)
                 break
             logger.debug("step %d returned None proposal, skipping", current_step_index)
             self._active_plan.current_index += 1
@@ -394,6 +400,14 @@ class ObjectiveReduction:
             step.retry_count += 1
             if step.params and "direction" in step.params:
                 self._pending_failed_dir = step.params["direction"]
+            # Early abort: if hyperon gives low confidence to this action,
+            # accelerate retry_count so we give up faster.
+            _DIR_TO_ACTION = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
+            action_name = _DIR_TO_ACTION.get((step.params or {}).get("direction", ""))
+            if action_name:
+                hyperon_conf = self._hyperon_priors.get(action_name, 0.5)
+                if hyperon_conf < 0.2:
+                    step.retry_count = max(step.retry_count, step.tolerance - 1)
         elif status == "switch_entity" and self._active_plan is not None:
             # Query hyperon to see if it recommends switching.
             hyperon_recommends_switch = False
