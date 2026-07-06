@@ -30,7 +30,10 @@ def generate_plan(
     parallel: bool = False,
     timeout: float | None = None,
 ) -> Plan | None:
-    objective_tree = reduce(game_model)
+    goal_hints: list[dict] | None = None
+    if context and "goal_hints" in context:
+        goal_hints = context["goal_hints"]
+    objective_tree = reduce(game_model, goal_hints=goal_hints)
     leaf = select_leaf(objective_tree)
     primary_name = _STRATEGY_MAP.get(leaf.description, "generic")
     if parallel and leaf.description in _PARALLEL_TARGETS:

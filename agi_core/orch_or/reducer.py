@@ -20,10 +20,24 @@ def _explore() -> Objective:
 
 
 
-def reduce(game_model: GameModel, root: Objective | None = None) -> Objective:
+def reduce(
+    game_model: GameModel,
+    root: Objective | None = None,
+    goal_hints: list[dict] | None = None,
+) -> Objective:
     if root is None:
         root = _root_obj()
     features = game_model.features
+    # Apply hyperon goal hints to adjust sub-objective priorities.
+    if goal_hints:
+        for hint in goal_hints:
+            hinted_subgoal = str(hint.get("subgoal", "") or "")
+            hint_conf = float(hint.get("confidence", 0.0))
+            if hinted_subgoal == "re-enter-level":
+                _root_obj().priority = 0.99  # slight nudge
+            elif hinted_subgoal == "clear-obstacles" and hint_conf > 0.5:
+                _clear_obstacles().priority = 0.92
+
     if features.player_detectable and features.goal_detectable:
         if features.has_beam:
             # Beam exists - use explore-board for beam navigation

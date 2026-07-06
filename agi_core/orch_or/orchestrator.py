@@ -96,21 +96,6 @@ class ObjectiveReduction:
                 self._stable_goal = nearest
         elif self._stable_goal is None and game_model.goal_positions:
             self._stable_goal = game_model.goal_positions[0]
-        logger.debug("orchestrator state: switch_attempted=%s non_beam=%s stable_goal=%s", self._switch_attempted, self._non_beam_controllers, self._stable_goal)
-        plan_context: dict[str, Any] = {
-            "game_step": context.observation.step_index,
-            "switch_attempted": self._switch_attempted,
-            "non_beam_controllers": self._non_beam_controllers.copy(),
-            "failed_directions": self._failed_directions.copy(),
-            "stable_goal": self._stable_goal,
-        }
-        _update_beam_context(game_model, self._previous_model, self._get_working_memory(context), plan_context)
-
-        if not self._skip_monitoring:
-            self._check_previous_action(game_model, context)
-            if self._active_plan is not None:
-                self._persist_plan(context)
-        self._skip_monitoring = False
 
         # --- Hyperon integration: query rules for decision support ---
         hyperon_priors: dict[str, float] = {}
@@ -152,6 +137,25 @@ class ObjectiveReduction:
                 logger.debug("hyperon action-priors: %s", hyperon_priors)
         except Exception:
             logger.debug("hyperon rules query failed (disabled?)", exc_info=True)
+
+        logger.debug("orchestrator state: switch_attempted=%s non_beam=%s stable_goal=%s", self._switch_attempted, self._non_beam_controllers, self._stable_goal)
+        plan_context: dict[str, Any] = {
+            "game_step": context.observation.step_index,
+            "switch_attempted": self._switch_attempted,
+            "non_beam_controllers": self._non_beam_controllers.copy(),
+            "failed_directions": self._failed_directions.copy(),
+            "stable_goal": self._stable_goal,
+            "action_priors": hyperon_priors,
+        }
+        if subgoal_from_hints:
+            plan_context["goal_hints"] = [{"subgoal": subgoal_from_hints}]
+        _update_beam_context(game_model, self._previous_model, self._get_working_memory(context), plan_context)
+
+        if not self._skip_monitoring:
+            self._check_previous_action(game_model, context)
+            if self._active_plan is not None:
+                self._persist_plan(context)
+        self._skip_monitoring = False
 
         # --- Hyperon integration: contextual memory bundle ---
         try:
@@ -215,6 +219,10 @@ class ObjectiveReduction:
                 self._persist_plan(context)
                 self._skip_monitoring = True
                 return self.decide(context)
+            try:
+                context.hyperon.update_proposals([])
+            except Exception:
+                pass
             return self._fallback_executive(context)
         while True:
             self._active_plan.attempt_count += 1
@@ -267,6 +275,15 @@ class ObjectiveReduction:
             wm = self._get_working_memory(context)
             wm.pop(_SWITCH_KEY, None)
             wm.pop(_SWITCH_POS_KEY, None)
+            # Query hyperon for action priors to guide the fallback direction.
+            hyperon_priors: dict[str, float] = {}
+            try:
+                for row in context.hyperon.run_rules("action-priors"):
+                    action_name = str(row.get("action_name", "")).upper()
+                    if action_name:
+                        hyperon_priors[action_name] = float(row.get("confidence", 0.5))
+            except Exception:
+                pass
             # Instead of falling back to the reactive executive (which may give
             # a conflicting direction), emit a simple move toward the stable
             # goal for non-beam-controllers.
@@ -274,10 +291,15 @@ class ObjectiveReduction:
                 px, py = game_model.player_pos
                 gx, gy = self._stable_goal
                 dx, dy = gx - px, gy - py
-                if abs(dx) >= abs(dy):
-                    direction = "right" if dx > 0 else ("left" if dx < 0 else "down")
-                else:
-                    direction = "down" if dy > 0 else ("up" if dy < 0 else "right")
+                direction = "right" if dx > 0 else ("left" if dx < 0 else ("down" if dy > 0 else "up"))
+                # Use hyperon prior to pick axis when both need movement.
+                _DIR_TO_ACTION = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
+                if dx != 0 and dy != 0:
+                    horiz = "right" if dx > 0 else "left"
+                    vert = "down" if dy > 0 else "up"
+                    pri_h = hyperon_priors.get(_DIR_TO_ACTION.get(horiz, ""), 0.0)
+                    pri_v = hyperon_priors.get(_DIR_TO_ACTION.get(vert, ""), 0.0)
+                    direction = horiz if pri_h >= pri_v else vert
                 step = PlanStep(
                     action="move", params={"direction": direction},
                     source="orch_or:stable_goal", preconditions=frozenset(),
@@ -293,13 +315,29 @@ class ObjectiveReduction:
                 return self.decide(context)
             return self._fallback_executive(context)
         self._regenerate_count += 1
+        # Query hyperon action priors to include in plan context.
+        hyperon_priors = {}
+        try:
+            for row in context.hyperon.run_rules("action-priors"):
+                action_name = str(row.get("action_name", "")).upper()
+                if action_name:
+                    hyperon_priors[action_name] = float(row.get("confidence", 0.5))
+        except Exception:
+            pass
         plan_context: dict[str, Any] = {
             "game_step": context.observation.step_index,
             "switch_attempted": self._switch_attempted,
             "non_beam_controllers": self._non_beam_controllers.copy(),
             "failed_directions": self._failed_directions.copy(),
             "stable_goal": self._stable_goal,
+            "action_priors": hyperon_priors,
         }
+        try:
+            gh = context.hyperon.run_rules("goal-hints")
+            if gh:
+                plan_context["goal_hints"] = gh
+        except Exception:
+            pass
         _update_beam_context(game_model, self._previous_model, self._get_working_memory(context), plan_context)
         result_plan = generate_plan(game_model, context=plan_context)
         if result_plan is not None:
@@ -386,10 +424,18 @@ class ObjectiveReduction:
     def _fallback_executive(self, context: ExecutiveContext) -> ActionDecision:
         logger.debug("falling back to base executive")
         parallel = bool(getattr(self._config, "planner_parallel", False))
+        decision: ActionDecision
         if parallel:
             timeout = float(getattr(self._config, "planner_parallel_timeout", 2.0) or 2.0)
-            return self._fallback_executive_parallel(context, timeout)
-        return self._executive.decide(context)
+            decision = self._fallback_executive_parallel(context, timeout)
+        else:
+            decision = self._executive.decide(context)
+        # Feed the executive's proposals back to hyperon.
+        try:
+            context.hyperon.update_proposals(decision.proposals)
+        except Exception:
+            pass
+        return decision
 
     def _fallback_executive_parallel(self, context: ExecutiveContext, timeout: float = 2.0) -> ActionDecision:
         try:
