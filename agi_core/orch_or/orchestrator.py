@@ -108,6 +108,12 @@ class ObjectiveReduction:
         # --- Hyperon integration: query rules for decision support ---
         hyperon_priors: dict[str, float] = {}
         subgoal_from_hints: str | None = None
+        # Query beam strategy hints (game/level-specific direction bias).
+        beam_strategy: list[dict[str, Any]] = []
+        try:
+            beam_strategy = context.hyperon.run_rules("beam-strategy") or []
+        except Exception:
+            pass
         try:
             # Check for reset-needed
             for row in context.hyperon.run_rules("reset-needed"):
@@ -155,6 +161,7 @@ class ObjectiveReduction:
             "failed_directions": self._failed_directions.copy(),
             "stable_goal": self._stable_goal,
             "action_priors": hyperon_priors,
+            "beam_strategy": beam_strategy,
         }
         if subgoal_from_hints:
             plan_context["goal_hints"] = goal_hints
@@ -414,6 +421,14 @@ class ObjectiveReduction:
                 hyperon_conf = self._hyperon_priors.get(action_name, 0.5)
                 if hyperon_conf < 0.2:
                     step.retry_count = max(step.retry_count, step.tolerance - 1)
+            # Also check hyperon's game-stagnation signal.
+            try:
+                for row in context.hyperon.run_rules("game-stagnation"):
+                    if row.get("flag") == "stagnation":
+                        step.retry_count = max(step.retry_count, step.tolerance - 1)
+                        break
+            except Exception:
+                pass
         elif status == "switch_entity" and self._active_plan is not None:
             # Query hyperon to see if it recommends switching.
             hyperon_recommends_switch = False

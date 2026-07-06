@@ -248,6 +248,60 @@ class HyperonBridgeTests(unittest.TestCase):
         # unknown threshold is 3, so 2 steps should NOT trigger stagnation
         self.assertEqual(len(result), 0)
 
+    def test_game_reset_needed_ar25_game_over(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="GAME_OVER", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION5", "RESET"],
+            derived_features={"frame_signature": "sig-grn-ar25"},
+        )
+        observation.game_id = "ar25"
+        bridge.sync(observation, EpisodicMemory(), [])
+        result = bridge.run_rules("game-reset-needed")
+        self.assertTrue(len(result) >= 1)
+        self.assertEqual(result[0].get("action_name"), "RESET")
+
+    def test_game_reset_needed_ar25_active_no_reset(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION5", "RESET"],
+            derived_features={"frame_signature": "sig-grn-ar25-active"},
+        )
+        observation.game_id = "ar25"
+        bridge.sync(observation, EpisodicMemory(), [])
+        result = bridge.run_rules("game-reset-needed")
+        self.assertEqual(len(result), 0)
+
+    def test_beam_strategy_ar25_level_1(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-bs-ar25-l1"},
+        )
+        observation.game_id = "ar25"
+        bridge.sync(observation, EpisodicMemory(), [])
+        # levels_completed=0 means level 1.
+        bridge.facts.setdefault("episode", {})["levels_completed"] = 0
+        result = bridge.run_rules("beam-strategy")
+        self.assertTrue(len(result) >= 1)
+        self.assertEqual(result[0].get("direction"), "down")
+
+    def test_beam_strategy_ar25_level_2(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
+            derived_features={"frame_signature": "sig-bs-ar25-l2"},
+        )
+        observation.game_id = "ar25"
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["levels_completed"] = 1
+        result = bridge.run_rules("beam-strategy")
+        self.assertTrue(len(result) >= 1)
+        self.assertEqual(result[0].get("direction"), "right")
+
     def test_sync_records_live_board_summary_without_persisting_board(self) -> None:
         bridge = HyperonBridge(enabled=False)
         memory = EpisodicMemory()

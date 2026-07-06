@@ -427,6 +427,36 @@ class HyperonBridge:
                 return [{"flag": "stagnation", "confidence": 0.74,
                          "reason": f"board-stagnation:{board_type}"}]
             return []
+        if query_name == "game-reset-needed":
+            game_id = str(episode.get("game_id", "") or "")
+            state = str(episode.get("game_state", "") or "")
+            game_id_aliases = {"ar25": "ar25"}
+            # Override reset behavior for specific games.
+            _GAME_RESET_NEEDED: dict[str, set[str]] = {
+                "ar25": {"GAME_OVER", "NOT_PLAYED"},
+            }
+            canonical = game_id_aliases.get(game_id, game_id)
+            if canonical in _GAME_RESET_NEEDED:
+                if state in _GAME_RESET_NEEDED[canonical]:
+                    return [{"action_name": "RESET", "confidence": 0.99,
+                             "reason": f"game-reset:{game_id}:{state}"}]
+                return []
+            # Fall back to standard reset-needed logic.
+            return self._run_shadow_rules("reset-needed")
+        if query_name == "beam-strategy":
+            game_id = str(episode.get("game_id", "") or "")
+            level = int(episode.get("levels_completed", 0) or 0) + 1
+            # AR25 per-level beam direction preferences.
+            _BEAM_STRATEGY: dict[str, dict[int, list[tuple[str, float]]]] = {
+                "ar25": {
+                    1: [("down", 0.75), ("right", 0.65)],
+                    2: [("right", 0.60), ("down", 0.55)],
+                },
+            }
+            game_levels = _BEAM_STRATEGY.get(game_id, {})
+            if level in game_levels:
+                return [{"direction": d, "confidence": c} for d, c in game_levels[level]]
+            return []
         return []
 
     def _working_memory_goal_hint(
