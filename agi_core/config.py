@@ -63,6 +63,12 @@ class RuntimeConfig:
             "llm": 0.05,
         }
     )
+    planner_enabled: bool = True
+    planner_max_actions: int = 80
+    planner_explore_probes: int = 3
+    planner_parallel: bool = False
+    planner_workers: int = 4
+    planner_parallel_timeout: float | None = None
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "RuntimeConfig":
@@ -161,6 +167,18 @@ class RuntimeConfig:
             ).upper(),
             reset_state_names=reset_state_names,
             win_state_name=win_state_name,
+            planner_enabled=env.get("AGI_PLANNER_ENABLE", "1").strip().lower()
+            in {"1", "true", "yes", "on"},
+            planner_max_actions=int(env.get("AGI_PLANNER_MAX_ACTIONS", "80")),
+            planner_explore_probes=int(env.get("AGI_PLANNER_EXPLORE_PROBES", "3")),
+            planner_parallel=env.get("AGI_PLANNER_PARALLEL", "0").strip().lower()
+            in {"1", "true", "yes", "on"},
+            planner_workers=int(env.get("AGI_PLANNER_WORKERS", "4")),
+            planner_parallel_timeout=(
+                float(env.get("AGI_PLANNER_PARALLEL_TIMEOUT", ""))
+                if env.get("AGI_PLANNER_PARALLEL_TIMEOUT", "").strip()
+                else None
+            ),
         )
 
     def effective_model_path(self) -> Path:

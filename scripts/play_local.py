@@ -96,7 +96,10 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    log_level = logging.DEBUG if os.environ.get("AGI_DEBUG_DECISIONS", "0").strip().lower() in {"1", "true", "yes", "on"} else logging.INFO
+    logging.basicConfig(level=log_level, format="%(levelname)s:%(name)s:%(message)s")
+    if log_level == logging.DEBUG:
+        logging.getLogger("agi_core.orch_or").setLevel(logging.DEBUG)
     _configure_local_runner_env(args.llm_provider)
     print(f"Using llm provider: {args.llm_provider}")
 

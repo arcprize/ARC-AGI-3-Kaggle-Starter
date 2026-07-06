@@ -34,7 +34,9 @@ tmp*/
 .idea/
 .vscode/
 /third_party
-/.tmp
+/.tmp*
 /.pip-cache/http-v2
 /.vs
 /models
+/memory.sqlite3
+/memory.sqlite3-journal
