@@ -392,8 +392,21 @@ class ObjectiveReduction:
             if step.params and "direction" in step.params:
                 self._pending_failed_dir = step.params["direction"]
         elif status == "switch_entity" and self._active_plan is not None:
-            if self._switch_attempted:
-                # Already switched once and still stuck — record failed dir and fall back
+            # Query hyperon to see if it recommends switching.
+            hyperon_recommends_switch = False
+            try:
+                for row in context.hyperon.run_rules("action-priors"):
+                    if str(row.get("action_name", "")).upper() == "ACTION5":
+                        confidence = float(row.get("confidence", 0.0))
+                        if confidence > 0.3:
+                            hyperon_recommends_switch = True
+                        break
+            except Exception:
+                pass
+            if self._switch_attempted and not hyperon_recommends_switch:
+                # Already switched once and still stuck, and hyperon doesn't
+                # strongly recommend another switch — record failed dir and
+                # fall back.
                 if self._pending_failed_dir is not None:
                     self._failed_directions.add(self._pending_failed_dir)
                     self._pending_failed_dir = None
