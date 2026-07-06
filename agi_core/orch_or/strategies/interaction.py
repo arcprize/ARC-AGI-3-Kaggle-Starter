@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from agi_core.orch_or.game_model import PlanStep
 
 if TYPE_CHECKING:
-    from agi_core.orch_or.game_model import GameModel
+    from agi_core.orch_or.game_model import Component, GameModel
 
 
 def interaction_strategy(game_model: GameModel, context: dict | None = None) -> list[PlanStep]:
@@ -30,7 +30,7 @@ def interaction_strategy(game_model: GameModel, context: dict | None = None) -> 
     return steps
 
 
-def _find_player_component(gm: GameModel) -> object | None:
+def _find_player_component(gm: GameModel) -> Component | None:
     px, py = gm.player_pos
     if px is None or py is None:
         return None

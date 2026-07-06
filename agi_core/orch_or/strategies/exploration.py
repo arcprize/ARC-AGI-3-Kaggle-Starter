@@ -32,14 +32,12 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                 candidates.append("up")
             elif gy > py:
                 candidates.append("down")
-            # Reorder by hyperon action priors, then skip failed directions.
+            # Reorder by hyperon action priors, then filter failed directions.
             priors = ctx.get("action_priors", {})
             candidates = _bias_candidates_by_priors(candidates, priors)
             failed = ctx.get("failed_directions", set())
-            candidates = [d for d in candidates if d not in failed] + [d for d in candidates if d in failed]
+            candidates = [d for d in candidates if d not in failed]
             for d in candidates:
-                if d in failed:
-                    continue
                 dvx, dvy = _direction_vec(d)
                 nx, ny = px + dvx, py + dvy
                 if not game_model.walkable or (nx, ny) in game_model.walkable:
@@ -172,23 +170,6 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                         steps.append(_explore_step(d))
                         return steps
     return steps
-
-
-def _player_controls_beam(game_model: GameModel) -> bool:
-    player = game_model.player_pos
-    if player is None:
-        return False
-    all_beam_cells = _get_beam_cells(game_model)
-    if not all_beam_cells:
-        return False
-    px, py = player
-    nearest = min(all_beam_cells, key=lambda c: abs(c[0] - px) + abs(c[1] - py))
-    bx, by = nearest
-    # Beam-controlling entities sit on the same row as the beam.
-    # Non-controlling sprites are separated by a clear vertical gap.
-    if abs(py - by) > 6:
-        return False
-    return abs(px - bx) + abs(py - by) <= 24
 
 
 def _perpendicular(d: str) -> list[str]:

@@ -28,17 +28,16 @@ def reduce(
     if root is None:
         root = _root_obj()
     features = game_model.features
-    # Apply hyperon goal hints to adjust sub-objective priorities.
-    if goal_hints:
-        for hint in goal_hints:
-            hinted_subgoal = str(hint.get("subgoal", "") or "")
-            hint_conf = float(hint.get("confidence", 0.0))
-            if hinted_subgoal == "re-enter-level":
-                _root_obj().priority = 0.99  # slight nudge
-            elif hinted_subgoal == "clear-obstacles" and hint_conf > 0.5:
-                _clear_obstacles().priority = 0.92
-
     if features.player_detectable and features.goal_detectable:
+        # Apply hyperon goal hints to adjust sub-objective priorities.
+        _hint_boost_clear: float = 0.0
+        if goal_hints:
+            for hint in goal_hints:
+                hinted_subgoal = str(hint.get("subgoal", "") or "")
+                hint_conf = float(hint.get("confidence", 0.0))
+                if hinted_subgoal == "clear-obstacles" and hint_conf > 0.5:
+                    _hint_boost_clear = 0.07
+
         if features.has_beam:
             # Beam exists - use explore-board for beam navigation
             # Exception: platformer with direct path can just navigate
@@ -64,15 +63,12 @@ def reduce(
             reach.sub_objectives = [nav]
             root.sub_objectives = [reach]
             return root
-            reach = _reach_goal()
-            nav = _navigate()
-            reach.sub_objectives = [nav]
-            root.sub_objectives = [reach]
-            return root
         has_interactive = any(otype == "interactive" for _, _, otype in game_model.obstacles)
         if has_interactive:
             reach = _reach_goal()
-            reach.sub_objectives = [_clear_obstacles()]
+            clear_obj = _clear_obstacles()
+            clear_obj.priority = min(clear_obj.priority + _hint_boost_clear, 0.95)
+            reach.sub_objectives = [clear_obj]
             root.sub_objectives = [reach]
             return root
         # No beam, no path, no interactive: fallback to navigate

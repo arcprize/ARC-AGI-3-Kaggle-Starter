@@ -25,9 +25,9 @@ def astar(
             return None
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             neighbor = (current[0] + dx, current[1] + dy)
-            if neighbor not in passable:
-                continue
             if neighbor[0] < 0 or neighbor[0] >= width or neighbor[1] < 0 or neighbor[1] >= height:
+                continue
+            if neighbor not in passable:
                 continue
             tentative = g_score[current] + 1
             if neighbor not in g_score or tentative < g_score[neighbor]:

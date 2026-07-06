@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+
 from typing import TYPE_CHECKING
 
 from agi_core.orch_or.game_model import PlanStep
 
 if TYPE_CHECKING:
     from agi_core.orch_or.game_model import GameModel
+
+logger = logging.getLogger(__name__)
 
 
 def puzzle_strategy(game_model: GameModel, context: dict | None = None) -> list[PlanStep]:
@@ -14,23 +18,14 @@ def puzzle_strategy(game_model: GameModel, context: dict | None = None) -> list[
     player = game_model.player_pos
     if player is None:
         return steps
-    # Puzzle strategy is a fallback when the primary strategy returned no steps.
-    # Try switching the controllable entity first (ACTION5), but only once per
-    # stuck episode so we don't oscillate between sprites.
     already_switched = bool(context.get("switch_attempted", False))
-    import logging
-    logger = logging.getLogger(__name__)
     logger.debug("puzzle_strategy: already_switched=%s player=%s player_color=%s", already_switched, player, game_model.features.player_color)
-    # The puzzle strategy lets the primary strategy (exploration / beam nav)
-    # drive the current entity.  We only intervene when the entity is stuck
-    # and needs to switch.
     if already_switched:
         return steps
-    player_comp = _find_player_component(game_model)
     interactive = [(ox, oy) for ox, oy, otype in game_model.obstacles if otype == "interactive"]
     # Skip click on interactive obstacles when a beam is present — the
     # exploration strategy's beam navigation should drive instead.
-    if not steps and interactive and not game_model.features.has_beam:
+    if interactive and not game_model.features.has_beam:
         px, py = player
         interactive.sort(key=lambda p: abs(p[0] - px) + abs(p[1] - py))
         tx, ty = interactive[0]

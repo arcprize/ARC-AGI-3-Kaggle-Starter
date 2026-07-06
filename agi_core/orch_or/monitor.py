@@ -52,9 +52,10 @@ def _plan_has_switch(plan: Plan) -> bool:
 
 
 def _player_on_color_0(gm: GameModel) -> bool:
-    px, py = gm.player_pos
-    if px is None or py is None:
+    pos = gm.player_pos
+    if pos is None:
         return False
+    px, py = pos
     for c in gm.components:
         min_x, min_y, max_x, max_y = c.bbox
         if min_x <= px <= max_x and min_y <= py <= max_y:

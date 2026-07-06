@@ -26,6 +26,8 @@ from agi_core.executive import Executive, ExecutiveRuntime
 from agi_core.knowledge.hyperon_bridge import HyperonBridge
 from agi_core.llm import build_llm_backend
 from agi_core.memory import EpisodicMemory
+from agi_core.orch_or import ObjectiveReduction
+from agi_core.orch_or.parallel import ThreadPoolManager
 from agi_core.specialists.critic import ProposalCritic
 from agi_core.specialists.llm import LLMSpecialist
 from agi_core.specialists.reactive import ReactiveSpecialist
@@ -70,12 +72,19 @@ class MyAgent(Agent):
             probe_timeout_seconds=config.hyperon_probe_timeout_seconds,
         )
         llm_backend = build_llm_backend(config)
-        executive = Executive(
+        if config.planner_enabled and config.planner_parallel:
+            ThreadPoolManager.set_max_workers(config.planner_workers)
+        base_executive = Executive(
             config=config,
             reactive=ReactiveSpecialist(),
             symbolic=SymbolicSpecialist(),
             llm=LLMSpecialist(),
             critic=ProposalCritic(),
+        )
+        executive = (
+            ObjectiveReduction(executive=base_executive, config=config)
+            if config.planner_enabled
+            else base_executive
         )
         self.runtime = ExecutiveRuntime(
             adapter=adapter,

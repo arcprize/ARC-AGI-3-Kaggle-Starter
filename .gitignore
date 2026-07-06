@@ -10,7 +10,7 @@ __pycache__/
 vendor/
 environment_files/
 recordings/
-logs.log
+*.log
 
 # Generated artefacts
 notebooks/submission.ipynb
@@ -25,8 +25,6 @@ third_party/hyperon/*.whl
 third_party/wheels/*.whl
 arc_agi_3_public_demo_human_testing.zip
 # Local test scratch space
-tmp_test_build_notebook_*/
-tmp_test_build_notebook/
 tmp*/
 
 # OS / editors
@@ -38,5 +36,5 @@ tmp*/
 /.pip-cache/http-v2
 /.vs
 /models
-/memory.sqlite3
-/memory.sqlite3-journal
+/*.sqlite3
+/*.sqlite3-journal

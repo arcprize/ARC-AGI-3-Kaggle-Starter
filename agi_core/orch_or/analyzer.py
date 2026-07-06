@@ -50,6 +50,10 @@ def _detect_background_color(board: list[list[int]], width: int, height: int) ->
 
 
 
+_GOAL_COLOR_CANDIDATES: set[int] = {11}
+_PLATFORMER_COMPONENT_THRESHOLD: int = 5
+
+
 def _find_components(
     board: list[list[int]], width: int, height: int, bg_color: int,
 ) -> list[Component]:
@@ -82,10 +86,7 @@ def _find_components(
                             visited.add((nx, ny))
                             queue.append((nx, ny))
             touches_border = (min_x == 0 or min_y == 0 or max_x == width - 1 or max_y == height - 1)
-            color_counts: dict[int, int] = {}
-            for cx, cy in cells:
-                color_counts[board[cy][cx]] = color_counts.get(board[cy][cx], 0) + 1
-            dominant_color = max(color_counts, key=color_counts.get) if color_counts else -1
+            dominant_color = val
             components.append(Component(
                 cells=cells,
                 bbox=(min_x, min_y, max_x, max_y),
@@ -252,7 +253,7 @@ def _find_goals(
     scored.sort(key=lambda x: -x[0])
     n_goals = max(1, min(len(scored) // 2, 3))
     primary_goals = [_component_center(c) for _, c in scored[:n_goals]]
-    goal_color_candidates = {11}
+    goal_color_candidates = _GOAL_COLOR_CANDIDATES
     goal_colored_in_top = [c for _, c in scored[:n_goals] if c.dominant_color in goal_color_candidates]
     if goal_colored_in_top:
         primary_goals = [_component_center(c) for c in goal_colored_in_top]
@@ -260,7 +261,6 @@ def _find_goals(
         h, w = len(board), len(board[0])
         bg = _detect_background_color(board, w, h)
         simple_walk = {(x, y) for y in range(h) for x in range(w) if board[y][x] == bg}
-        from agi_core.orch_or.search import astar
         px, py = player_pos
         reachable = []
         for gx, gy in primary_goals:
@@ -300,7 +300,6 @@ def _find_obstacles(
     obstacles: list[tuple[int, int, str]] = []
     player_comps = set()
     if player_pos is not None:
-        px, py = player_pos
         for c in components:
             if _in_bbox(player_pos, c.bbox) and not c.touches_border:
                 player_comps.add(id(c))

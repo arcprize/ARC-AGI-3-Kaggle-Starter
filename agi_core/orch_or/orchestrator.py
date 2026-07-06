@@ -33,6 +33,7 @@ _BEAM_COVERAGE_KEY = "orch_or_beam_coverage"
 _BEAM_DIR_KEY = "orch_or_beam_best_direction"
 _BEAM_PROX_KEY = "orch_or_beam_proximity"
 _BEAM_COLOR_KEY = "orch_or_beam_controller_color"
+_LEVEL_JUMP_THRESHOLD = 35
 
 
 class ObjectiveReduction:
@@ -74,7 +75,7 @@ class ObjectiveReduction:
         if self._previous_model is not None and self._previous_model.player_pos is not None and game_model.player_pos is not None:
             prev_p = self._previous_model.player_pos
             curr_p = game_model.player_pos
-            if abs(curr_p[0] - prev_p[0]) + abs(curr_p[1] - prev_p[1]) > 35:
+            if abs(curr_p[0] - prev_p[0]) + abs(curr_p[1] - prev_p[1]) > _LEVEL_JUMP_THRESHOLD:
                 self._non_beam_controllers.clear()
                 self._switch_attempted = False
                 self._failed_directions.clear()
@@ -339,7 +340,9 @@ class ObjectiveReduction:
         except Exception:
             pass
         _update_beam_context(game_model, self._previous_model, self._get_working_memory(context), plan_context)
-        result_plan = generate_plan(game_model, context=plan_context)
+        parallel = bool(getattr(self._config, "planner_parallel", False))
+        p_timeout = getattr(self._config, "planner_parallel_timeout", None)
+        result_plan = generate_plan(game_model, context=plan_context, parallel=parallel, timeout=p_timeout)
         if result_plan is not None:
             if any(s.action == "switch" for s in result_plan.steps):
                 self._switch_attempted = True
@@ -470,7 +473,7 @@ def _update_beam_context(
     wm: dict[str, Any],
     ctx: dict[str, Any],
 ) -> None:
-    if not current.features.has_beam or previous is None or previous.features.has_beam is False:
+    if not current.features.has_beam or previous is None or not previous.features.has_beam:
         wm.pop(_BEAM_COVERAGE_KEY, None)
         wm.pop(_BEAM_DIR_KEY, None)
         wm.pop(_BEAM_PROX_KEY, None)
@@ -503,9 +506,10 @@ def _update_beam_context(
 
 
 def _get_board_data(observation) -> list[list[int]] | None:
+    derived = getattr(observation, "derived_features", {})
     board_grid = [
         [int(p) for p in row]
-        for row in (observation.derived_features.get("board_grid", []))
+        for row in (derived.get("board_grid", []) if derived else [])
     ]
     if board_grid:
         return board_grid
