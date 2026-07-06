@@ -136,5 +136,35 @@
 (= (board-goal-proximity platformer) 3)
 (= (board-goal-proximity unknown) 2)
 
+; Expected controllable entity count per board type.
+; puzzle = multiple entities to switch between; platformer = single.
+(= (board-entity-count puzzle) multiple)
+(= (board-entity-count platformer) single)
+(= (board-entity-count unknown) single)
+
+; Whether gravity affects movement per board type.
+; platformer has gravity pulling down; puzzle has no gravity.
+(= (board-gravity-enabled puzzle) false)
+(= (board-gravity-enabled platformer) true)
+(= (board-gravity-enabled unknown) false)
+
+; Whether the board scrolls horizontally per board type.
+; platformer often scrolls; puzzle typically stays fixed.
+(= (board-horizontal-scroll puzzle) false)
+(= (board-horizontal-scroll platformer) true)
+(= (board-horizontal-scroll unknown) false)
+
+; Collision behavior per board type.
+; solid = hard walls/obstacles; overlap = soft boundaries.
+(= (board-collision-type puzzle) solid)
+(= (board-collision-type platformer) solid)
+(= (board-collision-type unknown) solid)
+
+; How level exit is triggered per board type.
+; position = reach a specific tile; action = perform an action.
+(= (board-exit-type puzzle) action)
+(= (board-exit-type platformer) position)
+(= (board-exit-type unknown) position)
+
 (= (prefer-novel-action stalled) True)
 (= (prefer-successful-pattern repeated-progress) True)

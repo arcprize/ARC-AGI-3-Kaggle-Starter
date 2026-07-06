@@ -120,8 +120,28 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                         _explore_bias = str(board_bias_rows[0].get("axis", _explore_bias))
                 except Exception:
                     pass
-                if _explore_bias == "vertical":
+                # Gravity: when enabled, prefer down (gravity pull).
+                _gravity = "false"
+                try:
+                    grav_rows = ctx.get("board_gravity_enabled", [])
+                    if grav_rows:
+                        _gravity = str(grav_rows[0].get("gravity", "false"))
+                except Exception:
+                    pass
+                # Horizontal scroll: when true, prefer horizontal exploration.
+                _scroll = "false"
+                try:
+                    scroll_rows = ctx.get("board_horizontal_scroll", [])
+                    if scroll_rows:
+                        _scroll = str(scroll_rows[0].get("scroll", "false"))
+                except Exception:
+                    pass
+                if _explore_bias == "vertical" and _scroll != "true":
                     search_dirs = ["down", "up", "right", "left"]
+                elif _gravity == "true":
+                    search_dirs = ["down", "up", "right", "left"]
+                elif _scroll == "true":
+                    search_dirs = ["right", "left", "down", "up"]
                 else:
                     search_dirs = ["right", "left", "down", "up"]
                 search_dirs = _bias_candidates_by_priors(search_dirs, ctx.get("action_priors", {}))
@@ -171,7 +191,15 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                 gx, gy = nearest_goal
             # If already within proximity, return empty so the plan generator
             # falls through to the executive / level completion detection.
-            if abs(gx - px) + abs(gy - py) <= _proximity:
+            # Skip this for boards where exit requires an action (not just position).
+            _exit_type = "position"
+            try:
+                ext_rows = (context or {}).get("board_exit_type", [])
+                if ext_rows:
+                    _exit_type = str(ext_rows[0].get("exit", "position"))
+            except Exception:
+                pass
+            if _exit_type != "action" and abs(gx - px) + abs(gy - py) <= _proximity:
                 return steps
             candidates = []
             if gx < px:

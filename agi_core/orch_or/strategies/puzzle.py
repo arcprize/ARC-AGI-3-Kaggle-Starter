@@ -23,6 +23,13 @@ def puzzle_strategy(game_model: GameModel, context: dict | None = None) -> list[
     if already_switched:
         return steps
     ap = context.get("action_priors", {})
+    # Skip puzzle-specific actions when board has only a single entity.
+    try:
+        ent_rows = context.get("board_entity_count", [])
+        if ent_rows and str(ent_rows[0].get("count", "single")) == "single":
+            return steps
+    except Exception:
+        pass
     interactive = [(ox, oy) for ox, oy, otype in game_model.obstacles if otype == "interactive"]
     # Skip click on interactive obstacles when a beam is present — the
     # exploration strategy's beam navigation should drive instead.

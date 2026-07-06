@@ -126,6 +126,10 @@ class ObjectiveReduction:
             board_path_preference = context.hyperon.run_rules("board-path-preference") or []
             board_retry_tolerance = context.hyperon.run_rules("board-retry-tolerance") or []
             board_goal_proximity = context.hyperon.run_rules("board-goal-proximity") or []
+            board_entity_count = context.hyperon.run_rules("board-entity-count") or []
+            board_gravity_enabled = context.hyperon.run_rules("board-gravity-enabled") or []
+            board_horizontal_scroll = context.hyperon.run_rules("board-horizontal-scroll") or []
+            board_exit_type = context.hyperon.run_rules("board-exit-type") or []
         except Exception:
             pass
         try:
@@ -183,6 +187,10 @@ class ObjectiveReduction:
             "board_path_preference": board_path_preference,
             "board_retry_tolerance": board_retry_tolerance,
             "board_goal_proximity": board_goal_proximity,
+            "board_entity_count": board_entity_count,
+            "board_gravity_enabled": board_gravity_enabled,
+            "board_horizontal_scroll": board_horizontal_scroll,
+            "board_exit_type": board_exit_type,
         }
         if subgoal_from_hints:
             plan_context["goal_hints"] = goal_hints

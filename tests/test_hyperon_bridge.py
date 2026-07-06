@@ -492,6 +492,78 @@ class HyperonBridgeTests(unittest.TestCase):
         result = bridge.run_rules("board-beam-priority")
         self.assertEqual(result[0].get("priority"), "low")
 
+    def test_board_entity_count_puzzle_multiple(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION5"], derived_features={"frame_signature": "sig-bec-puzzle"})
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        result = bridge.run_rules("board-entity-count")
+        self.assertEqual(result[0].get("count"), "multiple")
+
+    def test_board_entity_count_platformer_single(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION5"], derived_features={"frame_signature": "sig-bec-platformer"})
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "platformer"
+        result = bridge.run_rules("board-entity-count")
+        self.assertEqual(result[0].get("count"), "single")
+
+    def test_board_gravity_enabled_platformer_true(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"], derived_features={"frame_signature": "sig-bge-platformer"})
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "platformer"
+        result = bridge.run_rules("board-gravity-enabled")
+        self.assertEqual(result[0].get("gravity"), "true")
+
+    def test_board_gravity_enabled_puzzle_false(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"], derived_features={"frame_signature": "sig-bge-puzzle"})
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        result = bridge.run_rules("board-gravity-enabled")
+        self.assertEqual(result[0].get("gravity"), "false")
+
+    def test_board_horizontal_scroll_platformer_true(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"], derived_features={"frame_signature": "sig-bhs-platformer"})
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "platformer"
+        result = bridge.run_rules("board-horizontal-scroll")
+        self.assertEqual(result[0].get("scroll"), "true")
+
+    def test_board_horizontal_scroll_puzzle_false(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"], derived_features={"frame_signature": "sig-bhs-puzzle"})
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        result = bridge.run_rules("board-horizontal-scroll")
+        self.assertEqual(result[0].get("scroll"), "false")
+
+    def test_board_exit_type_puzzle_action(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION5"], derived_features={"frame_signature": "sig-bet-puzzle"})
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        result = bridge.run_rules("board-exit-type")
+        self.assertEqual(result[0].get("exit"), "action")
+
+    def test_board_exit_type_platformer_position(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION5"], derived_features={"frame_signature": "sig-bet-platformer"})
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "platformer"
+        result = bridge.run_rules("board-exit-type")
+        self.assertEqual(result[0].get("exit"), "position")
+
     def test_sync_records_live_board_summary_without_persisting_board(self) -> None:
         bridge = HyperonBridge(enabled=False)
         memory = EpisodicMemory()

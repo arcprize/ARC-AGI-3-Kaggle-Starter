@@ -493,6 +493,26 @@ class HyperonBridge:
             board_type = str(episode.get("board_type", "") or "unknown")
             _BOARD_PROX: dict[str, int] = {"puzzle": 1, "platformer": 3, "unknown": 2}
             return [{"proximity": _BOARD_PROX.get(board_type, 2), "board_type": board_type}]
+        if query_name == "board-entity-count":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_ENT: dict[str, str] = {"puzzle": "multiple", "platformer": "single", "unknown": "single"}
+            return [{"count": _BOARD_ENT.get(board_type, "single"), "board_type": board_type}]
+        if query_name == "board-gravity-enabled":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_GRV: dict[str, str] = {"puzzle": "false", "platformer": "true", "unknown": "false"}
+            return [{"gravity": _BOARD_GRV.get(board_type, "false"), "board_type": board_type}]
+        if query_name == "board-horizontal-scroll":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_SCR: dict[str, str] = {"puzzle": "false", "platformer": "true", "unknown": "false"}
+            return [{"scroll": _BOARD_SCR.get(board_type, "false"), "board_type": board_type}]
+        if query_name == "board-collision-type":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_COL: dict[str, str] = {"puzzle": "solid", "platformer": "solid", "unknown": "solid"}
+            return [{"collision": _BOARD_COL.get(board_type, "solid"), "board_type": board_type}]
+        if query_name == "board-exit-type":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_EXT: dict[str, str] = {"puzzle": "action", "platformer": "position", "unknown": "position"}
+            return [{"exit": _BOARD_EXT.get(board_type, "position"), "board_type": board_type}]
         return []
 
     def _working_memory_goal_hint(
