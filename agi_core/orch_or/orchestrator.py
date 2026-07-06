@@ -63,6 +63,12 @@ class ObjectiveReduction:
             logger.debug("no board data, falling back to executive")
             return self._fallback_executive(context)
         game_model = build_game_model(board_data)
+        # Feed board_type into hyperon facts so game-action-priors can use it.
+        try:
+            if hasattr(context.hyperon, "facts"):
+                context.hyperon.facts.setdefault("episode", {})["board_type"] = game_model.features.board_type
+        except Exception:
+            pass
         logger.debug(
             "game_model: player=%s goals=%s features=pd:%s gd:%s ptg:%s bt:%s",
             game_model.player_pos, game_model.goal_positions,
@@ -127,16 +133,16 @@ class ObjectiveReduction:
                 logger.debug("hyperon goal-hints: %s", goal_hints)
                 subgoal_from_hints = goal_hints[0].get("subgoal")
             # Query action priors for current subgoal
-            prior_query = "action-priors"
+            prior_query = "game-action-priors"
             if subgoal_from_hints:
-                prior_query = f"action-priors:{subgoal_from_hints}"
+                prior_query = f"game-action-priors:{subgoal_from_hints}"
             for row in context.hyperon.run_rules(prior_query):
                 action_name = str(row.get("action_name", "")).upper()
                 if not action_name:
                     continue
                 hyperon_priors[action_name] = float(row.get("confidence", 0.5))
             if hyperon_priors:
-                logger.debug("hyperon action-priors: %s", hyperon_priors)
+                logger.debug("hyperon game-action-priors: %s", hyperon_priors)
         except Exception:
             logger.debug("hyperon rules query failed (disabled?)", exc_info=True)
         self._hyperon_priors = hyperon_priors
@@ -282,10 +288,10 @@ class ObjectiveReduction:
             wm = self._get_working_memory(context)
             wm.pop(_SWITCH_KEY, None)
             wm.pop(_SWITCH_POS_KEY, None)
-            # Query hyperon for action priors to guide the fallback direction.
+            # Query hyperon for game-aware action priors to guide the fallback direction.
             hyperon_priors: dict[str, float] = {}
             try:
-                for row in context.hyperon.run_rules("action-priors"):
+                for row in context.hyperon.run_rules("game-action-priors"):
                     action_name = str(row.get("action_name", "")).upper()
                     if action_name:
                         hyperon_priors[action_name] = float(row.get("confidence", 0.5))
@@ -325,7 +331,7 @@ class ObjectiveReduction:
         # Query hyperon action priors to include in plan context.
         hyperon_priors = {}
         try:
-            for row in context.hyperon.run_rules("action-priors"):
+            for row in context.hyperon.run_rules("game-action-priors"):
                 action_name = str(row.get("action_name", "")).upper()
                 if action_name:
                     hyperon_priors[action_name] = float(row.get("confidence", 0.5))
@@ -412,7 +418,7 @@ class ObjectiveReduction:
             # Query hyperon to see if it recommends switching.
             hyperon_recommends_switch = False
             try:
-                for row in context.hyperon.run_rules("action-priors"):
+                for row in context.hyperon.run_rules("game-action-priors"):
                     if str(row.get("action_name", "")).upper() == "ACTION5":
                         confidence = float(row.get("confidence", 0.0))
                         if confidence > 0.3:

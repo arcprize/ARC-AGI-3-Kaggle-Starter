@@ -24,5 +24,28 @@
 (= (symbolic-prior ACTION5) 0.56)
 (= (symbolic-prior ACTION6) 0.52)
 
+; Game-specific action-prior overrides.
+(= (game-prior ar25 ACTION1) 0.55)
+(= (game-prior ar25 ACTION2) 0.78)
+(= (game-prior ar25 ACTION3) 0.60)
+(= (game-prior ar25 ACTION4) 0.72)
+(= (game-prior ar25 ACTION5) 0.45)
+(= (game-prior ar25 ACTION6) 0.30)
+
+; Board-type-specific action-prior overrides.
+(= (board-prior puzzle ACTION1) 0.30)
+(= (board-prior puzzle ACTION2) 0.35)
+(= (board-prior puzzle ACTION3) 0.30)
+(= (board-prior puzzle ACTION4) 0.30)
+(= (board-prior puzzle ACTION5) 0.80)
+(= (board-prior puzzle ACTION6) 0.70)
+
+(= (board-prior platformer ACTION1) 0.60)
+(= (board-prior platformer ACTION2) 0.65)
+(= (board-prior platformer ACTION3) 0.60)
+(= (board-prior platformer ACTION4) 0.65)
+(= (board-prior platformer ACTION5) 0.40)
+(= (board-prior platformer ACTION6) 0.35)
+
 (= (prefer-novel-action stalled) True)
 (= (prefer-successful-pattern repeated-progress) True)

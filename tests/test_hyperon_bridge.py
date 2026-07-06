@@ -1360,6 +1360,45 @@ class HyperonBridgeTests(unittest.TestCase):
 
         self.assertEqual(priors[0]["action_name"], "ACTION2")
 
+    def test_game_action_priors_ar25_overrides_defaults(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"],
+            derived_features={"frame_signature": "sig-ar25"},
+        )
+        observation.game_id = "ar25"
+        bridge.sync(observation, EpisodicMemory(), [])
+        # Manually set board_type to unknown so game priors dominate.
+        bridge.facts.setdefault("episode", {})["board_type"] = "unknown"
+        priors = bridge.run_rules("game-action-priors")
+        prior_map = {p["action_name"]: p["confidence"] for p in priors}
+        self.assertAlmostEqual(prior_map.get("ACTION2", 0), 0.78, places=2)
+        self.assertAlmostEqual(prior_map.get("ACTION4", 0), 0.72, places=2)
+        self.assertAlmostEqual(prior_map.get("ACTION5", 0), 0.45, places=2)
+        self.assertAlmostEqual(prior_map.get("ACTION6", 0), 0.30, places=2)
+        # Verify reasons mention game-prior.
+        action2_row = next(p for p in priors if p["action_name"] == "ACTION2")
+        self.assertIn("game-prior:ar25", action2_row.get("reason", ""))
+
+    def test_game_action_priors_board_type_puzzle(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"],
+            derived_features={"frame_signature": "sig-puzzle"},
+        )
+        bridge.sync(observation, EpisodicMemory(), [])
+        # Manually set board_type to puzzle.
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        priors = bridge.run_rules("game-action-priors")
+        prior_map = {p["action_name"]: p["confidence"] for p in priors}
+        self.assertAlmostEqual(prior_map.get("ACTION5", 0), 0.80, places=2)
+        self.assertAlmostEqual(prior_map.get("ACTION6", 0), 0.70, places=2)
+        self.assertAlmostEqual(prior_map.get("ACTION1", 0), 0.30, places=2)
+        action5_row = next(p for p in priors if p["action_name"] == "ACTION5")
+        self.assertIn("board-prior:puzzle", action5_row.get("reason", ""))
+
     def test_sync_promotes_runtime_working_memory_focus_into_recommended_actions(self) -> None:
         class RuntimeFocusMemory(EpisodicMemory):
             def working_memory_snapshot(self):

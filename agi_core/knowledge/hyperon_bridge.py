@@ -371,6 +371,37 @@ class HyperonBridge:
                 {"action_name": action_name, "penalty": value}
                 for action_name, value in failure_streaks.items()
             ]
+        if query_name == "game-action-priors":
+            game_id = str(episode.get("game_id", "") or "")
+            board_type = str(episode.get("board_type", "") or "")
+            base = self._action_priors(
+                legal_actions, memory,
+                learned=self.facts.get("learned", {}),
+                current_state=str(episode.get("game_state", "")),
+                current_subgoal=query_arg,
+                current_frame_signature=str(episode.get("frame_signature", "") or ""),
+            )
+            # Override with game-specific priors.
+            _GAME_PRIORS: dict[str, dict[str, float]] = {
+                "ar25": {"ACTION1": 0.55, "ACTION2": 0.78, "ACTION3": 0.60,
+                         "ACTION4": 0.72, "ACTION5": 0.45, "ACTION6": 0.30},
+            }
+            if game_id in _GAME_PRIORS:
+                for action, conf in _GAME_PRIORS[game_id].items():
+                    base = [p for p in base if p.get("action_name") != action]
+                    base.append({"action_name": action, "confidence": conf, "reason": f"game-prior:{game_id}"})
+            # Override with board-type-specific priors.
+            _BOARD_PRIORS: dict[str, dict[str, float]] = {
+                "puzzle": {"ACTION1": 0.30, "ACTION2": 0.35, "ACTION3": 0.30,
+                           "ACTION4": 0.30, "ACTION5": 0.80, "ACTION6": 0.70},
+                "platformer": {"ACTION1": 0.60, "ACTION2": 0.65, "ACTION3": 0.60,
+                               "ACTION4": 0.65, "ACTION5": 0.40, "ACTION6": 0.35},
+            }
+            if board_type in _BOARD_PRIORS:
+                for action, conf in _BOARD_PRIORS[board_type].items():
+                    base = [p for p in base if p.get("action_name") != action]
+                    base.append({"action_name": action, "confidence": conf, "reason": f"board-prior:{board_type}"})
+            return base
         return []
 
     def _working_memory_goal_hint(
@@ -2502,6 +2533,9 @@ class HyperonBridge:
         episode = self.facts.get("episode", {})
         memory = self.facts.get("memory", {})
         lines.append(f"(episode-game {self._symbol(episode.get('game_id'))})")
+        board_type = episode.get("board_type", "unknown")
+        if board_type:
+            lines.append(f"(board-type {self._symbol(board_type)})")
         lines.append(f"(episode-step {int(episode.get('step_index', 0) or 0)})")
         lines.append(f"(episode-state {self._symbol(episode.get('game_state'))})")
         lines.append(
