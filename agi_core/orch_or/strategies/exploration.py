@@ -128,6 +128,14 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                         _gravity = str(grav_rows[0].get("gravity", "false"))
                 except Exception:
                     pass
+                # Nav style: "grid" prefers exact cardinal steps.
+                _nav_style = "free"
+                try:
+                    nav_rows = ctx.get("board_nav_style", [])
+                    if nav_rows:
+                        _nav_style = str(nav_rows[0].get("style", "free"))
+                except Exception:
+                    pass
                 # Horizontal scroll: when true, prefer horizontal exploration.
                 _scroll = "false"
                 try:
@@ -228,6 +236,14 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
             else:
                 steps.append(_explore_step("left"))
             return steps
+        # Viewport style: "follow" means we should explore toward unseen areas.
+        try:
+            view_rows = (context or {}).get("board_viewport_style", [])
+            if view_rows and str(view_rows[0].get("style", "fixed")) == "follow":
+                if not steps and game_model.player_pos is not None and game_model.goal_positions:
+                    pass  # Use A* to pathfind (handled by other strategies)
+        except Exception:
+            pass
         # Search order fallback for puzzle boards with goal detectable
         if features.board_type == "puzzle":
             _explore_bias = "vertical"

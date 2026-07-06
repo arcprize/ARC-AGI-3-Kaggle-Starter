@@ -23,10 +23,13 @@ def puzzle_strategy(game_model: GameModel, context: dict | None = None) -> list[
     if already_switched:
         return steps
     ap = context.get("action_priors", {})
-    # Skip puzzle-specific actions when board has only a single entity.
+    # Skip puzzle-specific actions when board has single-entity focus.
     try:
         ent_rows = context.get("board_entity_count", [])
+        focus_rows = context.get("board_focus_mode", [])
         if ent_rows and str(ent_rows[0].get("count", "single")) == "single":
+            return steps
+        if focus_rows and str(focus_rows[0].get("mode", "single")) == "single":
             return steps
     except Exception:
         pass

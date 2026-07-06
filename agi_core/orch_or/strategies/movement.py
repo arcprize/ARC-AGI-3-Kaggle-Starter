@@ -46,6 +46,17 @@ def movement_strategy(game_model: GameModel, context: dict | None = None) -> lis
                     _path_walkable.discard((ox+dx, oy+dy))
     except Exception:
         pass
+    # Board-type danger detection: "avoid" excludes hazard-adjacent cells.
+    try:
+        danger_rows = (context or {}).get("board_danger_detection", [])
+        if danger_rows and str(danger_rows[0].get("detection", "ignore")) == "avoid":
+            for c in game_model.components:
+                if c.dominant_color in (1, 2) and not c.touches_border:
+                    for cx, cy in c.cells:
+                        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                            _path_walkable.discard((cx+dx, cy+dy))
+    except Exception:
+        pass
     for goal in search_goals:
         path = astar(player, goal, _path_walkable, game_model.width, game_model.height)
         if path and len(path) > 1:

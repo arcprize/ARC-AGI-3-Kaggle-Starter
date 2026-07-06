@@ -166,5 +166,35 @@
 (= (board-exit-type platformer) position)
 (= (board-exit-type unknown) position)
 
+; Probe strategy per board type — how to interact with the environment.
+; click = probe/inspect cells; swipe = directional gesture.
+(= (board-probe-strategy puzzle) click)
+(= (board-probe-strategy platformer) swipe)
+(= (board-probe-strategy unknown) click)
+
+; Focus mode per board type — single vs multi-entity attention.
+; single = focus on one entity; multi = distribute across entities.
+(= (board-focus-mode puzzle) multi)
+(= (board-focus-mode platformer) single)
+(= (board-focus-mode unknown) single)
+
+; Navigation style per board type — how movement works.
+; grid = snap to tiles; free = pixel-based movement.
+(= (board-nav-style puzzle) grid)
+(= (board-nav-style platformer) free)
+(= (board-nav-style unknown) free)
+
+; Danger detection per board type — whether to avoid hazards.
+; avoid = pathfind around hazards; ignore = treat as normal terrain.
+(= (board-danger-detection puzzle) ignore)
+(= (board-danger-detection platformer) avoid)
+(= (board-danger-detection unknown) ignore)
+
+; Viewport style per board type — how the board is viewed.
+; fixed = full board visible; follow = viewport follows player.
+(= (board-viewport-style puzzle) fixed)
+(= (board-viewport-style platformer) follow)
+(= (board-viewport-style unknown) fixed)
+
 (= (prefer-novel-action stalled) True)
 (= (prefer-successful-pattern repeated-progress) True)

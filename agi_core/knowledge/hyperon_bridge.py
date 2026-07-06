@@ -513,6 +513,26 @@ class HyperonBridge:
             board_type = str(episode.get("board_type", "") or "unknown")
             _BOARD_EXT: dict[str, str] = {"puzzle": "action", "platformer": "position", "unknown": "position"}
             return [{"exit": _BOARD_EXT.get(board_type, "position"), "board_type": board_type}]
+        if query_name == "board-probe-strategy":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_PROBE: dict[str, str] = {"puzzle": "click", "platformer": "swipe", "unknown": "click"}
+            return [{"strategy": _BOARD_PROBE.get(board_type, "click"), "board_type": board_type}]
+        if query_name == "board-focus-mode":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_FOCUS: dict[str, str] = {"puzzle": "multi", "platformer": "single", "unknown": "single"}
+            return [{"mode": _BOARD_FOCUS.get(board_type, "single"), "board_type": board_type}]
+        if query_name == "board-nav-style":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_NAV: dict[str, str] = {"puzzle": "grid", "platformer": "free", "unknown": "free"}
+            return [{"style": _BOARD_NAV.get(board_type, "free"), "board_type": board_type}]
+        if query_name == "board-danger-detection":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_DANGER: dict[str, str] = {"puzzle": "ignore", "platformer": "avoid", "unknown": "ignore"}
+            return [{"detection": _BOARD_DANGER.get(board_type, "ignore"), "board_type": board_type}]
+        if query_name == "board-viewport-style":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_VIEW: dict[str, str] = {"puzzle": "fixed", "platformer": "follow", "unknown": "fixed"}
+            return [{"style": _BOARD_VIEW.get(board_type, "fixed"), "board_type": board_type}]
         return []
 
     def _working_memory_goal_hint(

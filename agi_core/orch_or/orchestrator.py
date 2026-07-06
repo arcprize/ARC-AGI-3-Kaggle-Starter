@@ -130,6 +130,11 @@ class ObjectiveReduction:
             board_gravity_enabled = context.hyperon.run_rules("board-gravity-enabled") or []
             board_horizontal_scroll = context.hyperon.run_rules("board-horizontal-scroll") or []
             board_exit_type = context.hyperon.run_rules("board-exit-type") or []
+            board_probe_strategy = context.hyperon.run_rules("board-probe-strategy") or []
+            board_focus_mode = context.hyperon.run_rules("board-focus-mode") or []
+            board_nav_style = context.hyperon.run_rules("board-nav-style") or []
+            board_danger_detection = context.hyperon.run_rules("board-danger-detection") or []
+            board_viewport_style = context.hyperon.run_rules("board-viewport-style") or []
         except Exception:
             pass
         try:
@@ -191,6 +196,11 @@ class ObjectiveReduction:
             "board_gravity_enabled": board_gravity_enabled,
             "board_horizontal_scroll": board_horizontal_scroll,
             "board_exit_type": board_exit_type,
+            "board_probe_strategy": board_probe_strategy,
+            "board_focus_mode": board_focus_mode,
+            "board_nav_style": board_nav_style,
+            "board_danger_detection": board_danger_detection,
+            "board_viewport_style": board_viewport_style,
         }
         if subgoal_from_hints:
             plan_context["goal_hints"] = goal_hints
