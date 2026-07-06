@@ -22,14 +22,16 @@ def puzzle_strategy(game_model: GameModel, context: dict | None = None) -> list[
     logger.debug("puzzle_strategy: already_switched=%s player=%s player_color=%s", already_switched, player, game_model.features.player_color)
     if already_switched:
         return steps
+    ap = context.get("action_priors", {})
     interactive = [(ox, oy) for ox, oy, otype in game_model.obstacles if otype == "interactive"]
     # Skip click on interactive obstacles when a beam is present — the
     # exploration strategy's beam navigation should drive instead.
     if interactive and not game_model.features.has_beam:
-        px, py = player
-        interactive.sort(key=lambda p: abs(p[0] - px) + abs(p[1] - py))
-        tx, ty = interactive[0]
-        steps.append(_interact_step(tx, ty, game_model))
+        if not ap or ap.get("ACTION6", 0.5) > 0.1:
+            px, py = player
+            interactive.sort(key=lambda p: abs(p[0] - px) + abs(p[1] - py))
+            tx, ty = interactive[0]
+            steps.append(_interact_step(tx, ty, game_model))
     if not steps and game_model.walkable:
         # If the current entity controls the beam, let the exploration
         # strategy's beam navigation handle movement instead.

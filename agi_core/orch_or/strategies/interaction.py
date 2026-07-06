@@ -14,19 +14,23 @@ def interaction_strategy(game_model: GameModel, context: dict | None = None) -> 
     obstacles = game_model.obstacles
     if player is None:
         return steps
+    ctx = context or {}
+    ap = ctx.get("action_priors", {})
     px, py = player
     interactive_obstacles = [(ox, oy) for ox, oy, otype in obstacles if otype == "interactive"]
-    for ox, oy in interactive_obstacles:
-        if oy != py + 1:
-            continue
-        if abs(ox - px) > 2:
-            continue
-        steps.append(_interact_step(ox, oy, game_model))
+    if not ap or ap.get("ACTION6", 0.5) > 0.1:
+        for ox, oy in interactive_obstacles:
+            if oy != py + 1:
+                continue
+            if abs(ox - px) > 2:
+                continue
+            steps.append(_interact_step(ox, oy, game_model))
     player_comp = _find_player_component(game_model)
     if player_comp is not None and player_comp.dominant_color == 0:
-        has_switch = any(s.action == "switch" for s in steps)
-        if not has_switch:
-            steps.append(_switch_step())
+        if not ap or ap.get("ACTION5", 0.5) > 0.1:
+            has_switch = any(s.action == "switch" for s in steps)
+            if not has_switch:
+                steps.append(_switch_step())
     return steps
 
 

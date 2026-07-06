@@ -23,6 +23,17 @@ _STRATEGY_MAP: dict[str, str] = {
 _PUZZLE_OBJECTIVES = frozenset({"reach-goal", "navigate-to-goal", "explore-board"})
 
 
+def _apply_priority_boost(root: Objective, subgoal: str) -> None:
+    """Boost priority of a sub-objective that matches a hyperon goal-hint."""
+    stack: list[Objective] = [root]
+    while stack:
+        obj = stack.pop()
+        if obj.description == subgoal:
+            obj.priority = min(obj.priority + 0.15, 1.0)
+            return
+        stack.extend(obj.sub_objectives)
+
+
 def generate_plan(
     game_model: GameModel,
     context: dict[str, Any] | None = None,
@@ -34,6 +45,13 @@ def generate_plan(
     if context and "goal_hints" in context:
         goal_hints = context["goal_hints"]
     objective_tree = reduce(game_model, goal_hints=goal_hints)
+    # Apply hyperon goal-hint priority overrides after building the tree.
+    if goal_hints:
+        for hint in goal_hints:
+            hinted_subgoal = str(hint.get("subgoal", "") or "")
+            hint_conf = float(hint.get("confidence", 0.0))
+            if hint_conf >= 0.7:
+                _apply_priority_boost(objective_tree, hinted_subgoal)
     leaf = select_leaf(objective_tree)
     primary_name = _STRATEGY_MAP.get(leaf.description, "generic")
     if parallel and leaf.description in _PARALLEL_TARGETS:

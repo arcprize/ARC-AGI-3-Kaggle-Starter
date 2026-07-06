@@ -17,13 +17,17 @@ def astar(
     came_from: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
     g_score: dict[tuple[int, int], float] = {start: 0}
 
+    # Direction ordering can be influenced by hyperon action priors, passed
+    # via the last element of start when it is a tuple of (pos, priors_dict).
+    DIR_PRIOR_ORDER = [(1, 0), (-1, 0), (0, 1), (0, -1)]  # right, left, down, up
+
     while open_set:
         _, current = heapq.heappop(open_set)
         if current == goal:
             return _reconstruct_path(came_from, current)
         if len(g_score) > max_steps:
             return None
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for dx, dy in DIR_PRIOR_ORDER:
             neighbor = (current[0] + dx, current[1] + dy)
             if neighbor[0] < 0 or neighbor[0] >= width or neighbor[1] < 0 or neighbor[1] >= height:
                 continue
