@@ -440,15 +440,11 @@ def _extract_features(
     )
     features.has_gravity = board_type == "platformer"
     if player_pos is not None:
-        pixel_color = board[player_pos[1]][player_pos[0]]
-        if pixel_color != 0:
-            features.player_color = pixel_color
+        player_comp = _find_player_component(components, player_pos)
+        if player_comp is not None and player_comp.dominant_color != 0:
+            features.player_color = player_comp.dominant_color
         else:
-            player_comp = _find_player_component(components, player_pos)
-            if player_comp is not None and player_comp.dominant_color != 0:
-                features.player_color = player_comp.dominant_color
-            else:
-                features.player_color = pixel_color
+            features.player_color = board[player_pos[1]][player_pos[0]]
     for gx, gy in goal_positions:
         if 0 <= gy < height and 0 <= gx < width:
             features.goal_color = board[gy][gx]

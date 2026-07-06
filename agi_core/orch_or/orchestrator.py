@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 _PLAN_KEY = "orch_or_plan"
-_SWITCH_KEY = "orch_or_switch_attempted"
+_SWITCH_KEY = "orch_or_switch_count"
 _SWITCH_POS_KEY = "orch_or_player_pos_before_switch"
 _BEAM_COVERAGE_KEY = "orch_or_beam_coverage"
 _BEAM_DIR_KEY = "orch_or_beam_best_direction"
@@ -46,7 +46,7 @@ class ObjectiveReduction:
         self._previous_model: GameModel | None = None
         self._regenerate_count: int = 0
         self._skip_monitoring: bool = False
-        self._switch_attempted: bool = False
+        self._switch_count: int = 0  # 0=none, 1=mirror→shape, 2=shape→mirror (block further)
         self._switch_pos: tuple[int, int] | None = None
         self._non_beam_controllers: set[int] = set()
         self._failed_directions: set[str] = set()
@@ -84,12 +84,12 @@ class ObjectiveReduction:
             curr_p = game_model.player_pos
             if abs(curr_p[0] - prev_p[0]) + abs(curr_p[1] - prev_p[1]) > _LEVEL_JUMP_THRESHOLD:
                 self._non_beam_controllers.clear()
-                self._switch_attempted = False
+                self._switch_count = 0
                 self._failed_directions.clear()
                 self._stable_goal = None
         elif self._previous_model is None:
             self._non_beam_controllers.clear()
-            self._switch_attempted = False
+            self._switch_count = 0
             self._failed_directions.clear()
             self._stable_goal = None
         # Track a stable goal from platformer boards — these persist even when
@@ -186,10 +186,10 @@ class ObjectiveReduction:
             logger.debug("hyperon rules query failed (disabled?)", exc_info=True)
         self._hyperon_priors = hyperon_priors
 
-        logger.debug("orchestrator state: switch_attempted=%s non_beam=%s stable_goal=%s", self._switch_attempted, self._non_beam_controllers, self._stable_goal)
+        logger.debug("orchestrator state: switch_attempted=%s non_beam=%s stable_goal=%s", self._switch_count, self._non_beam_controllers, self._stable_goal)
         plan_context: dict[str, Any] = {
             "game_step": context.observation.step_index,
-            "switch_attempted": self._switch_attempted,
+            "switch_attempted": self._switch_count,
             "non_beam_controllers": self._non_beam_controllers.copy(),
             "failed_directions": self._failed_directions.copy(),
             "stable_goal": self._stable_goal,
@@ -238,7 +238,7 @@ class ObjectiveReduction:
         wm = self._get_working_memory(context)
         wm["active_subgoal"] = subgoal_from_hints or "unknown"
         wm["stable_goal"] = self._stable_goal
-        wm["switch_attempted"] = self._switch_attempted
+        wm["switch_attempted"] = self._switch_count
         wm["failed_directions"] = list(self._failed_directions)
         if hyperon_priors:
             wm["recommended_actions"] = sorted(hyperon_priors, key=hyperon_priors.get, reverse=True)
@@ -256,7 +256,7 @@ class ObjectiveReduction:
             if self._active_plan is not None:
                 logger.debug("plan generated: id=%s steps=%d", self._active_plan.objective_id, len(self._active_plan.steps))
                 if any(s.action == "switch" for s in self._active_plan.steps):
-                    self._switch_attempted = True
+                    self._switch_count += 1
                 self._persist_plan(context)
                 self._regenerate_count = 0
             else:
@@ -339,6 +339,26 @@ class ObjectiveReduction:
     def _handle_plan_exhausted(
         self, context: ExecutiveContext, game_model,
     ) -> ActionDecision:
+        # After first switch (mirror → shape), inject a switch back to mirror
+        if self._switch_count == 1 and game_model.player_pos is not None and game_model.features.player_color in self._non_beam_controllers:
+            self._switch_count += 1
+            # Clear non-beam controllers so the mirror is recognized as a
+            # beam controller when it switches back.
+            self._non_beam_controllers.clear()
+            logger.debug("exhausted: switching back to mirror (count=%d)", self._switch_count)
+            step = PlanStep(
+                action="switch", params={},
+                source="orch_or:plan_exhausted_switch",
+                preconditions=frozenset(), expected_effect="switch_entity",
+            )
+            self._active_plan = Plan(
+                objective_id="reach-goal", steps=[step],
+                created_at_step=context.observation.step_index,
+                confidence=0.7,
+            )
+            self._persist_plan(context)
+            self._skip_monitoring = True
+            return self.decide(context)
         if self._regenerate_count >= self._MAX_REGENERATE:
             self._regenerate_count = 0
             wm = self._get_working_memory(context)
@@ -357,6 +377,23 @@ class ObjectiveReduction:
             # a conflicting direction), emit a simple move toward the stable
             # goal for non-beam-controllers.
             if self._stable_goal is not None and game_model.player_pos is not None and game_model.features.player_color in self._non_beam_controllers:
+                # If we've already switched once (mirror → shape), switch back
+                # to mirror now so it can aim the beam at (37,8).
+                if self._switch_count == 1:
+                    self._switch_count += 1
+                    step = PlanStep(
+                        action="switch", params={},
+                        source="orch_or:plan_exhausted_switch",
+                        preconditions=frozenset(), expected_effect="switch_entity",
+                    )
+                    self._active_plan = Plan(
+                        objective_id="reach-goal", steps=[step],
+                        created_at_step=context.observation.step_index,
+                        confidence=0.7,
+                    )
+                    self._persist_plan(context)
+                    self._skip_monitoring = True
+                    return self.decide(context)
                 px, py = game_model.player_pos
                 gx, gy = self._stable_goal
                 dx, dy = gx - px, gy - py
@@ -395,7 +432,7 @@ class ObjectiveReduction:
             pass
         plan_context: dict[str, Any] = {
             "game_step": context.observation.step_index,
-            "switch_attempted": self._switch_attempted,
+            "switch_attempted": self._switch_count,
             "non_beam_controllers": self._non_beam_controllers.copy(),
             "failed_directions": self._failed_directions.copy(),
             "stable_goal": self._stable_goal,
@@ -413,7 +450,7 @@ class ObjectiveReduction:
         result_plan = generate_plan(game_model, context=plan_context, parallel=parallel, timeout=p_timeout)
         if result_plan is not None:
             if any(s.action == "switch" for s in result_plan.steps):
-                self._switch_attempted = True
+                self._switch_count += 1
             self._active_plan = result_plan
             self._persist_plan(context)
             self._skip_monitoring = True
@@ -450,9 +487,7 @@ class ObjectiveReduction:
             step = self._active_plan.steps[self._active_plan.current_index - 1] if self._active_plan.current_index > 0 else None
             if step is not None:
                 if step.action == "switch":
-                    self._switch_attempted = True
-                    # The entity we switched FROM controlled the beam;
-                    # the entity we switched TO does not.
+                    # The entity we switched TO is a non-beam-controller.
                     if game_model is not None and game_model.features.player_color >= 0:
                         self._non_beam_controllers.add(game_model.features.player_color)
                 else:
@@ -489,16 +524,16 @@ class ObjectiveReduction:
             except Exception:
                 pass
         elif status == "switch_entity" and self._active_plan is not None:
-            if self._switch_attempted:
-                # Already switched once — fall back instead of re-switching.
-                # This prevents oscillation between mirror and shape piece.
+            if self._switch_count >= 2:
+                # Already switched twice — fall back instead of re-switching.
+                # This allows mirror→shape→mirror but prevents further oscillation.
                 if self._pending_failed_dir is not None:
                     self._failed_directions.add(self._pending_failed_dir)
                     self._pending_failed_dir = None
                 self._active_plan = None
                 self._regenerate_count = 0
             else:
-                self._switch_attempted = True
+                self._switch_count += 1
                 self._inject_switch_before_current(self._active_plan)
         elif status in ("replan", "escalate"):
             if self._pending_failed_dir is not None:
