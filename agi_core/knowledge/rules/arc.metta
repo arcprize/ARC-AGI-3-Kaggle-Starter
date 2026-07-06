@@ -47,5 +47,17 @@
 (= (board-prior platformer ACTION5) 0.40)
 (= (board-prior platformer ACTION6) 0.35)
 
+; Board-type-specific goal hints — augment the state-based hints above.
+(= (board-goal-hint puzzle) explore-board)
+(= (board-goal-hint platformer) navigate-to-goal)
+(= (board-goal-hint unknown) advance-level)
+
+; Board-type-specific stagnation thresholds — how many retries before
+; stagnation is declared.  Puzzle boards give up sooner (switch entity),
+; platformers try harder.
+(= (board-stagnation-threshold puzzle) 2)
+(= (board-stagnation-threshold platformer) 5)
+(= (board-stagnation-threshold unknown) 3)
+
 (= (prefer-novel-action stalled) True)
 (= (prefer-successful-pattern repeated-progress) True)

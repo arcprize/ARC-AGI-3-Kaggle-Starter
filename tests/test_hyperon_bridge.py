@@ -191,6 +191,63 @@ class HyperonBridgeTests(unittest.TestCase):
             [{"subgoal": "break-stall", "confidence": 0.73}],
         )
 
+    def test_game_goal_hints_puzzle_board_type(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"],
+            derived_features={"frame_signature": "sig-gg-puzzle"},
+        )
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        hints = bridge.run_rules("game-goal-hints")
+        self.assertTrue(len(hints) >= 1)
+        self.assertEqual(hints[0].get("subgoal"), "explore-board")
+        self.assertGreaterEqual(hints[0].get("confidence", 0), 0.7)
+
+    def test_game_goal_hints_platformer_board_type(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        observation = make_observation(
+            step_index=1, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"],
+            derived_features={"frame_signature": "sig-gg-platformer"},
+        )
+        bridge.sync(observation, EpisodicMemory(), [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "platformer"
+        hints = bridge.run_rules("game-goal-hints")
+        self.assertTrue(len(hints) >= 1)
+        self.assertEqual(hints[0].get("subgoal"), "navigate-to-goal")
+
+    def test_game_stagnation_puzzle_board_type_lower_threshold(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        observation = make_observation(
+            step_index=5, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-gs-puzzle"},
+        )
+        bridge.sync(observation, memory, [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "puzzle"
+        bridge.facts["memory"]["stagnation_steps"] = 2
+        result = bridge.run_rules("game-stagnation")
+        self.assertTrue(len(result) >= 1)
+        self.assertEqual(result[0].get("flag"), "stagnation")
+
+    def test_game_stagnation_unknown_board_type_default_threshold(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        observation = make_observation(
+            step_index=5, game_state="ACTIVE", last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-gs-unknown"},
+        )
+        bridge.sync(observation, memory, [])
+        bridge.facts.setdefault("episode", {})["board_type"] = "unknown"
+        bridge.facts["memory"]["stagnation_steps"] = 2
+        result = bridge.run_rules("game-stagnation")
+        # unknown threshold is 3, so 2 steps should NOT trigger stagnation
+        self.assertEqual(len(result), 0)
+
     def test_sync_records_live_board_summary_without_persisting_board(self) -> None:
         bridge = HyperonBridge(enabled=False)
         memory = EpisodicMemory()

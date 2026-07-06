@@ -127,10 +127,10 @@ class ObjectiveReduction:
                             subgoal="re-enter-level",
                         )],
                     )
-            # Query goal hints
-            goal_hints = context.hyperon.run_rules("goal-hints")
+            # Query game-aware goal hints (factors in board_type).
+            goal_hints = context.hyperon.run_rules("game-goal-hints")
             if goal_hints:
-                logger.debug("hyperon goal-hints: %s", goal_hints)
+                logger.debug("hyperon game-goal-hints: %s", goal_hints)
                 subgoal_from_hints = goal_hints[0].get("subgoal")
             # Query action priors for current subgoal
             prior_query = "game-action-priors"
@@ -157,7 +157,7 @@ class ObjectiveReduction:
             "action_priors": hyperon_priors,
         }
         if subgoal_from_hints:
-            plan_context["goal_hints"] = [{"subgoal": subgoal_from_hints}]
+            plan_context["goal_hints"] = goal_hints
         _update_beam_context(game_model, self._previous_model, self._get_working_memory(context), plan_context)
 
         if not self._skip_monitoring:
@@ -346,7 +346,7 @@ class ObjectiveReduction:
             "action_priors": hyperon_priors,
         }
         try:
-            gh = context.hyperon.run_rules("goal-hints")
+            gh = context.hyperon.run_rules("game-goal-hints")
             if gh:
                 plan_context["goal_hints"] = gh
         except Exception:

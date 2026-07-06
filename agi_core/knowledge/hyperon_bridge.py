@@ -402,6 +402,31 @@ class HyperonBridge:
                     base = [p for p in base if p.get("action_name") != action]
                     base.append({"action_name": action, "confidence": conf, "reason": f"board-prior:{board_type}"})
             return base
+        if query_name == "game-goal-hints":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            # Board-type-specific goal hints.
+            _BOARD_GOAL_HINTS: dict[str, str] = {
+                "puzzle": "explore-board",
+                "platformer": "navigate-to-goal",
+            }
+            if board_type in _BOARD_GOAL_HINTS:
+                return [{"subgoal": _BOARD_GOAL_HINTS[board_type], "confidence": 0.75,
+                         "reason": f"board-goal-hint:{board_type}"}]
+            # Fall back to the standard goal-hints logic.
+            return self._run_shadow_rules("goal-hints")
+        if query_name == "game-stagnation":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            stagnation_steps = int(memory.get("stagnation_steps", 0) or 0)
+            _BOARD_STAGNATION_THRESHOLD: dict[str, int] = {
+                "puzzle": 2,
+                "platformer": 5,
+                "unknown": 3,
+            }
+            threshold = _BOARD_STAGNATION_THRESHOLD.get(board_type, 3)
+            if stagnation_steps >= threshold:
+                return [{"flag": "stagnation", "confidence": 0.74,
+                         "reason": f"board-stagnation:{board_type}"}]
+            return []
         return []
 
     def _working_memory_goal_hint(
