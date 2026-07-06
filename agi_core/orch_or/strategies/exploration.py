@@ -37,6 +37,14 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
             candidates = _bias_candidates_by_priors(candidates, priors)
             failed = ctx.get("failed_directions", set())
             candidates = [d for d in candidates if d not in failed]
+            # Use expanded walkable for non-beam-controllers so the shape
+            # piece can traverse terrain of any interior component color.
+            move_walkable = set(game_model.walkable)
+            if features.player_color in non_beam_set:
+                for c in game_model.components:
+                    if not c.touches_border:
+                        for cx, cy in c.cells:
+                            move_walkable.add((cx, cy))
             for d in candidates:
                 dvx, dvy = _direction_vec(d)
                 nx, ny = px + dvx, py + dvy

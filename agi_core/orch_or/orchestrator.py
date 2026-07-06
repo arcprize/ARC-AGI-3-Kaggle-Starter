@@ -98,11 +98,21 @@ class ObjectiveReduction:
         # is locked once set so dynamic puzzle goals don't override it.
         is_non_controller = game_model.features.player_color in self._non_beam_controllers
         if game_model.features.board_type == "platformer" and game_model.features.goal_detectable and game_model.goal_positions and game_model.player_pos is not None:
-            if not is_non_controller or self._stable_goal is None:
+            px, py = game_model.player_pos
+            nearest = min(game_model.goal_positions, key=lambda g: abs(g[0] - px) + abs(g[1] - py))
+            self._stable_goal = nearest
+        elif game_model.features.goal_detectable and game_model.goal_positions and game_model.player_pos is not None:
+            # For non-platformer boards or non-controllers: still update stable goal
+            # from current goals when the current entity is a non-beam-controller
+            # (shape piece), so it navigates toward the correct goal after switch.
+            if is_non_controller and self._stable_goal is not None:
                 px, py = game_model.player_pos
                 nearest = min(game_model.goal_positions, key=lambda g: abs(g[0] - px) + abs(g[1] - py))
-                self._stable_goal = nearest
-        elif self._stable_goal is None and game_model.goal_positions:
+                dist_to_current = abs(nearest[0] - self._stable_goal[0]) + abs(nearest[1] - self._stable_goal[1])
+                if dist_to_current > 10:
+                    logger.debug("stable_goal updated from %s to %s (dist=%d)", self._stable_goal, nearest, dist_to_current)
+                    self._stable_goal = nearest
+        if self._stable_goal is None and game_model.goal_positions:
             self._stable_goal = game_model.goal_positions[0]
 
         # --- Hyperon integration: query rules for decision support ---
@@ -479,21 +489,9 @@ class ObjectiveReduction:
             except Exception:
                 pass
         elif status == "switch_entity" and self._active_plan is not None:
-            # Query hyperon to see if it recommends switching.
-            hyperon_recommends_switch = False
-            try:
-                for row in context.hyperon.run_rules("game-action-priors"):
-                    if str(row.get("action_name", "")).upper() == "ACTION5":
-                        confidence = float(row.get("confidence", 0.0))
-                        if confidence > 0.3:
-                            hyperon_recommends_switch = True
-                        break
-            except Exception:
-                pass
-            if self._switch_attempted and not hyperon_recommends_switch:
-                # Already switched once and still stuck, and hyperon doesn't
-                # strongly recommend another switch — record failed dir and
-                # fall back.
+            if self._switch_attempted:
+                # Already switched once — fall back instead of re-switching.
+                # This prevents oscillation between mirror and shape piece.
                 if self._pending_failed_dir is not None:
                     self._failed_directions.add(self._pending_failed_dir)
                     self._pending_failed_dir = None
