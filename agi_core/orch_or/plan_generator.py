@@ -75,6 +75,15 @@ def generate_plan(
                 steps = puzzle_fn(game_model, context)
     if not steps:
         return None
+    # Override step tolerance from board-retry-tolerance MeTTa rule.
+    try:
+        retry_rows = (context or {}).get("board_retry_tolerance", [])
+        if retry_rows:
+            tol = int(retry_rows[0].get("tolerance", 3))
+            for s in steps:
+                s.tolerance = tol
+    except Exception:
+        pass
     # Adjust plan confidence from hyperon action priors.
     _DIR_TO_ACTION = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
     action_priors = (context or {}).get("action_priors", {})

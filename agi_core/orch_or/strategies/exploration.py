@@ -63,7 +63,15 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
         if features.has_beam:
             ctx = context or {}
             non_beam = ctx.get("non_beam_controllers", set())
-            if features.player_color not in non_beam:
+            # Check board-beam-priority: "low" means skip beam nav.
+            _beam_priority = "medium"
+            try:
+                bp_rows = ctx.get("board_beam_priority", [])
+                if bp_rows:
+                    _beam_priority = str(bp_rows[0].get("priority", "medium"))
+            except Exception:
+                pass
+            if features.player_color not in non_beam and _beam_priority != "low":
                 # If hyperon has a very high confidence direction, try it first
                 # before falling through to beam navigation.
                 _AP_TO_DIR = {"ACTION1": "up", "ACTION2": "down", "ACTION3": "left", "ACTION4": "right"}
@@ -146,12 +154,25 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
         # not control the beam (e.g. a secondary sprite in a puzzle level).
         non_beam_set = (context or {}).get("non_beam_controllers", set())
         if features.goal_detectable and game_model.goal_positions and (features.board_type == "platformer" or (features.board_type == "puzzle" and features.player_color in non_beam_set)):
+            # Board-type goal proximity: within this distance, consider the
+            # goal reached and stop navigating.
+            _proximity = 2
+            try:
+                prox_rows = (context or {}).get("board_goal_proximity", [])
+                if prox_rows:
+                    _proximity = int(prox_rows[0].get("proximity", 2))
+            except Exception:
+                pass
             stable_goal = (context or {}).get("stable_goal")
             if stable_goal is not None:
                 gx, gy = stable_goal
             else:
                 nearest_goal = min(game_model.goal_positions, key=lambda g: abs(g[0] - px) + abs(g[1] - py))
                 gx, gy = nearest_goal
+            # If already within proximity, return empty so the plan generator
+            # falls through to the executive / level completion detection.
+            if abs(gx - px) + abs(gy - py) <= _proximity:
+                return steps
             candidates = []
             if gx < px:
                 candidates.append("left")

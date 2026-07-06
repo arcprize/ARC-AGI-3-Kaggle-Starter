@@ -113,11 +113,19 @@ class ObjectiveReduction:
         board_explore_bias: list[dict[str, Any]] = []
         board_interact_range: list[dict[str, Any]] = []
         board_move_bias: list[dict[str, Any]] = []
+        board_beam_priority: list[dict[str, Any]] = []
+        board_path_preference: list[dict[str, Any]] = []
+        board_retry_tolerance: list[dict[str, Any]] = []
+        board_goal_proximity: list[dict[str, Any]] = []
         try:
             beam_strategy = context.hyperon.run_rules("beam-strategy") or []
             board_explore_bias = context.hyperon.run_rules("board-explore-bias") or []
             board_interact_range = context.hyperon.run_rules("board-interact-range") or []
             board_move_bias = context.hyperon.run_rules("board-move-bias") or []
+            board_beam_priority = context.hyperon.run_rules("board-beam-priority") or []
+            board_path_preference = context.hyperon.run_rules("board-path-preference") or []
+            board_retry_tolerance = context.hyperon.run_rules("board-retry-tolerance") or []
+            board_goal_proximity = context.hyperon.run_rules("board-goal-proximity") or []
         except Exception:
             pass
         try:
@@ -171,6 +179,10 @@ class ObjectiveReduction:
             "board_explore_bias": board_explore_bias,
             "board_interact_range": board_interact_range,
             "board_move_bias": board_move_bias,
+            "board_beam_priority": board_beam_priority,
+            "board_path_preference": board_path_preference,
+            "board_retry_tolerance": board_retry_tolerance,
+            "board_goal_proximity": board_goal_proximity,
         }
         if subgoal_from_hints:
             plan_context["goal_hints"] = goal_hints
@@ -436,6 +448,16 @@ class ObjectiveReduction:
                     if row.get("flag") == "stagnation":
                         step.retry_count = max(step.retry_count, step.tolerance - 1)
                         break
+            except Exception:
+                pass
+            # Board-type switch urgency: high urgency reduces tolerance.
+            try:
+                for row in context.hyperon.run_rules("board-switch-urgency"):
+                    urgency = str(row.get("urgency", "medium"))
+                    if urgency == "high":
+                        step.tolerance = min(step.tolerance, 2)
+                    elif urgency == "low":
+                        step.tolerance = max(step.tolerance, 5)
             except Exception:
                 pass
         elif status == "switch_entity" and self._active_plan is not None:

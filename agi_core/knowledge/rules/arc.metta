@@ -106,5 +106,35 @@
 (= (board-move-bias puzzle) down)
 (= (board-move-bias unknown) right)
 
+; Whether to prefer beam navigation over direct movement per board type.
+; high = always try beam nav first; low = skip beam nav for movement.
+(= (board-beam-priority puzzle) high)
+(= (board-beam-priority platformer) low)
+(= (board-beam-priority unknown) medium)
+
+; How urgently to switch controllable entities when stuck per board type.
+; high = switch after few retries; low = exhaust all options first.
+(= (board-switch-urgency puzzle) high)
+(= (board-switch-urgency platformer) low)
+(= (board-switch-urgency unknown) medium)
+
+; Path preference for A* navigation per board type.
+; direct = prefer shortest path; safe = avoid interactive obstacles.
+(= (board-path-preference puzzle) direct)
+(= (board-path-preference platformer) safe)
+(= (board-path-preference unknown) balanced)
+
+; Per-action retry tolerance per board type — how many times to retry
+; a failed action before giving up.  puzzle = fewer (switch sooner).
+(= (board-retry-tolerance puzzle) 2)
+(= (board-retry-tolerance platformer) 5)
+(= (board-retry-tolerance unknown) 3)
+
+; Goal proximity threshold per board type — max Manhattan distance to
+; consider a goal as "reached".  puzzle needs tight precision.
+(= (board-goal-proximity puzzle) 1)
+(= (board-goal-proximity platformer) 3)
+(= (board-goal-proximity unknown) 2)
+
 (= (prefer-novel-action stalled) True)
 (= (prefer-successful-pattern repeated-progress) True)

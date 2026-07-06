@@ -35,8 +35,19 @@ def movement_strategy(game_model: GameModel, context: dict | None = None) -> lis
     for g in goals:
         if not search_goals or g != stable_goal:
             search_goals.append(g)
+    # Board-type path preference: "safe" avoids interactive obstacles.
+    _path_walkable = set(game_model.walkable)
+    try:
+        pref_rows = (context or {}).get("board_path_preference", [])
+        if pref_rows and str(pref_rows[0].get("preference", "balanced")) == "safe":
+            obs_set = set((ox, oy) for ox, oy, _ in game_model.obstacles if _ == "interactive")
+            for ox, oy in list(obs_set):
+                for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                    _path_walkable.discard((ox+dx, oy+dy))
+    except Exception:
+        pass
     for goal in search_goals:
-        path = astar(player, goal, game_model.walkable, game_model.width, game_model.height)
+        path = astar(player, goal, _path_walkable, game_model.width, game_model.height)
         if path and len(path) > 1:
             for i in range(1, len(path)):
                 prev = path[i - 1]

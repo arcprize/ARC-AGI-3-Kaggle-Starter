@@ -473,6 +473,26 @@ class HyperonBridge:
             board_type = str(episode.get("board_type", "") or "unknown")
             _BOARD_MOVE: dict[str, str] = {"puzzle": "down", "platformer": "right", "unknown": "right"}
             return [{"direction": _BOARD_MOVE.get(board_type, "right"), "board_type": board_type}]
+        if query_name == "board-beam-priority":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_BEAM: dict[str, str] = {"puzzle": "high", "platformer": "low", "unknown": "medium"}
+            return [{"priority": _BOARD_BEAM.get(board_type, "medium"), "board_type": board_type}]
+        if query_name == "board-switch-urgency":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_SWITCH: dict[str, str] = {"puzzle": "high", "platformer": "low", "unknown": "medium"}
+            return [{"urgency": _BOARD_SWITCH.get(board_type, "medium"), "board_type": board_type}]
+        if query_name == "board-path-preference":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_PATH: dict[str, str] = {"puzzle": "direct", "platformer": "safe", "unknown": "balanced"}
+            return [{"preference": _BOARD_PATH.get(board_type, "balanced"), "board_type": board_type}]
+        if query_name == "board-retry-tolerance":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_RETRY: dict[str, int] = {"puzzle": 2, "platformer": 5, "unknown": 3}
+            return [{"tolerance": _BOARD_RETRY.get(board_type, 3), "board_type": board_type}]
+        if query_name == "board-goal-proximity":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            _BOARD_PROX: dict[str, int] = {"puzzle": 1, "platformer": 3, "unknown": 2}
+            return [{"proximity": _BOARD_PROX.get(board_type, 2), "board_type": board_type}]
         return []
 
     def _working_memory_goal_hint(
