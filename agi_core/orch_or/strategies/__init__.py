@@ -3,10 +3,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
 
 from agi_core.orch_or.strategies.exploration import exploration_strategy
+from agi_core.orch_or.strategies.goal_seeker import goal_seeker_strategy
 from agi_core.orch_or.strategies.generic import generic_strategy
 from agi_core.orch_or.strategies.interaction import interaction_strategy
 from agi_core.orch_or.strategies.movement import movement_strategy
-from agi_core.orch_or.strategies.puzzle import puzzle_strategy
 
 if TYPE_CHECKING:
     from agi_core.orch_or.game_model import GameModel, PlanStep
@@ -18,7 +18,7 @@ _registry: dict[str, StrategyFn] = {
     "movement": movement_strategy,
     "interaction": interaction_strategy,
     "exploration": exploration_strategy,
-    "puzzle": puzzle_strategy,
+    "goal_seeker": goal_seeker_strategy,
     "generic": generic_strategy,
 }
 

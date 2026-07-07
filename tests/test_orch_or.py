@@ -659,7 +659,7 @@ class ExecutorTests(unittest.TestCase):
         plan = Plan(objective_id="reach-goal", steps=[step, PlanStep(action="click", params={}, source="plan", preconditions=frozenset(), expected_effect="x")], current_index=0)
         proposal = plan_step_to_proposal(step, self._blank_gm(), plan)
         assert proposal is not None
-        self.assertEqual(proposal.metadata.get("step_index"), 0)
+        self.assertEqual(proposal.metadata.get("step_index"), 1)
         self.assertEqual(proposal.metadata.get("total_steps"), 2)
         self.assertEqual(proposal.metadata.get("plan_objective"), "reach-goal")
         self.assertEqual(proposal.expected_outcome, "move_right")

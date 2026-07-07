@@ -2300,6 +2300,66 @@ class DemoZipTrainingTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(int(count or 0), 0)
 
+    def test_infer_board_type_puzzle_from_switch_ratio(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_board_type({"ACTION5": 20, "ACTION1": 10, "ACTION2": 10}),
+            "puzzle",
+        )
+
+    def test_infer_board_type_puzzle_from_click_ratio(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_board_type({"ACTION6": 30, "ACTION1": 10, "ACTION2": 10}),
+            "puzzle",
+        )
+
+    def test_infer_board_type_platformer_from_up_ratio(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_board_type({"ACTION1": 30, "ACTION2": 10, "ACTION3": 10, "ACTION4": 10}),
+            "platformer",
+        )
+
+    def test_infer_board_type_puzzle_from_balanced_vert_horiz(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_board_type({"ACTION1": 1, "ACTION2": 6, "ACTION3": 4, "ACTION4": 3}),
+            "puzzle",
+        )
+
+    def test_infer_board_type_unknown_for_empty(self) -> None:
+        self.assertEqual(demo_zip_module._infer_board_type({}), "unknown")
+
+    def test_infer_board_type_unknown_for_strong_directional_bias(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_board_type({"ACTION1": 1, "ACTION4": 10}),
+            "unknown",
+        )
+
+    def test_extract_board_policy_params_yields_ten_params(self) -> None:
+        artifact_games = {
+            "ls20": {"actions": {"ACTION1": 1, "ACTION2": 6, "ACTION3": 4, "ACTION4": 3, "ACTION5": 3, "ACTION6": 5}},
+            "ar25": {"actions": {"ACTION1": 20, "ACTION2": 5, "ACTION3": 4, "ACTION4": 3}},
+        }
+        rows = demo_zip_module._extract_board_policy_params(artifact_games)
+        board_types = set(r["board_type"] for r in rows)
+        self.assertIn("puzzle", board_types)
+        param_names = {r["param_name"] for r in rows}
+        self.assertIn("explore-bias", param_names)
+        self.assertIn("interact-range", param_names)
+        self.assertIn("switch-urgency", param_names)
+        self.assertIn("path-preference", param_names)
+        self.assertIn("move-bias", param_names)
+        self.assertIn("beam-priority", param_names)
+        self.assertIn("entity-count", param_names)
+        self.assertIn("goal-proximity", param_names)
+        self.assertIn("retry-tolerance", param_names)
+        self.assertIn("stagnation-threshold", param_names)
+        self.assertTrue(len(rows) > 0)
+        for row in rows:
+            self.assertIn("board_type", row)
+            self.assertIn("param_name", row)
+            self.assertIn("param_value", row)
+            self.assertIn("confidence", row)
+            self.assertIn("sample_count", row)
+
 
 if __name__ == "__main__":
     unittest.main()

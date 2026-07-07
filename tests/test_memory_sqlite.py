@@ -2321,6 +2321,162 @@ class MemorySqliteTests(unittest.TestCase):
             self.assertEqual(bundle["trained_prior_bucket"]["ACTION1"], 12)
             self.assertEqual(bundle["recommended_actions"][0], "ACTION1")
 
+    def test_load_memory_bundle_from_stores_merges_abstract_memories_from_trained_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hot_db_path = Path(tmpdir) / "hot.sqlite3"
+            trained_db_path = Path(tmpdir) / "trained.sqlite3"
+            initialize_memory_schema(hot_db_path)
+            initialize_memory_schema(trained_db_path)
+            record_transition(
+                hot_db_path,
+                EpisodeRecord(
+                    game_id="ls20",
+                    step_index=1,
+                    action_name="ACTION1",
+                    outcome="progress",
+                    progress_delta=1,
+                    game_state="ACTIVE",
+                    prior_game_state="ACTIVE",
+                    levels_completed=1,
+                    prior_frame_signature="sig-hot",
+                    next_game_state="ACTIVE",
+                    next_frame_signature="sig-hot-next",
+                    prior_legal_actions=["ACTION1", "ACTION2"],
+                    stagnation_before=0,
+                    stagnation_after=0,
+                    decision_subgoal="advance-level",
+                    decision_source="symbolic",
+                ),
+            )
+            upsert_abstract_memory_rows(
+                trained_db_path,
+                [
+                    {
+                        "subgoal": "advance-level",
+                        "state": "ACTIVE",
+                        "board_height": 2,
+                        "board_width": 2,
+                        "board_active_cells": 4,
+                        "board_source_attr": "frame",
+                        "motif_tags": ["axis_horizontal", "axis_vertical"],
+                        "action_name": "ACTION2",
+                        "lead_in_actions": ["ACTION6"],
+                        "lesson_text": "Transferred move",
+                        "salience": 2.0,
+                        "confidence": 0.8,
+                        "progress": 3,
+                        "failed": 0,
+                        "stalled": 0,
+                        "total": 3,
+                        "last_outcome": "progress",
+                        "last_step_index": 8,
+                        "source_games": ["ar25", "bp35"],
+                    }
+                ],
+            )
+
+            bundle = load_memory_bundle_from_stores(
+                hot_db_path=hot_db_path,
+                archive_db_path=None,
+                trained_db_path=trained_db_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature="sig-fresh",
+                subgoal="advance-level",
+                legal_actions=["ACTION1", "ACTION2"],
+                board_context=None,
+                last_action="ACTION1",
+            )
+
+            self.assertTrue(bundle["abstract_memories"])
+            self.assertEqual(
+                bundle["abstract_memories"][0]["action_name"],
+                "ACTION2",
+            )
+
+    def test_load_memory_bundle_from_stores_merges_trained_prior_bucket_from_separate_trained_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hot_db_path = Path(tmpdir) / "hot.sqlite3"
+            archive_db_path = Path(tmpdir) / "archive.sqlite3"
+            trained_db_path = Path(tmpdir) / "trained.sqlite3"
+            initialize_memory_schema(hot_db_path)
+            initialize_memory_schema(archive_db_path)
+            initialize_memory_schema(trained_db_path)
+            initialize_schema(trained_db_path)
+            upsert_training_counts(
+                hot_db_path,
+                [
+                    {
+                        "scope": "subgoal",
+                        "game_id": "ls20",
+                        "subgoal": "inspect-active-board",
+                        "action_name": "ACTION6",
+                        "count": 11,
+                    }
+                ],
+            )
+            upsert_training_counts(
+                trained_db_path,
+                [
+                    {
+                        "scope": "state",
+                        "game_id": "ls20",
+                        "state": "ACTIVE",
+                        "action_name": "ACTION1",
+                        "count": 8,
+                    }
+                ],
+            )
+
+            bundle = load_memory_bundle_from_stores(
+                hot_db_path=hot_db_path,
+                archive_db_path=archive_db_path,
+                trained_db_path=trained_db_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature="sig-missing",
+                subgoal="inspect-active-board",
+                legal_actions=["ACTION1", "ACTION6"],
+                board_context=None,
+                last_action=None,
+            )
+
+            self.assertEqual(bundle["trained_prior_bucket"], {"ACTION6": 11, "ACTION1": 8})
+            self.assertEqual(bundle["recommended_actions"][0], "ACTION6")
+
+    def test_load_memory_bundle_from_stores_trained_db_same_as_hot_does_not_double_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hot_db_path = Path(tmpdir) / "shared.sqlite3"
+            initialize_memory_schema(hot_db_path)
+            upsert_training_counts(
+                hot_db_path,
+                [
+                    {
+                        "scope": "state",
+                        "game_id": "ls20",
+                        "state": "ACTIVE",
+                        "action_name": "ACTION1",
+                        "count": 12,
+                    }
+                ],
+            )
+
+            bundle = load_memory_bundle_from_stores(
+                hot_db_path=hot_db_path,
+                archive_db_path=None,
+                trained_db_path=hot_db_path,
+                game_id="ls20",
+                state="ACTIVE",
+                frame_signature="sig-fresh",
+                subgoal=None,
+                legal_actions=["ACTION1", "ACTION2"],
+                board_context=None,
+                last_action=None,
+            )
+
+            self.assertEqual(bundle["trained_prior_bucket"], {"ACTION1": 12})
+            self.assertEqual(len(bundle["trained_prior_bucket"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

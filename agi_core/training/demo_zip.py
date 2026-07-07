@@ -27,6 +27,7 @@ from agi_core.storage import (
     initialize_memory_schema,
     record_transitions,
     upsert_abstract_memory_rows,
+    upsert_board_policy_params,
     upsert_metadata,
     upsert_training_counts,
 )
@@ -240,6 +241,8 @@ def build_action_prior_artifact(
         record_transitions(destination, memory_records)
         if build_abstractions:
             upsert_abstract_memory_rows(destination, abstract_rows)
+        policy_rows = _extract_board_policy_params(artifact["games"])
+        upsert_board_policy_params(destination, policy_rows)
         upsert_metadata(
             destination,
             {
@@ -1066,6 +1069,126 @@ def _abstract_lesson_text(
 ) -> str:
     motif_text = ", ".join(motif_tags[:4]) if motif_tags else "generic-board"
     return f"{action_name} transfers for {subgoal or 'current-subgoal'} under {motif_text}"
+
+
+def _infer_board_type(game_actions: dict[str, int]) -> str:
+    total = sum(game_actions.values())
+    if total <= 0:
+        return "unknown"
+    switch_ratio = game_actions.get("ACTION5", 0) / total
+    click_ratio = game_actions.get("ACTION6", 0) / total
+    up_ratio = game_actions.get("ACTION1", 0) / total
+    vert = game_actions.get("ACTION1", 0) + game_actions.get("ACTION2", 0)
+    horiz = game_actions.get("ACTION3", 0) + game_actions.get("ACTION4", 0)
+    total_move = vert + horiz
+    if switch_ratio > 0.12 or click_ratio > 0.15:
+        return "puzzle"
+    if up_ratio > 0.15 and total_move > 0:
+        return "platformer"
+    if vert > 0 and horiz > 0 and total_move > 0:
+        vert_pct = vert / total_move
+        if 0.3 < vert_pct < 0.7:
+            return "puzzle"
+    return "unknown"
+
+
+def _extract_board_policy_params(
+    artifact_games: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    board_type_actions: dict[str, dict[str, int]] = {}
+    board_type_games: dict[str, set[str]] = {}
+    for game_id, game_entry in artifact_games.items():
+        actions = game_entry.get("actions", {})
+        bt = _infer_board_type(actions)
+        board_type_games.setdefault(bt, set()).add(game_id)
+        target = board_type_actions.setdefault(bt, {})
+        for action_name, count in actions.items():
+            target[action_name] = target.get(action_name, 0) + int(count or 0)
+    rows: list[dict[str, Any]] = []
+    for board_type, action_counts in board_type_actions.items():
+        total = sum(action_counts.values())
+        if total <= 0:
+            continue
+        vert = action_counts.get("ACTION1", 0) + action_counts.get("ACTION2", 0)
+        horiz = action_counts.get("ACTION3", 0) + action_counts.get("ACTION4", 0)
+        sorted_actions = sorted(
+            action_counts.items(), key=lambda x: -x[1]
+        )
+        top3 = {a for a, _ in sorted_actions[:3]}
+        sample_count = len(board_type_games.get(board_type, set()))
+
+        # explore-bias
+        if vert > horiz:
+            rows.append({"board_type": board_type, "param_name": "explore-bias", "param_value": "vertical", "confidence": 0.7, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "explore-bias", "param_value": "horizontal", "confidence": 0.7, "sample_count": sample_count})
+
+        # interact-range
+        action6_pct = action_counts.get("ACTION6", 0) / total
+        if action6_pct > 0.08:
+            rows.append({"board_type": board_type, "param_name": "interact-range", "param_value": "4", "confidence": 0.65, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "interact-range", "param_value": "2", "confidence": 0.65, "sample_count": sample_count})
+
+        # switch-urgency
+        if "ACTION5" in top3:
+            rows.append({"board_type": board_type, "param_name": "switch-urgency", "param_value": "high", "confidence": 0.7, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "switch-urgency", "param_value": "low", "confidence": 0.7, "sample_count": sample_count})
+
+        # path-preference
+        if horiz > vert * 2:
+            rows.append({"board_type": board_type, "param_name": "path-preference", "param_value": "direct", "confidence": 0.6, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "path-preference", "param_value": "safe", "confidence": 0.6, "sample_count": sample_count})
+
+        # move-bias
+        move_actions = {
+            "right": action_counts.get("ACTION4", 0),
+            "down": action_counts.get("ACTION2", 0),
+            "left": action_counts.get("ACTION3", 0),
+            "up": action_counts.get("ACTION1", 0),
+        }
+        if move_actions:
+            dominant_dir = max(move_actions, key=move_actions.get)
+            if move_actions[dominant_dir] > 0:
+                rows.append({"board_type": board_type, "param_name": "move-bias", "param_value": dominant_dir, "confidence": 0.65, "sample_count": sample_count})
+
+        # beam-priority
+        switch6_combo = action_counts.get("ACTION5", 0) + action_counts.get("ACTION6", 0)
+        if switch6_combo > total * 0.2:
+            rows.append({"board_type": board_type, "param_name": "beam-priority", "param_value": "high", "confidence": 0.6, "sample_count": sample_count})
+        elif switch6_combo > total * 0.1:
+            rows.append({"board_type": board_type, "param_name": "beam-priority", "param_value": "medium", "confidence": 0.6, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "beam-priority", "param_value": "low", "confidence": 0.6, "sample_count": sample_count})
+
+        # entity-count
+        if action_counts.get("ACTION5", 0) > 0:
+            rows.append({"board_type": board_type, "param_name": "entity-count", "param_value": "multiple", "confidence": 0.7, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "entity-count", "param_value": "single", "confidence": 0.7, "sample_count": sample_count})
+
+        # goal-proximity
+        if "ACTION6" in top3:
+            rows.append({"board_type": board_type, "param_name": "goal-proximity", "param_value": "1", "confidence": 0.6, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "goal-proximity", "param_value": "3", "confidence": 0.6, "sample_count": sample_count})
+
+        # retry-tolerance
+        switch_pct = action_counts.get("ACTION5", 0) / total
+        if switch_pct > 0.1:
+            rows.append({"board_type": board_type, "param_name": "retry-tolerance", "param_value": "2", "confidence": 0.6, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "retry-tolerance", "param_value": "5", "confidence": 0.6, "sample_count": sample_count})
+
+        # stagnation-threshold
+        if switch_pct > 0.1:
+            rows.append({"board_type": board_type, "param_name": "stagnation-threshold", "param_value": "2", "confidence": 0.6, "sample_count": sample_count})
+        else:
+            rows.append({"board_type": board_type, "param_name": "stagnation-threshold", "param_value": "5", "confidence": 0.6, "sample_count": sample_count})
+
+    return rows
 
 
 def _count_rows_for_game(

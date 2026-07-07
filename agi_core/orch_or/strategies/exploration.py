@@ -48,7 +48,7 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
             for d in candidates:
                 dvx, dvy = _direction_vec(d)
                 nx, ny = px + dvx, py + dvy
-                if not game_model.walkable or (nx, ny) in game_model.walkable:
+                if not move_walkable or (nx, ny) in move_walkable:
                     steps.append(_explore_step(d))
                     return steps
             # Direct route blocked — use A* with an expanded walkable set
@@ -79,11 +79,11 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                     _beam_priority = str(bp_rows[0].get("priority", "medium"))
             except Exception:
                 pass
-            if features.player_color not in non_beam and _beam_priority != "low":
-                # If hyperon has a very high confidence direction, try it first
-                # before falling through to beam navigation.
+            if features.player_color not in non_beam and _beam_priority != "low" and _is_beam_controller(game_model):
+                # If hyperon has a very high confidence direction, try it first.
                 _AP_TO_DIR = {"ACTION1": "up", "ACTION2": "down", "ACTION3": "left", "ACTION4": "right"}
                 ap = ctx.get("action_priors", {})
+                _failed = ctx.get("failed_directions", set())
                 hyperon_best_dir = max(((d, ap.get(a, 0.0)) for a, d in _AP_TO_DIR.items()), key=lambda x: x[1], default=(None, 0.0))
                 if hyperon_best_dir[0] and hyperon_best_dir[1] > 0.8:
                     dvx, dvy = _direction_vec(hyperon_best_dir[0])
@@ -92,14 +92,30 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                         steps.append(_explore_step(hyperon_best_dir[0]))
                         return steps
                 mirror_dir = _mirror_axis_direction(game_model)
-                if mirror_dir is not None:
+                if mirror_dir is None:
+                    switch_count = int(ctx.get("switch_attempted", 0))
+                    if (switch_count < 2
+                            and features.player_color >= 0
+                            and features.player_color not in non_beam
+                            and any(
+                                c.dominant_color != features.beam_color
+                                and c.dominant_color != features.player_color
+                                and c.dominant_color != features.background_color
+                                and c.dominant_color != features.goal_color
+                                and not c.touches_border
+                                for c in game_model.components
+                            )):
+                        steps.append(_switch_step())
+                        return steps
+                    return steps
+                if mirror_dir not in _failed:
                     dx, dy_ = _direction_vec(mirror_dir)
                     nx, ny = px + dx, py + dy_
                     if not game_model.walkable or (nx, ny) in game_model.walkable:
                         steps.append(_explore_step(mirror_dir))
                         return steps
                 gradient_dir = _beam_gradient_step(game_model, context)
-                if gradient_dir is not None:
+                if gradient_dir is not None and gradient_dir not in _failed:
                     dx, dy_ = _direction_vec(gradient_dir)
                     nx, ny = px + dx, py + dy_
                     if not game_model.walkable or (nx, ny) in game_model.walkable:
@@ -116,58 +132,16 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                         dir = "down" if dy > 0 else "up"
                     if features.mirror_axis >= 0:
                         dir = {"left": "right", "right": "left", "up": "up", "down": "down"}.get(dir, dir)
-                    nx, ny = (px + (1 if dx > 0 else -1), py) if abs(dx) > abs(dy) else (px, py + (1 if dy > 0 else -1))
-                    if not game_model.walkable or (nx, ny) in game_model.walkable:
-                        steps.append(_explore_step(dir))
-                        return steps
-                # Board-type explore bias overrides the default search order.
-                _explore_bias = "vertical" if features.has_beam else "horizontal"
-                try:
-                    board_bias_rows = ctx.get("board_explore_bias", [])
-                    if board_bias_rows:
-                        _explore_bias = str(board_bias_rows[0].get("axis", _explore_bias))
-                except Exception:
-                    pass
-                # Gravity: when enabled, prefer down (gravity pull).
-                _gravity = "false"
-                try:
-                    grav_rows = ctx.get("board_gravity_enabled", [])
-                    if grav_rows:
-                        _gravity = str(grav_rows[0].get("gravity", "false"))
-                except Exception:
-                    pass
-                # Nav style: "grid" prefers exact cardinal steps.
-                _nav_style = "free"
-                try:
-                    nav_rows = ctx.get("board_nav_style", [])
-                    if nav_rows:
-                        _nav_style = str(nav_rows[0].get("style", "free"))
-                except Exception:
-                    pass
-                # Horizontal scroll: when true, prefer horizontal exploration.
-                _scroll = "false"
-                try:
-                    scroll_rows = ctx.get("board_horizontal_scroll", [])
-                    if scroll_rows:
-                        _scroll = str(scroll_rows[0].get("scroll", "false"))
-                except Exception:
-                    pass
-                if _explore_bias == "vertical" and _scroll != "true":
-                    search_dirs = ["down", "up", "right", "left"]
-                elif _gravity == "true":
-                    search_dirs = ["down", "up", "right", "left"]
-                elif _scroll == "true":
-                    search_dirs = ["right", "left", "down", "up"]
-                else:
-                    search_dirs = ["right", "left", "down", "up"]
-                search_dirs = _bias_candidates_by_priors(search_dirs, ctx.get("action_priors", {}))
-                for d in search_dirs:
-                    dvx, dvy = _direction_vec(d)
-                    nx, ny = px + dvx, py + dvy
-                    if not game_model.walkable or (nx, ny) in game_model.walkable:
-                        steps.append(_explore_step(d))
-                        return steps
-                # Last resort: try the stable goal when beam nav gives nothing.
+                    if dir in _failed:
+                        dir = None
+                    if dir is not None:
+                        nx, ny = (px + (1 if dx > 0 else -1), py) if abs(dx) > abs(dy) else (px, py + (1 if dy > 0 else -1))
+                        if not game_model.walkable or (nx, ny) in game_model.walkable:
+                            steps.append(_explore_step(dir))
+                            return steps
+                # Try stable-goal navigation before random search so
+                # non-beam-controlling entities (shape piece) move
+                # toward the goal instead of wandering randomly.
                 if stable_goal is not None and features.goal_detectable:
                     gx, gy = stable_goal
                     candidates = []
@@ -179,16 +153,42 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                         candidates.append("up")
                     elif gy > py:
                         candidates.append("down")
+                    candidates = [d for d in candidates if d not in _failed]
                     for d in candidates:
                         dvx, dvy = _direction_vec(d)
                         nx, ny = px + dvx, py + dvy
-                        if not game_model.walkable or (nx, ny) in game_model.walkable:
+                        if not move_walkable or (nx, ny) in move_walkable:
                             steps.append(_explore_step(d))
                             return steps
+                for d in _bias_candidates_by_priors(
+                    ["right", "left", "down", "up"], ctx.get("action_priors", {})
+                ):
+                    if d in _failed:
+                        continue
+                    dvx, dvy = _direction_vec(d)
+                    nx, ny = px + dvx, py + dvy
+                    if not game_model.walkable or (nx, ny) in game_model.walkable:
+                        steps.append(_explore_step(d))
+                        return steps
+                # All beam-nav options exhausted — switch to another entity if
+                # one is available on the board (but don't exceed 2 switches).
+                switch_count = int(ctx.get("switch_attempted", 0))
+                if (switch_count < 2
+                        and features.player_color >= 0
+                        and features.player_color not in non_beam
+                        and any(
+                            c.dominant_color != features.beam_color
+                            and c.dominant_color != features.player_color
+                            and c.dominant_color != features.background_color
+                            and c.dominant_color != features.goal_color
+                            and not c.touches_border
+                            for c in game_model.components
+                        )):
+                    steps.append(_switch_step())
+                    return steps
                 return steps
         # Direct navigation toward the nearest goal when the current entity does
         # not control the beam (e.g. a secondary sprite in a puzzle level).
-        non_beam_set = (context or {}).get("non_beam_controllers", set())
         if features.goal_detectable and game_model.goal_positions and (features.board_type == "platformer" or (features.board_type == "puzzle" and features.player_color in non_beam_set)):
             # Board-type goal proximity: within this distance, consider the
             # goal reached and stop navigating.
@@ -230,7 +230,7 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
             priors = (context or {}).get("action_priors", {})
             candidates = _bias_candidates_by_priors(candidates, priors)
             failed = (context or {}).get("failed_directions", set())
-            candidates = [d for d in candidates if d not in failed] + [d for d in candidates if d in failed]
+            candidates = [d for d in candidates if d not in failed]
             for d in candidates:
                 dvx, dvy = _direction_vec(d)
                 nx, ny = px + dvx, py + dvy
@@ -265,7 +265,10 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                 search_dirs = ["down", "up", "right", "left"]
             else:
                 search_dirs = ["right", "left", "down", "up"]
+            _sch_failed = (context or {}).get("failed_directions", set())
             for d in search_dirs:
+                if d in _sch_failed:
+                    continue
                 dvx, dvy = _direction_vec(d)
                 nx, ny = px + dvx, py + dvy
                 if (nx, ny) in game_model.walkable:
@@ -281,6 +284,16 @@ def _perpendicular(d: str) -> list[str]:
 
 def _direction_vec(d: str) -> tuple[int, int]:
     return {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}.get(d, (0, 0))
+
+
+def _is_beam_controller(game_model: GameModel) -> bool:
+    """True when the player entity is a beam-controller (adjacent to beam)."""
+    features = game_model.features
+    if not features.has_beam or not features.beam_positions or game_model.player_pos is None:
+        return False
+    px, py = game_model.player_pos
+    return any(abs(bx - px) <= 6 and abs(by - py) <= 6
+               for bx, by in features.beam_positions)
 
 
 def _mirror_axis_direction(game_model: GameModel) -> str | None:
@@ -326,7 +339,8 @@ def _mirror_axis_direction(game_model: GameModel) -> str | None:
         beam_max_y = max(y for _, y in all_beam_cells)
         goal_min_y = min(g_y for _, g_y in game_model.goal_positions)
         goal_max_y = max(g_y for _, g_y in game_model.goal_positions)
-        if beam_max_y < goal_min_y or beam_min_y > goal_max_y:
+        beam_covers_y = beam_min_y <= goal_min_y and beam_max_y >= goal_max_y
+        if not beam_covers_y:
             return toward_y
         if toward_x and features.mirror_axis >= 0:
             reflection_x = 2 * features.mirror_axis - px
@@ -335,7 +349,7 @@ def _mirror_axis_direction(game_model: GameModel) -> str | None:
                 return toward_y
         if toward_x:
             return toward_x
-        return toward_y
+        return None  # beam already covers the goal y-range
     if toward_x:
         return toward_x
     return None
@@ -421,4 +435,14 @@ def _explore_step(direction: str) -> PlanStep:
         source="exploration_strategy",
         preconditions=frozenset(),
         expected_effect=f"explore_{direction}",
+    )
+
+
+def _switch_step() -> PlanStep:
+    return PlanStep(
+        action="switch",
+        params={},
+        source="exploration_strategy",
+        preconditions=frozenset(),
+        expected_effect="switch_entity",
     )

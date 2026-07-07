@@ -34,10 +34,6 @@ class Executive:
         context.llm_memory_bundle = context.memory_bundle
         context.llm_subgoal_hint = None
         context.contextual_memory_bundles = {}
-        pre_replan_opening = self._pre_replan_opening_fast_path(context)
-        if pre_replan_opening is not None:
-            context.memory.note_decision(pre_replan_opening)
-            return pre_replan_opening
         pending_reopen = context.memory.pending_score_floor_reopen(context.observation)
         if pending_reopen is not None and "RESET" in context.observation.legal_actions:
             context.score_floor_debug = dict(pending_reopen.get("score_floor_debug") or {})
@@ -52,17 +48,20 @@ class Executive:
             )
             context.memory.note_decision(decision)
             return decision
-        context.probe_dead_end_replan = self._should_force_probe_dead_end_llm_replan(context)
-        context.force_llm_replan = self._should_force_emergency_llm_replan(context)
+        context.probe_dead_end_replan = (
+            self._should_force_probe_dead_end_llm_replan(context)
+            if self.llm is not None else False
+        )
+        context.force_llm_replan = (
+            self._should_force_emergency_llm_replan(context)
+            if self.llm is not None else False
+        )
         replan_mode = self._should_enter_replan_mode(context)
         context.replan_mode = replan_mode
         reactive_proposals = [] if replan_mode else self.reactive.propose(context)
-        opening_fast_path = self._opening_fast_path(context, reactive_proposals)
-        if opening_fast_path is not None:
-            context.memory.note_decision(opening_fast_path)
-            return opening_fast_path
         symbolic_proposals = self.symbolic.propose(context)
-        self._refresh_llm_memory_bundle(context, symbolic_proposals, reactive_proposals)
+        if self.llm is not None:
+            self._refresh_llm_memory_bundle(context, symbolic_proposals, reactive_proposals)
         proposals = list(reactive_proposals) + list(symbolic_proposals)
         score_floor_fallback_cooldown = context.memory.recent_score_floor_fallback(
             context.observation
@@ -75,18 +74,19 @@ class Executive:
             context,
             symbolic_proposals,
         )
-        if context.force_llm_replan and not context.llm_subgoal_hint:
-            context.llm_subgoal_hint = "replan"
-        if (
-            (
-                replan_mode
-                or context.force_llm_replan
-                or best_symbolic_confidence < context.config.symbolic_confidence_gate
-            )
-            and not score_floor_fallback_cooldown
-            and not skip_early_probe_llm
-        ):
-            proposals.extend(self.llm.propose(context))
+        if self.llm is not None:
+            if context.force_llm_replan and not context.llm_subgoal_hint:
+                context.llm_subgoal_hint = "replan"
+            if (
+                (
+                    replan_mode
+                    or context.force_llm_replan
+                    or best_symbolic_confidence < context.config.symbolic_confidence_gate
+                )
+                and not score_floor_fallback_cooldown
+                and not skip_early_probe_llm
+            ):
+                proposals.extend(self.llm.propose(context))
         context.hyperon.update_proposals(proposals)
         rescored = self.critic.rescore(context, proposals)
         if self._all_legal_proposals_are_score_floor(context, rescored):
@@ -134,69 +134,6 @@ class Executive:
         fallback.proposals = rescored
         context.memory.note_decision(fallback)
         return fallback
-
-    def _pre_replan_opening_fast_path(
-        self,
-        context: ExecutiveContext,
-    ) -> ActionDecision | None:
-        opening_method = getattr(self.reactive, "_ar25_level0_opening_move", None)
-        if not callable(opening_method):
-            return None
-        proposal = opening_method(context)
-        if proposal is None:
-            return None
-        metadata = self._finalize_decision_metadata(
-            context,
-            proposal.action_name,
-            dict(getattr(proposal, "metadata", {}) or {}),
-        )
-        subgoal = self._finalize_decision_subgoal(
-            context,
-            proposal.action_name,
-            getattr(proposal, "subgoal", None),
-        )
-        return ActionDecision(
-            action_name=proposal.action_name,
-            source=proposal.source,
-            confidence=float(proposal.confidence),
-            reason=str(proposal.reason),
-            subgoal=subgoal,
-            metadata=metadata,
-            proposals=[proposal],
-        )
-
-    def _opening_fast_path(
-        self,
-        context: ExecutiveContext,
-        reactive_proposals: list,
-    ) -> ActionDecision | None:
-        if not reactive_proposals:
-            return None
-        proposal = reactive_proposals[0]
-        if (
-            str(getattr(context.observation, "game_id", "") or "").split("-")[0] != "ar25"
-            or str(getattr(proposal, "reason", "") or "") != "ar25 mirrored opening alignment"
-        ):
-            return None
-        metadata = self._finalize_decision_metadata(
-            context,
-            proposal.action_name,
-            dict(getattr(proposal, "metadata", {}) or {}),
-        )
-        subgoal = self._finalize_decision_subgoal(
-            context,
-            proposal.action_name,
-            getattr(proposal, "subgoal", None),
-        )
-        return ActionDecision(
-            action_name=proposal.action_name,
-            source=proposal.source,
-            confidence=float(proposal.confidence),
-            reason=str(proposal.reason),
-            subgoal=subgoal,
-            metadata=metadata,
-            proposals=list(reactive_proposals),
-        )
 
     def _all_legal_proposals_are_score_floor(
         self,
@@ -620,7 +557,7 @@ class Executive:
         context: ExecutiveContext,
     ) -> ActionDecision | None:
         llm_limit = context.config.llm_max_calls_per_episode
-        if context.memory.llm_calls < (llm_limit + 1):
+        if self.llm is None or context.memory.llm_calls < (llm_limit + 1):
             return None
         if not hasattr(self.llm, "memory_escape_proposals"):
             return None
@@ -732,7 +669,7 @@ class Executive:
         candidate_actions = self._probe_dead_end_escape_actions(context)
         if not candidate_actions:
             return None
-        if hasattr(self.llm, "memory_escape_proposals"):
+        if self.llm is not None and hasattr(self.llm, "memory_escape_proposals"):
             proposals = self.llm.memory_escape_proposals(
                 context,
                 "probe-dead-end memory escape",

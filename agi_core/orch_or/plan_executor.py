@@ -16,6 +16,7 @@ def plan_step_to_proposal(
     action_name = _resolve_action_name(step, game_model)
     if action_name is None:
         return None
+    step_number = plan.current_index + 1
     return ActionProposal(
         action_name=action_name,
         source=f"orch_or:{plan.objective_id}:{step.source}",
@@ -23,7 +24,7 @@ def plan_step_to_proposal(
         reason=step.expected_effect,
         subgoal=plan.objective_id,
         metadata={
-            "step_index": plan.current_index,
+            "step_index": step_number,
             "total_steps": len(plan.steps),
             "plan_objective": plan.objective_id,
             "plan_attempt": plan.attempt_count,

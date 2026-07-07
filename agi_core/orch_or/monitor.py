@@ -26,7 +26,7 @@ def check_progress(
         if moved:
             return ADVANCE
         if step.retry_count >= step.tolerance:
-            if _player_on_color_0(current_model):
+            if _player_on_color_0(current_model) and _count_entities(current_model) >= 2:
                 return SWITCH_ENTITY
             if not _plan_has_switch(plan):
                 return SWITCH_ENTITY
@@ -49,6 +49,14 @@ def check_progress(
 
 def _plan_has_switch(plan: Plan) -> bool:
     return any(s.action == "switch" for s in plan.steps)
+
+
+def _count_entities(gm: GameModel) -> int:
+    colors = set()
+    for c in gm.components:
+        if not c.touches_border and c.dominant_color not in (gm.features.background_color, gm.features.beam_color):
+            colors.add(c.dominant_color)
+    return len(colors)
 
 
 def _player_on_color_0(gm: GameModel) -> bool:

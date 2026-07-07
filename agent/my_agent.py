@@ -71,14 +71,14 @@ class MyAgent(Agent):
             skip_probe=config.hyperon_skip_probe,
             probe_timeout_seconds=config.hyperon_probe_timeout_seconds,
         )
-        llm_backend = build_llm_backend(config)
+        llm_backend = build_llm_backend(config) if config.llm_enabled else None
         if config.planner_enabled and config.planner_parallel:
             ThreadPoolManager.set_max_workers(config.planner_workers)
         base_executive = Executive(
             config=config,
             reactive=ReactiveSpecialist(),
             symbolic=SymbolicSpecialist(),
-            llm=LLMSpecialist(),
+            llm=LLMSpecialist() if config.llm_enabled else None,
             critic=ProposalCritic(),
         )
         executive = (

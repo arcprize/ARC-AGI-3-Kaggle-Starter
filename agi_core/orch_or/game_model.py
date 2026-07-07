@@ -20,7 +20,7 @@ class GameFeatures:
     has_click_interaction: bool = False
     has_breakable_blocks: bool = False
     has_collectibles: bool = False
-    movement_axes: set[str] = field(default_factory=lambda: {"x"})
+    movement_axes: set[str] = field(default_factory=lambda: {"x", "y"})
     player_detectable: bool = False
     goal_detectable: bool = False
     board_type: str = "unknown"
@@ -86,6 +86,13 @@ RETRY: MonitorStatus = "retry"
 REPLAN: MonitorStatus = "replan"
 ESCALATE: MonitorStatus = "escalate"
 SWITCH_ENTITY: MonitorStatus = "switch_entity"
+
+DIR_TO_ACTION: dict[str, str] = {
+    "up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4",
+}
+ACTION_TO_DIR: dict[str, str] = {
+    "ACTION1": "up", "ACTION2": "down", "ACTION3": "left", "ACTION4": "right",
+}
 
 
 def serialize_plan(plan: Plan) -> dict[str, Any]:

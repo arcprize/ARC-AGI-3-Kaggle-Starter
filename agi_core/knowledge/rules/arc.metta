@@ -24,14 +24,6 @@
 (= (symbolic-prior ACTION5) 0.56)
 (= (symbolic-prior ACTION6) 0.52)
 
-; Game-specific action-prior overrides.
-(= (game-prior ar25 ACTION1) 0.55)
-(= (game-prior ar25 ACTION2) 0.78)
-(= (game-prior ar25 ACTION3) 0.60)
-(= (game-prior ar25 ACTION4) 0.72)
-(= (game-prior ar25 ACTION5) 0.45)
-(= (game-prior ar25 ACTION6) 0.30)
-
 ; Board-type-specific action-prior overrides.
 (= (board-prior puzzle ACTION1) 0.30)
 (= (board-prior puzzle ACTION2) 0.35)
@@ -58,28 +50,6 @@
 (= (board-stagnation-threshold puzzle) 2)
 (= (board-stagnation-threshold platformer) 5)
 (= (board-stagnation-threshold unknown) 3)
-
-; Game-specific reset overrides — some games need more aggressive resets.
-(= (game-reset-needed GAME_OVER ar25) True)
-(= (game-reset-needed NOT_PLAYED ar25) True)
-(= (game-reset-needed ACTIVE ar25) False)
-
-; Beam navigation strategy hints for puzzle games with mirrors.
-; The direction the mirror should move to aim the beam at the goal.
-; level=N means the Nth level within the game.
-(= (beam-strategy ar25 1 down) 0.75)
-(= (beam-strategy ar25 1 right) 0.65)
-(= (beam-strategy ar25 1 up) 0.30)
-(= (beam-strategy ar25 1 left) 0.30)
-(= (beam-strategy ar25 2 right) 0.60)
-(= (beam-strategy ar25 2 down) 0.55)
-(= (beam-strategy ar25 2 up) 0.45)
-(= (beam-strategy ar25 2 left) 0.40)
-
-; Subgoal overrides per game — what ORCH-OR should focus on.
-(= (game-subgoal ar25 1) navigate-to-goal)
-(= (game-subgoal ar25 2) explore-board)
-(= (game-subgoal ar25 3) explore-board)
 
 ; Board-type reset thresholds — how many stagnation steps before RESET.
 (= (board-reset-threshold puzzle) 8)

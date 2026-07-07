@@ -9,7 +9,9 @@ from pathlib import Path
 from agi_core.storage import (
     initialize_schema,
     load_best_prior_bucket,
+    load_board_policy_params,
     load_game_summary,
+    upsert_board_policy_params,
     upsert_metadata,
     upsert_training_counts,
 )
@@ -40,6 +42,7 @@ class PriorsSqliteTests(unittest.TestCase):
             self.assertIn("state_action_priors", tables)
             self.assertIn("frame_action_priors", tables)
             self.assertIn("subgoal_action_priors", tables)
+            self.assertIn("board_policy_params", tables)
             self.assertIn("idx_state_lookup", indexes)
             self.assertIn("idx_frame_lookup", indexes)
             self.assertIn("idx_subgoal_lookup", indexes)
@@ -205,6 +208,58 @@ class PriorsSqliteTests(unittest.TestCase):
                 db_path, "ls20", "ACTIVE", "sig-1", ["ACTION1", "ACTION2"]
             )
             self.assertEqual(bucket, {})
+
+    def test_upsert_and_load_board_policy_params(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "priors.sqlite3"
+            initialize_schema(db_path)
+            upsert_board_policy_params(
+                db_path,
+                [
+                    {"board_type": "puzzle", "param_name": "explore-bias", "param_value": "vertical", "confidence": 0.7, "sample_count": 5},
+                    {"board_type": "puzzle", "param_name": "interact-range", "param_value": "4", "confidence": 0.65, "sample_count": 5},
+                    {"board_type": "platformer", "param_name": "explore-bias", "param_value": "horizontal", "confidence": 0.7, "sample_count": 3},
+                ],
+            )
+            puzzle = load_board_policy_params(db_path, "puzzle")
+            platformer = load_board_policy_params(db_path, "platformer")
+            unknown = load_board_policy_params(db_path, "unknown")
+            self.assertEqual(puzzle.get("explore-bias"), "vertical")
+            self.assertEqual(puzzle.get("interact-range"), "4")
+            self.assertEqual(len(puzzle), 2)
+            self.assertEqual(platformer.get("explore-bias"), "horizontal")
+            self.assertEqual(len(platformer), 1)
+            self.assertEqual(unknown, {})
+
+    def test_upsert_board_policy_params_updates_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "priors.sqlite3"
+            initialize_schema(db_path)
+            upsert_board_policy_params(
+                db_path,
+                [{"board_type": "puzzle", "param_name": "explore-bias", "param_value": "vertical", "confidence": 0.7, "sample_count": 3}],
+            )
+            upsert_board_policy_params(
+                db_path,
+                [{"board_type": "puzzle", "param_name": "explore-bias", "param_value": "horizontal", "confidence": 0.8, "sample_count": 2}],
+            )
+            puzzle = load_board_policy_params(db_path, "puzzle")
+            self.assertEqual(puzzle.get("explore-bias"), "horizontal")
+            self.assertEqual(len(puzzle), 1)
+
+    def test_load_board_policy_params_missing_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "missing.sqlite3"
+            result = load_board_policy_params(db_path, "puzzle")
+            self.assertEqual(result, {})
+
+    def test_upsert_board_policy_params_empty_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "priors.sqlite3"
+            initialize_schema(db_path)
+            upsert_board_policy_params(db_path, [])
+            result = load_board_policy_params(db_path, "puzzle")
+            self.assertEqual(result, {})
 
 
 if __name__ == "__main__":

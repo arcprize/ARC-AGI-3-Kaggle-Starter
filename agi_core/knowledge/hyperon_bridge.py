@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from agi_core.storage import (
     import_legacy_learning_json,
     initialize_memory_schema,
     load_best_prior_bucket,
+    load_board_policy_params,
     load_memory_bundle,
     load_memory_bundle_from_stores,
     record_transition as persist_transition,
@@ -32,6 +34,7 @@ from agi_core.storage.memory_sqlite import (
 )
 from agi_core.types import ActionProposal, EpisodeRecord, GoalState, MemoryBundle, Observation
 
+logger = logging.getLogger(__name__)
 
 class HyperonBridge:
     """Defensive Hyperon wrapper with a deterministic shadow fact store."""
@@ -85,8 +88,10 @@ class HyperonBridge:
         self._last_observation_step_by_game: dict[str, int] = {}
         self._last_observation_state_by_game: dict[str, str] = {}
         self._current_memory_bundle = MemoryBundle()
+        self._board_policy_params_cache: dict[str, dict[str, str]] | None = None
         self._rules_loaded = False
         self._last_fact_program: str | None = None
+        self._puzzle_system: Any = None
         self._initialize_memory_store()
 
     def bind_game(self, game_id: str) -> None:
@@ -200,10 +205,17 @@ class HyperonBridge:
             self._memory_error = repr(exc)
 
     def _flush_unpersisted_records(self) -> None:
-        if self.memory_db_path is None:
+        if self.memory_db_path is None and self.trained_priors_db_path is None:
             return
         for pending_key, pending_record in list(self._unpersisted_records.items()):
-            persist_transition(self.memory_db_path, pending_record)
+            if self.memory_db_path is not None:
+                persist_transition(self.memory_db_path, pending_record)
+            if (self.trained_priors_db_path is not None
+                    and self.trained_priors_db_path != self.memory_db_path):
+                try:
+                    persist_transition(self.trained_priors_db_path, pending_record)
+                except Exception:
+                    logger.debug("failed to persist to trained DB", exc_info=True)
             self._unpersisted_records.pop(pending_key, None)
 
     def update_proposals(self, proposals: list[ActionProposal]) -> None:
@@ -372,7 +384,6 @@ class HyperonBridge:
                 for action_name, value in failure_streaks.items()
             ]
         if query_name == "game-action-priors":
-            game_id = str(episode.get("game_id", "") or "")
             board_type = str(episode.get("board_type", "") or "")
             base = self._action_priors(
                 legal_actions, memory,
@@ -381,15 +392,6 @@ class HyperonBridge:
                 current_subgoal=query_arg,
                 current_frame_signature=str(episode.get("frame_signature", "") or ""),
             )
-            # Override with game-specific priors.
-            _GAME_PRIORS: dict[str, dict[str, float]] = {
-                "ar25": {"ACTION1": 0.55, "ACTION2": 0.78, "ACTION3": 0.60,
-                         "ACTION4": 0.72, "ACTION5": 0.45, "ACTION6": 0.30},
-            }
-            if game_id in _GAME_PRIORS:
-                for action, conf in _GAME_PRIORS[game_id].items():
-                    base = [p for p in base if p.get("action_name") != action]
-                    base.append({"action_name": action, "confidence": conf, "reason": f"game-prior:{game_id}"})
             # Override with board-type-specific priors.
             _BOARD_PRIORS: dict[str, dict[str, float]] = {
                 "puzzle": {"ACTION1": 0.30, "ACTION2": 0.35, "ACTION3": 0.30,
@@ -404,7 +406,10 @@ class HyperonBridge:
             return base
         if query_name == "game-goal-hints":
             board_type = str(episode.get("board_type", "") or "unknown")
-            # Board-type-specific goal hints.
+            trained = self._load_board_policy_overrides(board_type).get("goal-hint")
+            if trained is not None:
+                return [{"subgoal": str(trained), "confidence": 0.75,
+                         "reason": f"trained-goal-hint:{board_type}"}]
             _BOARD_GOAL_HINTS: dict[str, str] = {
                 "puzzle": "explore-board",
                 "platformer": "navigate-to-goal",
@@ -412,127 +417,199 @@ class HyperonBridge:
             if board_type in _BOARD_GOAL_HINTS:
                 return [{"subgoal": _BOARD_GOAL_HINTS[board_type], "confidence": 0.75,
                          "reason": f"board-goal-hint:{board_type}"}]
-            # Fall back to the standard goal-hints logic.
             return self._run_shadow_rules("goal-hints")
         if query_name == "game-stagnation":
             board_type = str(episode.get("board_type", "") or "unknown")
             stagnation_steps = int(memory.get("stagnation_steps", 0) or 0)
-            _BOARD_STAGNATION_THRESHOLD: dict[str, int] = {
-                "puzzle": 2,
-                "platformer": 5,
-                "unknown": 3,
-            }
-            threshold = _BOARD_STAGNATION_THRESHOLD.get(board_type, 3)
+            trained = self._load_board_policy_overrides(board_type).get("stagnation-threshold")
+            if trained is not None:
+                threshold = int(trained)
+            else:
+                _BOARD_STAGNATION_THRESHOLD: dict[str, int] = {
+                    "puzzle": 2,
+                    "platformer": 5,
+                    "unknown": 3,
+                }
+                threshold = _BOARD_STAGNATION_THRESHOLD.get(board_type, 3)
             if stagnation_steps >= threshold:
                 return [{"flag": "stagnation", "confidence": 0.74,
                          "reason": f"board-stagnation:{board_type}"}]
             return []
         if query_name == "game-reset-needed":
-            game_id = str(episode.get("game_id", "") or "")
-            state = str(episode.get("game_state", "") or "")
-            game_id_aliases = {"ar25": "ar25"}
-            # Override reset behavior for specific games.
-            _GAME_RESET_NEEDED: dict[str, set[str]] = {
-                "ar25": {"GAME_OVER", "NOT_PLAYED"},
-            }
-            canonical = game_id_aliases.get(game_id, game_id)
-            if canonical in _GAME_RESET_NEEDED:
-                if state in _GAME_RESET_NEEDED[canonical]:
-                    return [{"action_name": "RESET", "confidence": 0.99,
-                             "reason": f"game-reset:{game_id}:{state}"}]
-                return []
-            # Fall back to standard reset-needed logic.
             return self._run_shadow_rules("reset-needed")
         if query_name == "beam-strategy":
-            game_id = str(episode.get("game_id", "") or "")
-            level = int(episode.get("levels_completed", 0) or 0) + 1
-            # AR25 per-level beam direction preferences.
-            _BEAM_STRATEGY: dict[str, dict[int, list[tuple[str, float]]]] = {
-                "ar25": {
-                    1: [("down", 0.75), ("right", 0.65)],
-                    2: [("right", 0.60), ("down", 0.55)],
-                },
-            }
-            game_levels = _BEAM_STRATEGY.get(game_id, {})
-            if level in game_levels:
-                return [{"direction": d, "confidence": c} for d, c in game_levels[level]]
             return []
         if query_name == "board-reset-threshold":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("reset-threshold")
             _BOARD_RESET: dict[str, int] = {"puzzle": 8, "platformer": 12, "unknown": 6}
-            return [{"threshold": _BOARD_RESET.get(board_type, 6), "board_type": board_type}]
+            value = int(trained) if trained is not None else _BOARD_RESET.get(board_type, 6)
+            return [{"threshold": value, "board_type": board_type}]
         if query_name == "board-explore-bias":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("explore-bias")
             _BOARD_BIAS: dict[str, str] = {"puzzle": "vertical", "platformer": "horizontal", "unknown": "horizontal"}
-            return [{"axis": _BOARD_BIAS.get(board_type, "horizontal"), "board_type": board_type}]
+            value = str(trained) if trained is not None else _BOARD_BIAS.get(board_type, "horizontal")
+            return [{"axis": value, "board_type": board_type}]
         if query_name == "board-interact-range":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("interact-range")
             _BOARD_RANGE: dict[str, int] = {"puzzle": 4, "platformer": 2, "unknown": 3}
-            return [{"range": _BOARD_RANGE.get(board_type, 3), "board_type": board_type}]
+            value = int(trained) if trained is not None else _BOARD_RANGE.get(board_type, 3)
+            return [{"range": value, "board_type": board_type}]
         if query_name == "board-move-bias":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("move-bias")
             _BOARD_MOVE: dict[str, str] = {"puzzle": "down", "platformer": "right", "unknown": "right"}
-            return [{"direction": _BOARD_MOVE.get(board_type, "right"), "board_type": board_type}]
+            value = str(trained) if trained is not None else _BOARD_MOVE.get(board_type, "right")
+            return [{"direction": value, "board_type": board_type}]
         if query_name == "board-beam-priority":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("beam-priority")
             _BOARD_BEAM: dict[str, str] = {"puzzle": "high", "platformer": "low", "unknown": "medium"}
-            return [{"priority": _BOARD_BEAM.get(board_type, "medium"), "board_type": board_type}]
+            value = str(trained) if trained is not None else _BOARD_BEAM.get(board_type, "medium")
+            return [{"priority": value, "board_type": board_type}]
         if query_name == "board-switch-urgency":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("switch-urgency")
             _BOARD_SWITCH: dict[str, str] = {"puzzle": "high", "platformer": "low", "unknown": "medium"}
-            return [{"urgency": _BOARD_SWITCH.get(board_type, "medium"), "board_type": board_type}]
+            value = str(trained) if trained is not None else _BOARD_SWITCH.get(board_type, "medium")
+            return [{"urgency": value, "board_type": board_type}]
         if query_name == "board-path-preference":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("path-preference")
             _BOARD_PATH: dict[str, str] = {"puzzle": "direct", "platformer": "safe", "unknown": "balanced"}
-            return [{"preference": _BOARD_PATH.get(board_type, "balanced"), "board_type": board_type}]
+            value = str(trained) if trained is not None else _BOARD_PATH.get(board_type, "balanced")
+            return [{"preference": value, "board_type": board_type}]
         if query_name == "board-retry-tolerance":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("retry-tolerance")
             _BOARD_RETRY: dict[str, int] = {"puzzle": 2, "platformer": 5, "unknown": 3}
-            return [{"tolerance": _BOARD_RETRY.get(board_type, 3), "board_type": board_type}]
+            value = int(trained) if trained is not None else _BOARD_RETRY.get(board_type, 3)
+            return [{"tolerance": value, "board_type": board_type}]
         if query_name == "board-goal-proximity":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("goal-proximity")
             _BOARD_PROX: dict[str, int] = {"puzzle": 1, "platformer": 3, "unknown": 2}
-            return [{"proximity": _BOARD_PROX.get(board_type, 2), "board_type": board_type}]
+            value = int(trained) if trained is not None else _BOARD_PROX.get(board_type, 2)
+            return [{"proximity": value, "board_type": board_type}]
         if query_name == "board-entity-count":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("entity-count")
             _BOARD_ENT: dict[str, str] = {"puzzle": "multiple", "platformer": "single", "unknown": "single"}
-            return [{"count": _BOARD_ENT.get(board_type, "single"), "board_type": board_type}]
+            value = str(trained) if trained is not None else _BOARD_ENT.get(board_type, "single")
+            return [{"count": value, "board_type": board_type}]
         if query_name == "board-gravity-enabled":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("gravity-enabled")
+            if trained is not None:
+                return [{"gravity": str(trained), "board_type": board_type}]
             _BOARD_GRV: dict[str, str] = {"puzzle": "false", "platformer": "true", "unknown": "false"}
             return [{"gravity": _BOARD_GRV.get(board_type, "false"), "board_type": board_type}]
         if query_name == "board-horizontal-scroll":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("horizontal-scroll")
+            if trained is not None:
+                return [{"scroll": str(trained), "board_type": board_type}]
             _BOARD_SCR: dict[str, str] = {"puzzle": "false", "platformer": "true", "unknown": "false"}
             return [{"scroll": _BOARD_SCR.get(board_type, "false"), "board_type": board_type}]
         if query_name == "board-collision-type":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("collision-type")
+            if trained is not None:
+                return [{"collision": str(trained), "board_type": board_type}]
             _BOARD_COL: dict[str, str] = {"puzzle": "solid", "platformer": "solid", "unknown": "solid"}
             return [{"collision": _BOARD_COL.get(board_type, "solid"), "board_type": board_type}]
         if query_name == "board-exit-type":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("exit-type")
+            if trained is not None:
+                return [{"exit": str(trained), "board_type": board_type}]
             _BOARD_EXT: dict[str, str] = {"puzzle": "action", "platformer": "position", "unknown": "position"}
             return [{"exit": _BOARD_EXT.get(board_type, "position"), "board_type": board_type}]
         if query_name == "board-probe-strategy":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("probe-strategy")
+            if trained is not None:
+                return [{"strategy": str(trained), "board_type": board_type}]
             _BOARD_PROBE: dict[str, str] = {"puzzle": "click", "platformer": "swipe", "unknown": "click"}
             return [{"strategy": _BOARD_PROBE.get(board_type, "click"), "board_type": board_type}]
         if query_name == "board-focus-mode":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("focus-mode")
+            if trained is not None:
+                return [{"mode": str(trained), "board_type": board_type}]
             _BOARD_FOCUS: dict[str, str] = {"puzzle": "multi", "platformer": "single", "unknown": "single"}
             return [{"mode": _BOARD_FOCUS.get(board_type, "single"), "board_type": board_type}]
         if query_name == "board-nav-style":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("nav-style")
+            if trained is not None:
+                return [{"style": str(trained), "board_type": board_type}]
             _BOARD_NAV: dict[str, str] = {"puzzle": "grid", "platformer": "free", "unknown": "free"}
             return [{"style": _BOARD_NAV.get(board_type, "free"), "board_type": board_type}]
         if query_name == "board-danger-detection":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("danger-detection")
+            if trained is not None:
+                return [{"detection": str(trained), "board_type": board_type}]
             _BOARD_DANGER: dict[str, str] = {"puzzle": "ignore", "platformer": "avoid", "unknown": "ignore"}
             return [{"detection": _BOARD_DANGER.get(board_type, "ignore"), "board_type": board_type}]
         if query_name == "board-viewport-style":
             board_type = str(episode.get("board_type", "") or "unknown")
+            trained = self._load_board_policy_overrides(board_type).get("viewport-style")
+            if trained is not None:
+                return [{"style": str(trained), "board_type": board_type}]
             _BOARD_VIEW: dict[str, str] = {"puzzle": "fixed", "platformer": "follow", "unknown": "fixed"}
             return [{"style": _BOARD_VIEW.get(board_type, "fixed"), "board_type": board_type}]
+        if query_name == "beam-solver":
+            try:
+                from agi_core.knowledge.beam_solver import solve_beam_puzzle
+                goals = episode.get("goal_positions", [])
+                beam_cells = episode.get("beam_cells", [])
+                mirror_axis = int(episode.get("mirror_axis", -1))
+                player_pos = episode.get("player_pos")
+                mirror_pos = episode.get("mirror_pos")
+                width = int(episode.get("board_width", 64))
+                height = int(episode.get("board_height", 64))
+                game_id = str(episode.get("game_id", ""))
+                if goals and beam_cells and mirror_axis >= 0:
+                    result = solve_beam_puzzle(
+                        goal_positions=goals,
+                        beam_cells=beam_cells,
+                        mirror_axis=mirror_axis,
+                        player_pos=tuple(player_pos) if player_pos else None,
+                        current_mirror_pos=tuple(mirror_pos) if mirror_pos else None,
+                        width=width, height=height,
+                        memory_db_path=self.memory_db_path,
+                        game_id=game_id,
+                    )
+                    return [{
+                        "mirror_direction": result.get("mirror_direction"),
+                        "best_mirror_x": result.get("best_mirror_x"),
+                        "uncovered_count": len(result.get("uncovered_goals", [])),
+                        "all_coverable": result.get("all_coverable", False),
+                    }]
+            except Exception as exc:
+                logger.debug("beam-solver shadow rule failed: %s", exc)
+            return []
+        if query_name == "puzzle-solver":
+            try:
+                from agi_core.knowledge.puzzle_system import PuzzleSystem
+                if self._puzzle_system is None:
+                    self._puzzle_system = PuzzleSystem(memory_db_path=self.memory_db_path)
+                game_model_data = {
+                    "has_beam": bool(episode.get("has_beam", False)),
+                    "board_type": str(episode.get("board_type", "")),
+                    "player_pos": episode.get("player_pos"),
+                    "goal_positions": episode.get("goal_positions", []),
+                    "mirror_axis": int(episode.get("mirror_axis", -1)),
+                }
+                if game_model_data["has_beam"] or game_model_data["board_type"] == "puzzle":
+                    return [{"activated": True, "source": "puzzle_system"}]
+            except Exception as exc:
+                logger.debug("puzzle-solver shadow rule failed: %s", exc)
+            return [{"activated": False}]
         return []
 
     def _working_memory_goal_hint(
@@ -1133,6 +1210,7 @@ class HyperonBridge:
         bundle = load_memory_bundle_from_stores(
             hot_db_path=self.memory_db_path,
             archive_db_path=self.archive_memory_db_path,
+            trained_db_path=self.trained_priors_db_path,
             game_id=observation.game_id,
             state=observation.game_state,
             frame_signature=str(
@@ -2899,6 +2977,25 @@ class HyperonBridge:
         summary.setdefault("records_seen", 0)
         summary.setdefault("frame_signatures", {})
         return summary
+
+    def _load_board_policy_overrides(self, board_type: str) -> dict[str, str]:
+        if self.trained_priors_db_path is None:
+            return {}
+        if self._board_policy_params_cache is None:
+            self._board_policy_params_cache = {}
+            try:
+                puzzle = load_board_policy_params(self.trained_priors_db_path, "puzzle")
+                platformer = load_board_policy_params(self.trained_priors_db_path, "platformer")
+                unknown = load_board_policy_params(self.trained_priors_db_path, "unknown")
+                if puzzle:
+                    self._board_policy_params_cache["puzzle"] = puzzle
+                if platformer:
+                    self._board_policy_params_cache["platformer"] = platformer
+                if unknown:
+                    self._board_policy_params_cache["unknown"] = unknown
+            except Exception:
+                self._board_policy_params_cache = {}
+        return self._board_policy_params_cache.get(board_type, {})
 
     def _load_trained_prior_bucket(
         self,

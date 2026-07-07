@@ -1048,6 +1048,7 @@ def load_memory_bundle_from_stores(
     *,
     hot_db_path: str | Path | None,
     archive_db_path: str | Path | None = None,
+    trained_db_path: str | Path | None = None,
     game_id: str,
     state: str,
     frame_signature: str,
@@ -1091,7 +1092,23 @@ def load_memory_bundle_from_stores(
         include_retrieval_metadata=include_retrieval_metadata,
         retrieval_store="archive",
     )
-    if hot_bundle is None and archive_bundle is None:
+    trained_bundle, trained_error = _safe_load_memory_bundle(
+        trained_db_path,
+        game_id=game_id,
+        state=state,
+        frame_signature=frame_signature,
+        subgoal=subgoal,
+        legal_actions=legal_actions,
+        board_context=board_context,
+        board_motif_tags=board_motif_tags,
+        last_action=last_action,
+        allow_same_as=hot_db_path,
+        touch_retrieved=False,
+        retrieval_step=retrieval_step,
+        include_retrieval_metadata=False,
+        retrieval_store="trained",
+    )
+    if hot_bundle is None and archive_bundle is None and trained_bundle is None:
         if hot_error is not None:
             raise hot_error
         if archive_error is not None:
@@ -1099,33 +1116,59 @@ def load_memory_bundle_from_stores(
         bundle = _empty_bundle()
         bundle["board_context_summary"] = _normalized_board_context(board_context)
         return bundle
+
+    def _merge_trained(base_bundle, trained_bnd):
+        if trained_bnd is None:
+            return base_bundle
+        base_bundle["abstract_memories"] = _merge_ranked_memory_items(
+            base_bundle.get("abstract_memories", []),
+            trained_bnd.get("abstract_memories", []),
+            limit=6,
+        )
+        base_bundle["trained_prior_bucket"] = _merge_prior_buckets(
+            base_bundle.get("trained_prior_bucket", {}),
+            trained_bnd.get("trained_prior_bucket", {}),
+        )
+        return base_bundle
+
+    if hot_bundle is None and archive_bundle is None:
+        bundle = _empty_bundle()
+        bundle["board_context_summary"] = _normalized_board_context(board_context)
+        bundle = _merge_trained(bundle, trained_bundle)
+        return bundle
     if hot_bundle is None:
-        bundle = archive_bundle or _empty_bundle()
+        base = archive_bundle or _empty_bundle()
+        base = _merge_trained(base, trained_bundle)
+        base["board_context_summary"] = _normalized_board_context(board_context)
         if include_retrieval_metadata:
             _touch_bundle_memory_rows(
                 archive_db_path,
-                bundle,
+                base,
                 retrieval_step=retrieval_step,
                 retrieval_store="archive",
             )
-            return _strip_bundle_retrieval_metadata(bundle)
-        return bundle
+            return _strip_bundle_retrieval_metadata(base)
+        return base
     if archive_bundle is None:
+        base = hot_bundle
+        base = _merge_trained(base, trained_bundle)
+        base["board_context_summary"] = _normalized_board_context(board_context)
         if include_retrieval_metadata:
             _touch_bundle_memory_rows(
                 hot_db_path,
-                hot_bundle,
+                base,
                 retrieval_step=retrieval_step,
                 retrieval_store="hot",
             )
-            return _strip_bundle_retrieval_metadata(hot_bundle)
-        return hot_bundle
+            return _strip_bundle_retrieval_metadata(base)
+        return base
     merged_bundle = _merge_memory_bundles(
         hot_bundle=hot_bundle,
         archive_bundle=archive_bundle,
         legal_actions=legal_actions,
         board_context=board_context,
     )
+    merged_bundle = _merge_trained(merged_bundle, trained_bundle)
     if include_retrieval_metadata:
         _touch_bundle_memory_rows(
             hot_db_path,

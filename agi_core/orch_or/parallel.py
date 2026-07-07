@@ -17,6 +17,8 @@ class ThreadPoolManager:
         cls._shutdown()
         cls._instance = None
 
+    _atexit_registered = False
+
     @classmethod
     def executor(cls) -> ThreadPoolExecutor:
         if cls._instance is None:
@@ -26,7 +28,9 @@ class ThreadPoolManager:
                         max_workers=cls._max_workers,
                         thread_name_prefix="orch_or",
                     )
-                    atexit.register(cls._shutdown)
+                    if not cls._atexit_registered:
+                        atexit.register(cls._shutdown)
+                        cls._atexit_registered = True
         return cls._instance
 
     @classmethod

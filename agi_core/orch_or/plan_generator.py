@@ -10,17 +10,16 @@ from agi_core.orch_or.strategies import available_strategies, get_strategy
 if TYPE_CHECKING:
     from agi_core.orch_or.game_model import GameModel, Objective, PlanStep
 
-_PARALLEL_TARGETS = frozenset({"reach-goal", "navigate-to-goal", "clear-obstacles"})
+_PARALLEL_TARGETS = frozenset({"reach-goal", "navigate-to-goal", "seek-goal", "clear-obstacles"})
 
 _STRATEGY_MAP: dict[str, str] = {
     "reach-goal": "movement",
     "navigate-to-goal": "movement",
+    "seek-goal": "goal_seeker",
     "clear-obstacles": "interaction",
     "explore-board": "exploration",
     "complete-level": "generic",
 }
-
-_PUZZLE_OBJECTIVES = frozenset({"reach-goal", "navigate-to-goal", "explore-board"})
 
 
 def _apply_priority_boost(root: Objective, subgoal: str) -> None:
@@ -44,7 +43,10 @@ def generate_plan(
     goal_hints: list[dict] | None = None
     if context and "goal_hints" in context:
         goal_hints = context["goal_hints"]
-    objective_tree = reduce(game_model, goal_hints=goal_hints)
+    goal_history: list[list[tuple[int, int]]] | None = None
+    if context and "goal_history" in context:
+        goal_history = context["goal_history"]
+    objective_tree = reduce(game_model, goal_hints=goal_hints, goal_history=goal_history)
     # Apply hyperon goal-hint priority overrides after building the tree.
     if goal_hints:
         for hint in goal_hints:
@@ -61,18 +63,7 @@ def generate_plan(
         strategy_fn = get_strategy("generic")
     if strategy_fn is None:
         return None
-    puzzle_fn = get_strategy("puzzle")
-    if game_model.features.board_type == "puzzle" and puzzle_fn is not None:
-        # For puzzle boards, try the puzzle strategy first so we can switch to
-        # the correct controllable entity before exploring.
-        steps = puzzle_fn(game_model, context)
-        if not steps:
-            steps = strategy_fn(game_model, context)
-    else:
-        steps = strategy_fn(game_model, context)
-        if not steps and leaf.description in _PUZZLE_OBJECTIVES:
-            if puzzle_fn is not None:
-                steps = puzzle_fn(game_model, context)
+    steps = strategy_fn(game_model, context)
     if not steps:
         return None
     # Override step tolerance from board-retry-tolerance MeTTa rule.
@@ -124,7 +115,7 @@ def _generate_plan_parallel(
         targets.append("interaction")
     elif primary_name == "interaction":
         targets.append("movement")
-    targets = [s for s in all_strategies if s in targets or s in ("exploration", "puzzle", "generic")]
+    targets = [s for s in all_strategies if s in targets or s in ("exploration", "generic")]
     targets = list(dict.fromkeys(targets))
     tasks = [
         (lambda fn=get_strategy(s): fn(game_model, context) if fn else [], s)
@@ -143,8 +134,6 @@ def _generate_plan_parallel(
                 all_steps.append(step)
     if not all_steps:
         return None
-    switch_order = {"switch": 0, "click": 1, "move": 2, "wait": 3}
-    all_steps.sort(key=lambda s: (switch_order.get(s.action, 99), s.params.get("direction", "") if s.params else ""))
     return Plan(
         objective_id=leaf.description,
         steps=all_steps,

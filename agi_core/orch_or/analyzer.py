@@ -142,14 +142,6 @@ def _merge_nearby_same_color(components: list[Component]) -> list[Component]:
             min_y = min(y for x, y in cells)
             max_x = max(x for x, y in cells)
             max_y = max(y for x, y in cells)
-            color_counts: dict[int, int] = {}
-            for cx, cy in cells:
-                found = False
-                for c in group:
-                    if (cx, cy) in c.cells:
-                        found = True
-                        break
-                color_counts[color] = color_counts.get(color, 0) + 1
             merged.append(Component(
                 cells=cells,
                 bbox=(min_x, min_y, max_x, max_y),
@@ -251,7 +243,7 @@ def _find_goals(
                 score -= 0.5
         scored.append((score, c))
     scored.sort(key=lambda x: -x[0])
-    n_goals = max(1, min(len(scored) // 2, 3))
+    n_goals = min(max(2, len(scored)), 4)
     primary_goals = [_component_center(c) for _, c in scored[:n_goals]]
     goal_color_candidates = _GOAL_COLOR_CANDIDATES
     goal_colored_in_top = [c for _, c in scored[:n_goals] if c.dominant_color in goal_color_candidates]
@@ -309,6 +301,8 @@ def _find_obstacles(
             continue
         if id(c) in player_comps:
             continue
+        if c.dominant_color == 4 or c.dominant_color == 10:
+            continue
         obs_type = "wall" if c.touches_border else "interactive"
         obstacles.append((cx, cy, obs_type))
     return obstacles
@@ -359,28 +353,18 @@ def _detect_beam(
     if beam_comp is None:
         return (False, -1, [], 0, float('inf'), -1)
     beam_cells_set = set(beam_comp.cells)
-    goals_lit = 0
-    for gx, gy in goal_positions:
-        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
-            nx, ny = gx + dx, gy + dy
-            if (nx, ny) in beam_cells_set:
-                goals_lit += 1
-                break
-    beam_centers = []
+    goals_lit = sum(1 for gx, gy in goal_positions if (gx, gy) in beam_cells_set)
     min_dist = float('inf')
     mirror_axis = -1
     if beam_comp.cells:
-        n = max(1, len(beam_comp.cells) // 3)
-        step = max(1, len(beam_comp.cells) // n)
-        for i in range(0, len(beam_comp.cells), step):
-            beam_centers.append(beam_comp.cells[i])
         if goal_positions:
             min_dist = min(
                 min(abs(bx - gx) + abs(by - gy) for gx, gy in goal_positions)
                 for bx, by in beam_comp.cells
             )
         mirror_axis = _infer_mirror_axis(beam_comp, player_pos, board)
-    return (True, beam_comp.dominant_color, beam_centers[:5], goals_lit, min_dist, mirror_axis)
+    sample = beam_comp.cells[:5]
+    return (True, beam_comp.dominant_color, sample, goals_lit, min_dist, mirror_axis)
 
 
 def _infer_mirror_axis(
@@ -391,18 +375,9 @@ def _infer_mirror_axis(
     if player_pos is None:
         return -1
     px, py = player_pos
-    best_dist = float('inf')
-    best_bx = -1
     for bx, by in beam_comp.cells:
-        d = abs(bx - px) + abs(by - py)
-        if d < best_dist:
-            best_dist = d
-            best_bx = bx
-    if best_bx < 0:
-        return -1
-    axis = (px + best_bx + 1) // 2
-    if 0 <= axis < (len(board[0]) if board else 64):
-        return axis
+        if abs(bx - px) + abs(by - py) <= 6:
+            return px
     return -1
 
 
@@ -413,11 +388,16 @@ def _extract_features(
     components: list[Component],
     player_pos: tuple[int, int] | None,
     goal_positions: list[tuple[int, int]],
-    walkable: set[tuple[int, int]] | None = None,
+    walkable: set[tuple[int, int]],
 ) -> GameFeatures:
     path_possible = False
     if player_pos is not None and goal_positions and walkable:
-        a_star_passable = walkable | {player_pos} | set(goal_positions)
+        expanded_walkable = set(walkable)
+        for c in components:
+            if not c.touches_border:
+                for cx, cy in c.cells:
+                    expanded_walkable.add((cx, cy))
+        a_star_passable = expanded_walkable | {player_pos} | set(goal_positions)
         path = astar(player_pos, goal_positions[0], a_star_passable, width, height)
         path_possible = path is not None
     board_type = _classify_board(components, player_pos)
@@ -485,7 +465,8 @@ def _classify_board(components: list[Component], player_pos: tuple[int, int] | N
     non_border = [c for c in components if not c.touches_border]
     if player_pos is not None:
         non_border = [c for c in non_border if not _in_bbox(player_pos, c.bbox)]
-    if len(non_border) <= _PLATFORMER_THRESHOLD:
+    distinct_colors = set(c.dominant_color for c in non_border)
+    if len(non_border) <= 5 and len(distinct_colors) <= 4:
         return "platformer"
     return "puzzle"
 

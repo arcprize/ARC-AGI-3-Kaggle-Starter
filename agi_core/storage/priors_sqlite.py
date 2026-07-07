@@ -90,6 +90,18 @@ def initialize_schema(db_path: str | Path) -> None:
             ON subgoal_action_priors(game_id, subgoal)
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS board_policy_params (
+                board_type TEXT NOT NULL,
+                param_name TEXT NOT NULL,
+                param_value TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (board_type, param_name)
+            )
+            """
+        )
         connection.commit()
 
 
@@ -318,6 +330,57 @@ def _query_pairs(
 ) -> dict[str, int]:
     rows = connection.execute(query, parameters).fetchall()
     return {str(action_name): int(count) for action_name, count in rows}
+
+
+def upsert_board_policy_params(
+    db_path: str | Path,
+    rows: list[dict[str, Any]],
+) -> None:
+    if not rows:
+        return
+    with closing(sqlite3.connect(Path(db_path))) as connection:
+        connection.executemany(
+            """
+            INSERT INTO board_policy_params(board_type, param_name, param_value, confidence, sample_count)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(board_type, param_name)
+            DO UPDATE SET
+                param_value = excluded.param_value,
+                confidence = excluded.confidence,
+                sample_count = board_policy_params.sample_count + excluded.sample_count
+            """,
+            [
+                (
+                    str(row.get("board_type", "")),
+                    str(row.get("param_name", "")),
+                    str(row.get("param_value", "")),
+                    float(row.get("confidence", 1.0)),
+                    int(row.get("sample_count", 0)),
+                )
+                for row in rows
+            ],
+        )
+        connection.commit()
+
+
+def load_board_policy_params(
+    db_path: str | Path,
+    board_type: str,
+) -> dict[str, str]:
+    path = Path(db_path)
+    if not path.exists():
+        return {}
+    with closing(sqlite3.connect(path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT param_name, param_value
+            FROM board_policy_params
+            WHERE board_type = ?
+            ORDER BY confidence DESC, sample_count DESC
+            """,
+            [board_type],
+        ).fetchall()
+        return {str(name): str(value) for name, value in rows}
 
 
 def _merge_missing_actions(target: dict[str, int], source: dict[str, int]) -> None:

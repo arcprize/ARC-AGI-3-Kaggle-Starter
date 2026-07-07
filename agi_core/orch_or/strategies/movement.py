@@ -23,6 +23,16 @@ def _direction(from_pos: tuple[int, int], to_pos: tuple[int, int]) -> str:
     return "right"
 
 
+def _is_beam_controller(game_model: GameModel) -> bool:
+    """True when the player entity is a beam-controller (adjacent to beam)."""
+    features = game_model.features
+    if not features.has_beam or not features.beam_positions or game_model.player_pos is None:
+        return False
+    px, py = game_model.player_pos
+    return any(abs(bx - px) <= 6 and abs(by - py) <= 6
+               for bx, by in features.beam_positions)
+
+
 def movement_strategy(game_model: GameModel, context: dict | None = None) -> list[PlanStep]:
     steps: list[PlanStep] = []
     player = game_model.player_pos
@@ -60,52 +70,94 @@ def movement_strategy(game_model: GameModel, context: dict | None = None) -> lis
     for goal in search_goals:
         path = astar(player, goal, _path_walkable, game_model.width, game_model.height)
         if path and len(path) > 1:
-            for i in range(1, len(path)):
+            is_close = abs(player[0] - goal[0]) + abs(player[1] - goal[1]) <= 9
+            step_size = 1 if is_close else 3
+            for i in range(1, len(path), step_size):
                 prev = path[i - 1]
                 curr = path[i]
                 steps.append(_move_step(_direction(prev, curr)))
             return steps
+    if game_model.obstacles and game_model.player_pos is not None:
+        obs_walkable = set(_path_walkable)
+        for c in game_model.components:
+            if not c.touches_border:
+                for cxx, cyy in c.cells:
+                    obs_walkable.add((cxx, cyy))
+        px2, py2 = game_model.player_pos
+        for ox, oy, otype in sorted(game_model.obstacles, key=lambda o: abs(o[0] - px2) + abs(o[1] - py2)):
+            if otype != "interactive":
+                continue
+            bg = game_model.features.background_color
+            comp = next((c for c in game_model.components if c.dominant_color != bg and c.bbox[0] <= ox <= c.bbox[2] and c.bbox[1] <= oy <= c.bbox[3]), None)
+            if comp is not None:
+                click_target = min(comp.cells, key=lambda cell: abs(cell[0] - px2) + abs(cell[1] - py2))
+                cx2, cy2 = click_target
+            else:
+                cx2, cy2 = ox, oy
+            dist = abs(cx2 - px2) + abs(cy2 - py2)
+            if dist <= 2:
+                steps.append(_interact_step(cx2, cy2))
+                return steps
+            adj_targets = [(cx2 + dx, cy2 + dy) for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)) if (cx2 + dx, cy2 + dy) in obs_walkable]
+            if adj_targets:
+                adj_goal = min(adj_targets, key=lambda t: abs(t[0] - px2) + abs(t[1] - py2))
+                path_to_obs = astar(player, adj_goal, obs_walkable, game_model.width, game_model.height)
+                if path_to_obs and len(path_to_obs) > 1:
+                    step_idx = 0
+                    while step_idx < len(path_to_obs) - 1:
+                        next_idx = min(step_idx + 3, len(path_to_obs) - 1)
+                        prev = path_to_obs[step_idx]
+                        curr = path_to_obs[next_idx]
+                        steps.append(_move_step(_direction(prev, curr)))
+                        step_idx = next_idx
+                    steps.append(_interact_step(cx2, cy2))
+                    return steps
     px, py = player
     non_beam = (context or {}).get("non_beam_controllers", set())
-    if game_model.features.has_beam and game_model.features.beam_positions and game_model.features.player_color not in non_beam:
+    failed_dirs = (context or {}).get("failed_directions", set())
+    if (game_model.features.has_beam and game_model.features.beam_positions
+            and game_model.features.player_color not in non_beam
+            and _is_beam_controller(game_model)):
         bp = min(game_model.features.beam_positions, key=lambda p: abs(p[0] - px) + abs(p[1] - py))
         bx, by = bp
         dx = bx - px
         dy = by - py
         if abs(dx) > abs(dy):
+            nd = "right" if dx > 0 else "left"
             nx, ny = (px + (1 if dx > 0 else -1), py)
         else:
+            nd = "down" if dy > 0 else "up"
             nx, ny = (px, py + (1 if dy > 0 else -1))
-        if not game_model.walkable or (nx, ny) in game_model.walkable:
-            if abs(dx) > abs(dy):
-                steps.append(_move_step("right" if dx > 0 else "left"))
-            elif dy != 0:
-                steps.append(_move_step("down" if dy > 0 else "up"))
+        if nd not in failed_dirs and (not game_model.walkable or (nx, ny) in game_model.walkable):
+            steps.append(_move_step(nd))
             return steps
-    # Use stable goal for fallback direction, falling through to goals[0].
     target = stable_goal if stable_goal is not None else goals[0]
     gx, gy = target
     dx = gx - px
     dy = gy - py
     if dx == 0 and dy == 0:
         return steps
-    # When both axes need movement, let hyperon action priors break the tie.
     _DIR_TO_ACTION = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
     action_priors = (context or {}).get("action_priors", {})
-    horiz = "right" if dx > 0 else "left"
-    vert = "down" if dy > 0 else "up"
+    failed_dirs = (context or {}).get("failed_directions", set())
+    candidates = []
+    if dx > 0: candidates.append("right")
+    elif dx < 0: candidates.append("left")
+    if dy > 0: candidates.append("down")
+    elif dy < 0: candidates.append("up")
     if abs(dx) > abs(dy):
-        primary, secondary = horiz, vert
+        pass  # horizontal bias from order above
     elif abs(dy) > abs(dx):
-        primary, secondary = vert, horiz
+        candidates = candidates[::-1]
     else:
-        pri_h = action_priors.get(_DIR_TO_ACTION.get(horiz, ""), 0.0)
-        pri_v = action_priors.get(_DIR_TO_ACTION.get(vert, ""), 0.0)
-        primary = horiz if pri_h >= pri_v else vert
-        secondary = vert if pri_h >= pri_v else horiz
-    for d in (primary, secondary):
-        off = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
-        dvx, dvy = off.get(d, (0, 0))
+        pri_h = action_priors.get(_DIR_TO_ACTION.get(candidates[0], ""), 0.0) if candidates else 0.0
+        pri_v = action_priors.get(_DIR_TO_ACTION.get(candidates[-1], ""), 0.0) if len(candidates) > 1 else 0.0
+        if pri_v > pri_h and len(candidates) > 1:
+            candidates = candidates[::-1]
+    for d in candidates:
+        if d in failed_dirs:
+            continue
+        dvx, dvy = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}.get(d, (0, 0))
         nx, ny = px + dvx, py + dvy
         if not game_model.walkable or (nx, ny) in game_model.walkable:
             steps.append(_move_step(d))
@@ -120,4 +172,14 @@ def _move_step(direction: str) -> PlanStep:
         source="movement_strategy",
         preconditions=frozenset(),
         expected_effect=f"move_{direction}",
+    )
+
+
+def _interact_step(tx: int, ty: int) -> PlanStep:
+    return PlanStep(
+        action="click",
+        params={"x": tx, "y": ty, "target_gx": tx, "target_gy": ty},
+        source="movement_strategy",
+        preconditions=frozenset(),
+        expected_effect="break_block",
     )

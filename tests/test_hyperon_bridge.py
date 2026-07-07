@@ -12,9 +12,11 @@ from agi_core.storage import (
     import_legacy_learning_json,
     initialize_memory_schema,
     initialize_schema,
+    load_board_policy_params,
     load_memory_bundle,
     record_transition,
     upsert_abstract_memory_rows,
+    upsert_board_policy_params,
     upsert_training_counts,
 )
 from agi_core.knowledge.hyperon_bridge import HyperonBridge
@@ -272,35 +274,6 @@ class HyperonBridgeTests(unittest.TestCase):
         bridge.sync(observation, EpisodicMemory(), [])
         result = bridge.run_rules("game-reset-needed")
         self.assertEqual(len(result), 0)
-
-    def test_beam_strategy_ar25_level_1(self) -> None:
-        bridge = HyperonBridge(enabled=False)
-        observation = make_observation(
-            step_index=1, game_state="ACTIVE", last_action="ACTION1",
-            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
-            derived_features={"frame_signature": "sig-bs-ar25-l1"},
-        )
-        observation.game_id = "ar25"
-        bridge.sync(observation, EpisodicMemory(), [])
-        # levels_completed=0 means level 1.
-        bridge.facts.setdefault("episode", {})["levels_completed"] = 0
-        result = bridge.run_rules("beam-strategy")
-        self.assertTrue(len(result) >= 1)
-        self.assertEqual(result[0].get("direction"), "down")
-
-    def test_beam_strategy_ar25_level_2(self) -> None:
-        bridge = HyperonBridge(enabled=False)
-        observation = make_observation(
-            step_index=1, game_state="ACTIVE", last_action="ACTION1",
-            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4"],
-            derived_features={"frame_signature": "sig-bs-ar25-l2"},
-        )
-        observation.game_id = "ar25"
-        bridge.sync(observation, EpisodicMemory(), [])
-        bridge.facts.setdefault("episode", {})["levels_completed"] = 1
-        result = bridge.run_rules("beam-strategy")
-        self.assertTrue(len(result) >= 1)
-        self.assertEqual(result[0].get("direction"), "right")
 
     def test_board_explore_bias_puzzle_vertical(self) -> None:
         bridge = HyperonBridge(enabled=False)
@@ -1804,27 +1777,6 @@ class HyperonBridgeTests(unittest.TestCase):
         priors = bridge.run_rules("action-priors:break-stall")
 
         self.assertEqual(priors[0]["action_name"], "ACTION2")
-
-    def test_game_action_priors_ar25_overrides_defaults(self) -> None:
-        bridge = HyperonBridge(enabled=False)
-        observation = make_observation(
-            step_index=1, game_state="ACTIVE", last_action="ACTION1",
-            legal_actions=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"],
-            derived_features={"frame_signature": "sig-ar25"},
-        )
-        observation.game_id = "ar25"
-        bridge.sync(observation, EpisodicMemory(), [])
-        # Manually set board_type to unknown so game priors dominate.
-        bridge.facts.setdefault("episode", {})["board_type"] = "unknown"
-        priors = bridge.run_rules("game-action-priors")
-        prior_map = {p["action_name"]: p["confidence"] for p in priors}
-        self.assertAlmostEqual(prior_map.get("ACTION2", 0), 0.78, places=2)
-        self.assertAlmostEqual(prior_map.get("ACTION4", 0), 0.72, places=2)
-        self.assertAlmostEqual(prior_map.get("ACTION5", 0), 0.45, places=2)
-        self.assertAlmostEqual(prior_map.get("ACTION6", 0), 0.30, places=2)
-        # Verify reasons mention game-prior.
-        action2_row = next(p for p in priors if p["action_name"] == "ACTION2")
-        self.assertIn("game-prior:ar25", action2_row.get("reason", ""))
 
     def test_game_action_priors_board_type_puzzle(self) -> None:
         bridge = HyperonBridge(enabled=False)
@@ -3553,6 +3505,56 @@ class HyperonBridgeTests(unittest.TestCase):
                 "abstraction-transfer",
                 bridge.facts["memory_bundle"]["retrieval_summary"]["top_recall_sources"],
             )
+
+    def test_load_board_policy_overrides_returns_empty_without_trained_db(self) -> None:
+        bridge = HyperonBridge(enabled=False, memory_db_path=None, trained_priors_db_path=None)
+        self.assertEqual(bridge._load_board_policy_overrides("puzzle"), {})
+
+    def test_load_board_policy_overrides_loads_and_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trained_path = Path(tmpdir) / "trained.sqlite3"
+            initialize_schema(trained_path)
+            upsert_board_policy_params(
+                trained_path,
+                [
+                    {"board_type": "puzzle", "param_name": "explore-bias", "param_value": "vertical", "confidence": 0.8, "sample_count": 5},
+                    {"board_type": "puzzle", "param_name": "interact-range", "param_value": "4", "confidence": 0.7, "sample_count": 5},
+                ],
+            )
+            bridge = HyperonBridge(
+                enabled=False,
+                trained_priors_db_path=trained_path,
+            )
+            puzzle_overrides = bridge._load_board_policy_overrides("puzzle")
+            platformer_overrides = bridge._load_board_policy_overrides("platformer")
+            self.assertEqual(puzzle_overrides.get("explore-bias"), "vertical")
+            self.assertEqual(puzzle_overrides.get("interact-range"), "4")
+            self.assertEqual(len(puzzle_overrides), 2)
+            self.assertEqual(platformer_overrides, {})
+
+    def test_load_board_policy_overrides_fallback_on_exception(self) -> None:
+        bridge = HyperonBridge(enabled=False, trained_priors_db_path=Path("nonexistent.sqlite3"))
+        result = bridge._load_board_policy_overrides("puzzle")
+        self.assertEqual(result, {})
+
+    def test_shadow_rules_use_trained_board_policy_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trained_path = Path(tmpdir) / "trained.sqlite3"
+            initialize_schema(trained_path)
+            upsert_board_policy_params(
+                trained_path,
+                [
+                    {"board_type": "puzzle", "param_name": "explore-bias", "param_value": "horizontal", "confidence": 0.8, "sample_count": 5},
+                ],
+            )
+            bridge = HyperonBridge(
+                enabled=False,
+                memory_db_path=None,
+                trained_priors_db_path=trained_path,
+            )
+            bridge.facts["episode"] = {"board_type": "puzzle"}
+            result = bridge.run_rules("board-explore-bias")
+            self.assertEqual(result[0]["axis"], "horizontal")
 
 
 if __name__ == "__main__":

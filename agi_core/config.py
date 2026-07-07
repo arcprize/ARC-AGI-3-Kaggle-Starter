@@ -4,9 +4,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_EXTERNAL_LLM_MODEL_PATH = Path(
-    r"E:\.models\gemma-4-transformers-gemma-4-e2b-it-v1"
-)
 DEFAULT_RESET_STATE_NAMES = ("NOT_PLAYED", "GAME_OVER")
 DEFAULT_WIN_STATE_NAME = "WIN"
 
@@ -56,17 +53,17 @@ class RuntimeConfig:
         "ACTION5",
         "ACTION6",
     )
+    llm_enabled: bool = False
     source_bias: dict[str, float] = field(
         default_factory=lambda: {
             "reactive": 0.25,
             "symbolic": 0.15,
-            "llm": 0.05,
         }
     )
     planner_enabled: bool = True
     planner_max_actions: int = 80
     planner_explore_probes: int = 3
-    planner_parallel: bool = False
+    planner_parallel: bool = True
     planner_workers: int = 4
     planner_parallel_timeout: float | None = None
 
@@ -152,6 +149,8 @@ class RuntimeConfig:
             openai_timeout_seconds=(
                 float(openai_timeout) if openai_timeout and openai_timeout.strip() else None
             ),
+            llm_enabled=env.get("AGI_LLM_ENABLE", "0").strip().lower()
+            in {"1", "true", "yes", "on"},
             llm_max_calls_per_episode=int(env.get("AGI_LLM_MAX_CALLS", "2")),
             llm_max_tokens=int(env.get("AGI_LLM_MAX_TOKENS", "192")),
             llm_temperature=float(env.get("AGI_LLM_TEMPERATURE", "0.1")),
@@ -171,7 +170,7 @@ class RuntimeConfig:
             in {"1", "true", "yes", "on"},
             planner_max_actions=int(env.get("AGI_PLANNER_MAX_ACTIONS", "80")),
             planner_explore_probes=int(env.get("AGI_PLANNER_EXPLORE_PROBES", "3")),
-            planner_parallel=env.get("AGI_PLANNER_PARALLEL", "0").strip().lower()
+            planner_parallel=env.get("AGI_PLANNER_PARALLEL", "1").strip().lower()
             in {"1", "true", "yes", "on"},
             planner_workers=int(env.get("AGI_PLANNER_WORKERS", "4")),
             planner_parallel_timeout=(
@@ -181,15 +180,4 @@ class RuntimeConfig:
             ),
         )
 
-    def effective_model_path(self) -> Path:
-        if self.llm_model_path.exists():
-            return self.llm_model_path
-        if DEFAULT_EXTERNAL_LLM_MODEL_PATH.exists():
-            return DEFAULT_EXTERNAL_LLM_MODEL_PATH
-        matches = sorted(self.llm_model_dir.glob("*.gguf"))
-        if matches:
-            return matches[0]
-        for child in sorted(self.llm_model_dir.iterdir()) if self.llm_model_dir.exists() else []:
-            if child.is_dir() and (child / "config.json").exists():
-                return child
-        return self.llm_model_path
+

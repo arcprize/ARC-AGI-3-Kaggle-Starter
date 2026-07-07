@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Iterable
 
 from agi_core.image_input import board_probe_click_target, default_click_target, preferred_board_probe_action
@@ -25,10 +24,6 @@ class ReactiveSpecialist:
             )
             return proposals
         if observation.game_state == context.config.win_state_name:
-            return proposals
-        opening_move = self._ar25_level0_opening_move(context)
-        if opening_move is not None:
-            proposals.append(opening_move)
             return proposals
         if not observation.legal_actions:
             if not bool(observation.derived_features.get("legal_actions_known", True)):
@@ -118,151 +113,6 @@ class ReactiveSpecialist:
             )
         )
         return proposals
-
-    def _ar25_level0_opening_move(
-        self,
-        context: ExecutiveContext,
-    ) -> ActionProposal | None:
-        observation = context.observation
-        if str(observation.game_id or "").split("-")[0] != "ar25":
-            return None
-        decision_count = self._actions_since_last_progress(context)
-        scheduled_action = None
-        if observation.levels_completed == 0:
-            if decision_count < 5 and "ACTION3" in observation.legal_actions:
-                scheduled_action = "ACTION3"
-            elif decision_count < 15 and "ACTION2" in observation.legal_actions:
-                scheduled_action = "ACTION2"
-        elif observation.levels_completed == 1:
-            if decision_count < 2 and "ACTION3" in observation.legal_actions:
-                scheduled_action = "ACTION3"
-            elif decision_count == 2 and "ACTION5" in observation.legal_actions:
-                scheduled_action = "ACTION5"
-            elif 3 <= decision_count < 11 and "ACTION2" in observation.legal_actions:
-                scheduled_action = "ACTION2"
-        if scheduled_action is not None:
-            return ActionProposal(
-                action_name=scheduled_action,
-                source=self.source,
-                confidence=1.35,
-                reason="ar25 mirrored opening alignment",
-                subgoal="advance-level",
-                expected_outcome="progress",
-            )
-        image_input = observation.image_input
-        if image_input is None:
-            return None
-        reflected_bbox = self._component_bbox(
-            image_input.board,
-            color=4,
-            exclude_border_components=False,
-        )
-        target_bbox = self._component_bbox(
-            image_input.board,
-            color=11,
-            exclude_border_components=True,
-        )
-        if reflected_bbox is None or target_bbox is None:
-            return None
-        dx = target_bbox["min_x"] - reflected_bbox["min_x"]
-        dy = target_bbox["min_y"] - reflected_bbox["min_y"]
-        action_name = None
-        if dx > 0 and "ACTION3" in observation.legal_actions:
-            action_name = "ACTION3"
-        elif dx < 0 and "ACTION4" in observation.legal_actions:
-            action_name = "ACTION4"
-        elif dy > 0 and "ACTION2" in observation.legal_actions:
-            action_name = "ACTION2"
-        elif dy < 0 and "ACTION1" in observation.legal_actions:
-            action_name = "ACTION1"
-        if action_name is None:
-            return None
-        return ActionProposal(
-            action_name=action_name,
-            source=self.source,
-            confidence=1.35,
-            reason="ar25 mirrored opening alignment",
-            subgoal="advance-level",
-            expected_outcome="progress",
-        )
-
-    def _component_bbox(
-        self,
-        board: list[list[int]],
-        *,
-        color: int,
-        exclude_border_components: bool,
-    ) -> dict[str, int] | None:
-        height = len(board)
-        width = len(board[0]) if board else 0
-        if height <= 0 or width <= 0:
-            return None
-        seen: set[tuple[int, int]] = set()
-        components: list[dict[str, int]] = []
-        for y, row in enumerate(board):
-            for x, value in enumerate(row):
-                if int(value) != color or (x, y) in seen:
-                    continue
-                queue: deque[tuple[int, int]] = deque([(x, y)])
-                seen.add((x, y))
-                cells: list[tuple[int, int]] = []
-                while queue:
-                    cx, cy = queue.popleft()
-                    cells.append((cx, cy))
-                    for nx, ny in (
-                        (cx + 1, cy),
-                        (cx - 1, cy),
-                        (cx, cy + 1),
-                        (cx, cy - 1),
-                    ):
-                        if (
-                            0 <= nx < width
-                            and 0 <= ny < height
-                            and (nx, ny) not in seen
-                            and int(board[ny][nx]) == color
-                        ):
-                            seen.add((nx, ny))
-                            queue.append((nx, ny))
-                min_x = min(cx for cx, _ in cells)
-                max_x = max(cx for cx, _ in cells)
-                min_y = min(cy for _, cy in cells)
-                max_y = max(cy for _, cy in cells)
-                touches_border = (
-                    min_x == 0
-                    or min_y == 0
-                    or max_x == width - 1
-                    or max_y == height - 1
-                )
-                if exclude_border_components and touches_border:
-                    continue
-                components.append(
-                    {
-                        "min_x": min_x,
-                        "max_x": max_x,
-                        "min_y": min_y,
-                        "max_y": max_y,
-                        "size": len(cells),
-                    }
-                )
-        if not components:
-            return None
-        return max(
-            components,
-            key=lambda component: (
-                int(component["size"]),
-                -int(component["min_x"]),
-                -int(component["min_y"]),
-            ),
-        )
-
-    def _actions_since_last_progress(self, context: ExecutiveContext) -> int:
-        records = list(getattr(context.memory, "_records", []) or [])
-        count = 0
-        for record in reversed(records):
-            if int(getattr(record, "progress_delta", 0) or 0) > 0:
-                break
-            count += 1
-        return count
 
     def _rank_stall_break_actions(
         self,
