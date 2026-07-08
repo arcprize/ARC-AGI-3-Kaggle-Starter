@@ -65,6 +65,7 @@ class PuzzleSystem:
         self._beam_puzzle_completed: bool = False
         self._last_cached_action_step: int = -1
         self._switch_back_issued: bool = False
+        self._cached_mirror_gx: int = -1
         if self._memory_db_path:
             self._memory_db_path.parent.mkdir(parents=True, exist_ok=True)
             initialize_puzzle_schema(self._memory_db_path)
@@ -199,14 +200,21 @@ class PuzzleSystem:
         # suggest switching to the beam-controlling entity (mirror).
         beam_color = features.beam_color
         switch_count = plan_context.get("switch_attempted", 0)
+        # Only suggest switching if there's a substantial beam entity to switch to
+        # (size >= 10 cells), not just reflection fragments (color-4 cells from
+        # mirror reflections which are typically small and scattered).
+        has_beam_entity = any(
+            c.dominant_color == beam_color and c.size >= 10
+            for c in game_model.components if not c.touches_border
+        ) if beam_color >= 0 else False
         has_non_beam_entities = (
             features.has_beam
             and features.player_color >= 0
             and features.player_color != beam_color
             and beam_color >= 0
+            and has_beam_entity
             and switch_count < 3
             and not self._beam_puzzle_completed
-            and any(c.dominant_color == beam_color for c in game_model.components if not c.touches_border)
         )
         if has_non_beam_entities:
             plan_context["switch_attempted"] = switch_count + 1
@@ -411,35 +419,45 @@ class PuzzleSystem:
                 px, py = spx, spy
                 player_grid_x = px // grid_scale
 
-        # Infer the mirror's grid x from color-10 mirror components if visible,
-        # or from the midpoint between the shape piece and goals when the mirror
-        # is recolored to background color (Level 2+) by the render interface.
-        mirr_comps = [c for c in game_model.components if c.dominant_color == 10]
-        if mirr_comps:
-            mirr_comp = max(mirr_comps, key=lambda c: c.size)
-            mirr_xs = [cx for cx, _ in mirr_comp.cells]
-            if mirr_xs:
-                mirror_grid_x = (sum(mirr_xs) // len(mirr_xs)) // grid_scale
-            else:
-                return None
+        # Infer the mirror's grid x from color-10 cells.
+        # Even when the interface recolors the mirror center pixels, the outer
+        # 8 cells of each 3x3 block remain color 10 (visible in the frame).
+        all_color10: list[int] = []
+        n_color10_comps = 0
+        for c in game_model.components:
+            if c.dominant_color == 10:
+                n_color10_comps += 1
+                all_color10.extend(cx for cx, _ in c.cells)
+        if all_color10:
+            mirror_pixel_x = sum(all_color10) // len(all_color10)
+            mirror_grid_x = mirror_pixel_x // grid_scale
         else:
-            # Mirror not visible as color 10 (recolored by interface).
-            # Only infer from midpoint if reflection cells (color 4) are present,
-            # confirming a mirror exists. Without reflection cells, there's no mirror.
+            # No color-10 cells visible at all (mirror fully recolored).
+            # Fall back: infer from reflection cells (color 4).
             beam_refs = [c for c in game_model.components
                          if c.dominant_color == 4 and not c.touches_border]
             if not beam_refs or not shape_comps:
                 return None
-            g_comp = next((c for c in game_model.components
-                          if c.dominant_color == 11
-                          and any(cx < game_model.width - 1 for cx, _ in c.cells)), None)
-            if g_comp is None:
+            best_shape = max(shape_comps, key=lambda c: c.size)
+            shape_cells = list(best_shape.cells)
+            all_ref_cells: set[tuple[int, int]] = set()
+            for br in beam_refs:
+                all_ref_cells.update(br.cells)
+            from collections import Counter
+            mirror_votes: Counter[int] = Counter()
+            for sx, sy in shape_cells:
+                for rx, ry in all_ref_cells:
+                    if abs(ry - sy) <= grid_scale * 2:
+                        mirror_votes[sx + rx] += 1
+            if not mirror_votes:
                 return None
-            g_cells = [c for c in g_comp.cells if c[0] < game_model.width - 1]
-            if not g_cells:
-                return None
-            avg_gx = sum(c[0] for c in g_cells) // len(g_cells)
-            mirror_grid_x = (spx + avg_gx) // (2 * grid_scale)
+            best_sum = mirror_votes.most_common(1)[0][0]
+            mirror_grid_x = best_sum // (2 * grid_scale)
+        # Cache mirror grid x for stability (prevents frame-by-frame fluctuations
+        # when the mirror's color-10 cells are fragmented by interface overlay).
+        if self._cached_mirror_gx < 0:
+            self._cached_mirror_gx = mirror_grid_x
+        mirror_grid_x = self._cached_mirror_gx
         # Find goal component(s) with color 11 — the actual goal markers, not the
         # energy bar (which also uses color 11 at the rightmost column on 64-wide boards).
         # Energy bar cells are at column 63; goal markers are at interior columns.
