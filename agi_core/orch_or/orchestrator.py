@@ -63,6 +63,9 @@ class ObjectiveReduction:
             logger.debug("no board data, falling back to executive")
             return self._fallback_executive(context)
         game_model = build_game_model(board_data)
+        # Debug: log player and goals for level transition detection
+        if context.observation.levels_completed > 0 and game_model.player_pos is not None:
+            pass  # logger.debug("L2 player: %s goals: %s mirrors: %s", ...)
         puzzle_decision, pctx = self._try_puzzle_system(context, game_model)
         if puzzle_decision is not None:
             if pctx and pctx.get("switch_attempted", 0) > self._switch_count:

@@ -19,6 +19,7 @@ from agi_core.knowledge.puzzle_memory import (
 )
 from agi_core.orch_or.parallel import ThreadPoolManager
 from agi_core.orch_or.game_model import PlanStep
+from agi_core.orch_or.analyzer import _component_center
 from agi_core.types import ActionDecision
 
 if TYPE_CHECKING:
@@ -391,9 +392,12 @@ class PuzzleSystem:
         if game_model.features.has_beam:
             return None
         px, py = player
-        mirror_comp = next((c for c in game_model.components if c.dominant_color == 10), None)
-        if mirror_comp is None:
+        mirror_comps = [c for c in game_model.components if c.dominant_color == 10]
+        if not mirror_comps:
             return None
+        # Select the largest color-10 component (the actual mirror wall)
+        # to avoid picking up small color-10 noise or fragments.
+        mirror_comp = max(mirror_comps, key=lambda c: c.size)
         grid_scale = game_model.features.grid_scale
         if grid_scale <= 1:
             return None
@@ -403,6 +407,23 @@ class PuzzleSystem:
         mirror_pixel_x = sum(mirror_pixel_xs) // len(mirror_pixel_xs)
         mirror_grid_x = mirror_pixel_x // grid_scale
         player_grid_x = px // grid_scale
+
+        # If player is at or near the mirror (likely mis-detected by _find_player
+        # due to overlay differences between levels), try to find the actual shape
+        # piece (color 5 or color 0 component) as the true player position.
+        _orig_px, _orig_py = px, py
+        if abs(player_grid_x - mirror_grid_x) <= 1:
+            shape_candidates = [c for c in game_model.components
+                                if c.dominant_color in (5, 0)
+                                and not c.touches_border
+                                and 1 <= c.size <= 100]
+            if shape_candidates:
+                best = max(shape_candidates, key=lambda c: c.size)
+                scx, scy = _component_center(best)
+                # Only use shape piece if significantly different from current player
+                if abs(scx - px) + abs(scy - py) > 6:
+                    px, py = scx, scy
+                    player_grid_x = px // grid_scale
         # Find goal component(s) with color 11 — the actual goal markers, not the
         # energy bar (which also uses color 11 at the rightmost column on 64-wide boards).
         # Energy bar cells are at column 63; goal markers are at interior columns.

@@ -190,6 +190,16 @@ def _find_player(
 ) -> tuple[int, int] | None:
     candidates = [c for c in components if not c.touches_border and 1 <= c.size <= 80]
     if not candidates:
+        # Fallback: look for components with color 5 (shape piece) even if border-touching
+        shape = [c for c in components if c.dominant_color == 5 and 1 <= c.size <= 80]
+        if shape:
+            from collections import Counter as _C
+            _c = _C()
+            for c in shape:
+                _c[c.dominant_color] += 1
+            result = max(shape, key=lambda c: c.size)
+            cx, cy = _component_center(result)
+            return (int(cx), int(cy))
         return None
     total_pixels = sum(color_freq.values()) if color_freq else 1
     if not color_freq:
