@@ -389,41 +389,57 @@ class PuzzleSystem:
         """Compute where to position the player so its reflection across a static
         mirror (color 10) covers the goals, then navigate there via A*.
         Only applies when there is NO beam — beam puzzles use _handle_beam_controller."""
-        if game_model.features.has_beam:
-            return None
         px, py = player
-        mirror_comps = [c for c in game_model.components if c.dominant_color == 10]
-        if not mirror_comps:
-            return None
-        # Select the largest color-10 component (the actual mirror wall)
-        # to avoid picking up small color-10 noise or fragments.
-        mirror_comp = max(mirror_comps, key=lambda c: c.size)
         grid_scale = game_model.features.grid_scale
         if grid_scale <= 1:
             return None
-        mirror_pixel_xs = [cx for cx, _ in mirror_comp.cells]
-        if not mirror_pixel_xs:
-            return None
-        mirror_pixel_x = sum(mirror_pixel_xs) // len(mirror_pixel_xs)
-        mirror_grid_x = mirror_pixel_x // grid_scale
         player_grid_x = px // grid_scale
 
-        # If player is at or near the mirror (likely mis-detected by _find_player
-        # due to overlay differences between levels), try to find the actual shape
-        # piece (color 5 or color 0 component) as the true player position.
-        _orig_px, _orig_py = px, py
-        if abs(player_grid_x - mirror_grid_x) <= 1:
-            shape_candidates = [c for c in game_model.components
-                                if c.dominant_color in (5, 0)
-                                and not c.touches_border
-                                and 1 <= c.size <= 100]
-            if shape_candidates:
-                best = max(shape_candidates, key=lambda c: c.size)
-                scx, scy = _component_center(best)
-                # Only use shape piece if significantly different from current player
-                if abs(scx - px) + abs(scy - py) > 6:
-                    px, py = scx, scy
-                    player_grid_x = px // grid_scale
+        # Find the shape piece (color 5 or color 0 component) for both position
+        # correction and mirror inference. The shape piece is always a non-border
+        # component with color 5 or 0.
+        shape_comps = [c for c in game_model.components
+                       if c.dominant_color in (5, 0)
+                       and not c.touches_border
+                       and 1 <= c.size <= 100]
+        spx = px
+        if shape_comps:
+            best_shape = max(shape_comps, key=lambda c: c.size)
+            spx, spy = _component_center(best_shape)
+            # Correct player position if mis-detected (e.g. at mirror position)
+            if abs(spx - px) + abs(spy - py) > 6:
+                px, py = spx, spy
+                player_grid_x = px // grid_scale
+
+        # Infer the mirror's grid x from color-10 mirror components if visible,
+        # or from the midpoint between the shape piece and goals when the mirror
+        # is recolored to background color (Level 2+) by the render interface.
+        mirr_comps = [c for c in game_model.components if c.dominant_color == 10]
+        if mirr_comps:
+            mirr_comp = max(mirr_comps, key=lambda c: c.size)
+            mirr_xs = [cx for cx, _ in mirr_comp.cells]
+            if mirr_xs:
+                mirror_grid_x = (sum(mirr_xs) // len(mirr_xs)) // grid_scale
+            else:
+                return None
+        else:
+            # Mirror not visible as color 10 (recolored by interface).
+            # Only infer from midpoint if reflection cells (color 4) are present,
+            # confirming a mirror exists. Without reflection cells, there's no mirror.
+            beam_refs = [c for c in game_model.components
+                         if c.dominant_color == 4 and not c.touches_border]
+            if not beam_refs or not shape_comps:
+                return None
+            g_comp = next((c for c in game_model.components
+                          if c.dominant_color == 11
+                          and any(cx < game_model.width - 1 for cx, _ in c.cells)), None)
+            if g_comp is None:
+                return None
+            g_cells = [c for c in g_comp.cells if c[0] < game_model.width - 1]
+            if not g_cells:
+                return None
+            avg_gx = sum(c[0] for c in g_cells) // len(g_cells)
+            mirror_grid_x = (spx + avg_gx) // (2 * grid_scale)
         # Find goal component(s) with color 11 — the actual goal markers, not the
         # energy bar (which also uses color 11 at the rightmost column on 64-wide boards).
         # Energy bar cells are at column 63; goal markers are at interior columns.
