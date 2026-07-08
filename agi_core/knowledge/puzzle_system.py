@@ -403,21 +403,20 @@ class PuzzleSystem:
             return None
         player_grid_x = px // grid_scale
 
-        # Find the shape piece (color 5 or color 0 component) for both position
-        # correction and mirror inference. The shape piece is always a non-border
-        # component with color 5 or 0.
+        # Find the shape piece (color 5 or color 0 component) for computing
+        # the mirror's target position. The shape piece position determines
+        # where the mirror should be for correct reflection coverage.
         shape_comps = [c for c in game_model.components
                        if c.dominant_color in (5, 0)
                        and not c.touches_border
                        and 1 <= c.size <= 100]
         spx = px
+        spy = py
+        has_shape = False
         if shape_comps:
             best_shape = max(shape_comps, key=lambda c: c.size)
             spx, spy = _component_center(best_shape)
-            # Correct player position if mis-detected (e.g. at mirror position)
-            if abs(spx - px) + abs(spy - py) > 6:
-                px, py = spx, spy
-                player_grid_x = px // grid_scale
+            has_shape = True
 
         # Infer the mirror's grid x from color-10 cells.
         # Even when the interface recolors the mirror center pixels, the outer
@@ -455,9 +454,12 @@ class PuzzleSystem:
             mirror_grid_x = best_sum // (2 * grid_scale)
         # Cache mirror grid x for stability (prevents frame-by-frame fluctuations
         # when the mirror's color-10 cells are fragmented by interface overlay).
+        # Only cache when player is NOT at the mirror (i.e. mirror is static).
+        # When player IS the mirror, mirror_grid_x tracks the moving mirror.
         if self._cached_mirror_gx < 0:
             self._cached_mirror_gx = mirror_grid_x
-        mirror_grid_x = self._cached_mirror_gx
+        if abs((px // grid_scale) - mirror_grid_x) > 1:
+            mirror_grid_x = self._cached_mirror_gx
         # Find goal component(s) with color 11 — the actual goal markers, not the
         # energy bar (which also uses color 11 at the rightmost column on 64-wide boards).
         # Energy bar cells are at column 63; goal markers are at interior columns.
@@ -479,35 +481,52 @@ class PuzzleSystem:
         max_goal_gx = max_goal_px // grid_scale
         min_goal_gy = min_goal_py // grid_scale
         max_goal_gy = max_goal_py // grid_scale
-        # Check player and goals are on opposite sides of the mirror.
-        # If player is at the mirror (same grid x), move right (away from goals)
-        # to reach the correct side for reflection.
-        if player_grid_x == mirror_grid_x:
-            # Player is at the mirror. Move AWAY from goals to reach the
-            # correct side for reflection. Goals at x < mirror → move right.
-            # Goals at x > mirror → move left.
-            if max_goal_gx <= mirror_grid_x:
-                # Goals are left of mirror, move right
-                target_px = (mirror_grid_x + 2) * grid_scale + 1
-            else:
-                # Goals are right of mirror, move left
-                target_px = max(0, (mirror_grid_x - 2) * grid_scale + 1)
-            target_py = py
-            expanded = self._build_expanded_walkable(game_model, context, plan_context)
-            path = astar(player, (target_px, target_py), expanded,
-                         game_model.width, game_model.height, max_steps=5000)
-            if path and len(path) > 1:
-                nx, ny = path[1]
-                d = "right" if nx > px else ("left" if nx < px else ("down" if ny > py else "up"))
-                self._last_move_target = (nx, ny)
-                self._store_state(context, game_model, [], _dir_to_action(d), "mirror_position")
+        # Determine if the player entity is the mirror (player at mirror's x)
+        # or a separate shape piece (player on opposite side from goals).
+        player_is_mirror = abs(player_grid_x - mirror_grid_x) <= 1
+
+        if player_is_mirror and has_shape:
+            # Player IS the mirror. Move it LEFT until the reflection covers
+            # all goals. The mirror starts to the RIGHT of the goals.
+            # Each LEFT move reduces mirror.grid_x by 1 in game engine coordinates.
+            # For goals at x=[min_goal_gx, max_goal_gx] and shape at rightmost grid x,
+            # the target mirror grid x is (min_goal_gx + shape_right_gx) // 2.
+            # Since movement is in grid coords, navigate by computing grid delta.
+            best_shape_comp = max(shape_comps, key=lambda c: c.size) if shape_comps else None
+            if best_shape_comp is None:
+                return None
+            shape_right_gx = best_shape_comp.bbox[2] // grid_scale
+            target_mirror_gx = (min_goal_gx + shape_right_gx) // 2
+            # Mirror moves in grid coords (3 px per step). Compute grid delta.
+            mirror_gx = mirror_grid_x  # current mirror grid x
+            dx = target_mirror_gx - mirror_gx
+            # Prioritize x-movement first (mirror must be at correct grid x
+            # for the reflection formula to work). Move in grid steps.
+            if dx < 0:
                 return ActionDecision(
-                    action_name=_dir_to_action(d),
-                    source="puzzle_system:mirror_position",
-                    confidence=0.60,
-                    reason=f"mirror_position_{d}",
+                    action_name="ACTION3",  # LEFT
+                    source="puzzle_system:mirror_nav",
+                    confidence=0.70,
+                    reason="mirror_nav_left",
                 )
-            return None
+            elif dx > 0:
+                return ActionDecision(
+                    action_name="ACTION4",  # RIGHT
+                    source="puzzle_system:mirror_nav",
+                    confidence=0.70,
+                    reason="mirror_nav_right",
+                )
+            # At correct x — wait for level completion.
+            # For vertical mirrors, y-position doesn't affect reflection.
+            # The game should detect the win when the mirror is at the right x.
+            return ActionDecision(
+                action_name="ACTION6",
+                source="puzzle_system:mirror_positioned",
+                confidence=0.60,
+                reason="mirror_positioned_wait",
+            )
+
+        # Player is NOT the mirror — standard shape piece reflection.
         if not ((player_grid_x < mirror_grid_x < min_goal_gx) or
                 (player_grid_x > mirror_grid_x > max_goal_gx)):
             return None
