@@ -11,6 +11,7 @@ from agi_core.orch_or.game_model import (
     Objective,
     Plan,
     PlanStep,
+    SpriteInfo,
     deserialize_plan,
     serialize_plan,
 )
@@ -29,6 +30,7 @@ __all__ = (
     "PlanStep",
     "REPLAN",
     "RETRY",
+    "SpriteInfo",
     "ThreadPoolManager",
     "deserialize_plan",
     "serialize_plan",

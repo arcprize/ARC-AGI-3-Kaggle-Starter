@@ -2300,6 +2300,39 @@ class DemoZipTrainingTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(int(count or 0), 0)
 
+    def test_infer_dynamics_beam_from_high_switch_click(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_dynamics_from_actions({"ACTION5": 20, "ACTION6": 20, "ACTION1": 10}),
+            "beam",
+        )
+
+    def test_infer_dynamics_signal_from_switch_click(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_dynamics_from_actions({"ACTION5": 15, "ACTION6": 5, "ACTION1": 20}),
+            "signal",
+        )
+
+    def test_infer_dynamics_gravity_from_high_up_ratio(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_dynamics_from_actions({"ACTION1": 30, "ACTION2": 5, "ACTION3": 10, "ACTION4": 10}),
+            "gravity",
+        )
+
+    def test_infer_dynamics_navigation_from_balanced_movement(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_dynamics_from_actions({"ACTION1": 1, "ACTION2": 6, "ACTION3": 4, "ACTION4": 3}),
+            "navigation",
+        )
+
+    def test_infer_dynamics_sliding_from_strong_horizontal(self) -> None:
+        self.assertEqual(
+            demo_zip_module._infer_dynamics_from_actions({"ACTION1": 1, "ACTION4": 10}),
+            "sliding",
+        )
+
+    def test_infer_dynamics_static_for_empty(self) -> None:
+        self.assertEqual(demo_zip_module._infer_dynamics_from_actions({}), "static")
+
     def test_infer_board_type_puzzle_from_switch_ratio(self) -> None:
         self.assertEqual(
             demo_zip_module._infer_board_type({"ACTION5": 20, "ACTION1": 10, "ACTION2": 10}),
@@ -2316,21 +2349,6 @@ class DemoZipTrainingTests(unittest.TestCase):
         self.assertEqual(
             demo_zip_module._infer_board_type({"ACTION1": 30, "ACTION2": 10, "ACTION3": 10, "ACTION4": 10}),
             "platformer",
-        )
-
-    def test_infer_board_type_puzzle_from_balanced_vert_horiz(self) -> None:
-        self.assertEqual(
-            demo_zip_module._infer_board_type({"ACTION1": 1, "ACTION2": 6, "ACTION3": 4, "ACTION4": 3}),
-            "puzzle",
-        )
-
-    def test_infer_board_type_unknown_for_empty(self) -> None:
-        self.assertEqual(demo_zip_module._infer_board_type({}), "unknown")
-
-    def test_infer_board_type_unknown_for_strong_directional_bias(self) -> None:
-        self.assertEqual(
-            demo_zip_module._infer_board_type({"ACTION1": 1, "ACTION4": 10}),
-            "unknown",
         )
 
     def test_extract_board_policy_params_yields_ten_params(self) -> None:

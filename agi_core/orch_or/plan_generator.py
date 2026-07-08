@@ -121,7 +121,7 @@ def _generate_plan_parallel(
         (lambda fn=get_strategy(s): fn(game_model, context) if fn else [], s)
         for s in targets
     ]
-    raw_results = ThreadPoolManager.run_all(tasks, timeout=timeout)
+    raw_results = ThreadPoolManager.run_all(tasks, timeout=timeout or 1.0)
     all_steps: list[PlanStep] = []
     seen_actions: set[str] = set()
     for steps, name in raw_results:

@@ -995,6 +995,10 @@ def _build_abstract_memory_row(
             next_step.levels_completed if next_step is not None else step.levels_completed
         ),
     )
+    is_interaction = str(step.action_name or "") == "ACTION6"
+    if is_interaction:
+        if "interaction_step" not in motif_tags:
+            motif_tags = list(motif_tags) + ["interaction_step"]
     lead_in_actions = [
         str(prior_step.action_name or "")
         for prior_step in steps[max(0, index - 3) : index]
@@ -1016,6 +1020,7 @@ def _build_abstract_memory_row(
             action_name=str(step.action_name or ""),
             subgoal=str(decision_subgoal or ""),
             motif_tags=motif_tags,
+            action_data=step.action_data,
         ),
         "salience": 1.0 + (0.5 if outcome == "progress" else 0.2 * min(3, future_progress_delta)),
         "confidence": 0.8 if outcome == "progress" else 0.62,
@@ -1066,81 +1071,143 @@ def _abstract_lesson_text(
     action_name: str,
     subgoal: str,
     motif_tags: list[str],
+    action_data: dict[str, Any] | None = None,
 ) -> str:
     motif_text = ", ".join(motif_tags[:4]) if motif_tags else "generic-board"
+    if action_name == "ACTION6" and action_data:
+        cx = action_data.get("x", "")
+        cy = action_data.get("y", "")
+        return f"{action_name} transfers for {subgoal or 'current-subgoal'} under {motif_text} at ({cx},{cy})"
     return f"{action_name} transfers for {subgoal or 'current-subgoal'} under {motif_text}"
 
 
-def _infer_board_type(game_actions: dict[str, int]) -> str:
+def _infer_dynamics_from_actions(game_actions: dict[str, int]) -> str:
+    """Infer the primary dynamics category from action distribution.
+
+    Returns one of the 12 DynamicsCategory values based on action ratios.
+    """
     total = sum(game_actions.values())
     if total <= 0:
-        return "unknown"
+        return "static"
     switch_ratio = game_actions.get("ACTION5", 0) / total
     click_ratio = game_actions.get("ACTION6", 0) / total
     up_ratio = game_actions.get("ACTION1", 0) / total
+    down_ratio = game_actions.get("ACTION2", 0) / total
+    left_ratio = game_actions.get("ACTION3", 0) / total
+    right_ratio = game_actions.get("ACTION4", 0) / total
     vert = game_actions.get("ACTION1", 0) + game_actions.get("ACTION2", 0)
     horiz = game_actions.get("ACTION3", 0) + game_actions.get("ACTION4", 0)
     total_move = vert + horiz
-    if switch_ratio > 0.12 or click_ratio > 0.15:
+    # Beam: high switch + click, balanced movement
+    if switch_ratio > 0.15 and click_ratio > 0.15:
+        return "beam"
+    # Signal: high switch, moderate click, distributed movement
+    if switch_ratio > 0.12 and click_ratio > 0.08:
+        return "signal"
+    # Multi-agent: high switch, low click, balanced movement
+    if switch_ratio > 0.10 and click_ratio < 0.05 and total_move > 0:
+        return "multi-agent"
+    # Push-pull: high click, low switch, goal-directed movement
+    if click_ratio > 0.12 and switch_ratio < 0.05:
+        return "push-pull"
+    # Gravity: high up-ratio (jumping against gravity), low down-ratio
+    if up_ratio > 0.18 and down_ratio < 0.10 and total_move > 0:
+        return "gravity"
+    # Sliding: strong horizontal bias, low up/down
+    if horiz > vert * 3 and total_move > 0:
+        return "sliding"
+    # Inventory: click at many positions, moderate movement
+    if click_ratio > 0.05 and click_ratio < 0.12 and switch_ratio < 0.05 and total_move > 0:
+        return "inventory"
+    # Navigation: balanced movement, low switch/click
+    if total_move > 0 and switch_ratio < 0.08 and click_ratio < 0.08:
+        return "navigation"
+    # Pattern-transform: moderate switch + click, movement present
+    if switch_ratio > 0.05 or click_ratio > 0.05:
+        return "pattern-transform"
+    # Cellular-automata: very low movement, very low interaction
+    if total_move < total * 0.1:
+        return "cellular-automata"
+    return "navigation"
+
+
+def _infer_board_type(game_actions: dict[str, int]) -> str:
+    """Legacy wrapper — returns 'puzzle', 'platformer', or 'unknown' for backward compat."""
+    dynamics = _infer_dynamics_from_actions(game_actions)
+    puzzle_like = {"beam", "signal", "push-pull", "multi-agent", "pattern-transform", "hybrid"}
+    platformer_like = {"gravity", "sliding", "navigation", "inventory"}
+    if dynamics in puzzle_like:
         return "puzzle"
-    if up_ratio > 0.15 and total_move > 0:
+    if dynamics in platformer_like:
         return "platformer"
-    if vert > 0 and horiz > 0 and total_move > 0:
-        vert_pct = vert / total_move
-        if 0.3 < vert_pct < 0.7:
-            return "puzzle"
+    if dynamics == "static":
+        return "unknown"
     return "unknown"
 
 
 def _extract_board_policy_params(
     artifact_games: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    board_type_actions: dict[str, dict[str, int]] = {}
-    board_type_games: dict[str, set[str]] = {}
+    # Bucket by dynamics category (12 categories) and by legacy board_type.
+    dyn_actions: dict[str, dict[str, int]] = {}
+    dyn_games: dict[str, set[str]] = {}
+    bt_actions: dict[str, dict[str, int]] = {}
+    bt_games: dict[str, set[str]] = {}
     for game_id, game_entry in artifact_games.items():
         actions = game_entry.get("actions", {})
+        dynamics = _infer_dynamics_from_actions(actions)
         bt = _infer_board_type(actions)
-        board_type_games.setdefault(bt, set()).add(game_id)
-        target = board_type_actions.setdefault(bt, {})
+        dyn_games.setdefault(dynamics, set()).add(game_id)
+        bt_games.setdefault(bt, set()).add(game_id)
+        target_d = dyn_actions.setdefault(dynamics, {})
+        target_b = bt_actions.setdefault(bt, {})
         for action_name, count in actions.items():
-            target[action_name] = target.get(action_name, 0) + int(count or 0)
+            c = int(count or 0)
+            target_d[action_name] = target_d.get(action_name, 0) + c
+            target_b[action_name] = target_b.get(action_name, 0) + c
     rows: list[dict[str, Any]] = []
-    for board_type, action_counts in board_type_actions.items():
+
+    def _extract_rows(
+        key: str,
+        action_counts: dict[str, int],
+        game_count: int,
+    ) -> list[dict[str, Any]]:
+        if not action_counts:
+            return []
         total = sum(action_counts.values())
         if total <= 0:
-            continue
+            return []
         vert = action_counts.get("ACTION1", 0) + action_counts.get("ACTION2", 0)
         horiz = action_counts.get("ACTION3", 0) + action_counts.get("ACTION4", 0)
-        sorted_actions = sorted(
-            action_counts.items(), key=lambda x: -x[1]
-        )
+        sorted_actions = sorted(action_counts.items(), key=lambda x: -x[1])
         top3 = {a for a, _ in sorted_actions[:3]}
-        sample_count = len(board_type_games.get(board_type, set()))
+        sample_count = game_count
+        result: list[dict[str, Any]] = []
 
         # explore-bias
         if vert > horiz:
-            rows.append({"board_type": board_type, "param_name": "explore-bias", "param_value": "vertical", "confidence": 0.7, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "explore-bias", "param_value": "vertical", "confidence": 0.7, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "explore-bias", "param_value": "horizontal", "confidence": 0.7, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "explore-bias", "param_value": "horizontal", "confidence": 0.7, "sample_count": sample_count})
 
         # interact-range
         action6_pct = action_counts.get("ACTION6", 0) / total
         if action6_pct > 0.08:
-            rows.append({"board_type": board_type, "param_name": "interact-range", "param_value": "4", "confidence": 0.65, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "interact-range", "param_value": "4", "confidence": 0.65, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "interact-range", "param_value": "2", "confidence": 0.65, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "interact-range", "param_value": "2", "confidence": 0.65, "sample_count": sample_count})
 
         # switch-urgency
         if "ACTION5" in top3:
-            rows.append({"board_type": board_type, "param_name": "switch-urgency", "param_value": "high", "confidence": 0.7, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "switch-urgency", "param_value": "high", "confidence": 0.7, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "switch-urgency", "param_value": "low", "confidence": 0.7, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "switch-urgency", "param_value": "low", "confidence": 0.7, "sample_count": sample_count})
 
         # path-preference
         if horiz > vert * 2:
-            rows.append({"board_type": board_type, "param_name": "path-preference", "param_value": "direct", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "path-preference", "param_value": "direct", "confidence": 0.6, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "path-preference", "param_value": "safe", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "path-preference", "param_value": "safe", "confidence": 0.6, "sample_count": sample_count})
 
         # move-bias
         move_actions = {
@@ -1152,41 +1219,75 @@ def _extract_board_policy_params(
         if move_actions:
             dominant_dir = max(move_actions, key=move_actions.get)
             if move_actions[dominant_dir] > 0:
-                rows.append({"board_type": board_type, "param_name": "move-bias", "param_value": dominant_dir, "confidence": 0.65, "sample_count": sample_count})
+                result.append({"board_type": key, "param_name": "move-bias", "param_value": dominant_dir, "confidence": 0.65, "sample_count": sample_count})
 
         # beam-priority
         switch6_combo = action_counts.get("ACTION5", 0) + action_counts.get("ACTION6", 0)
         if switch6_combo > total * 0.2:
-            rows.append({"board_type": board_type, "param_name": "beam-priority", "param_value": "high", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "beam-priority", "param_value": "high", "confidence": 0.6, "sample_count": sample_count})
         elif switch6_combo > total * 0.1:
-            rows.append({"board_type": board_type, "param_name": "beam-priority", "param_value": "medium", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "beam-priority", "param_value": "medium", "confidence": 0.6, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "beam-priority", "param_value": "low", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "beam-priority", "param_value": "low", "confidence": 0.6, "sample_count": sample_count})
 
         # entity-count
         if action_counts.get("ACTION5", 0) > 0:
-            rows.append({"board_type": board_type, "param_name": "entity-count", "param_value": "multiple", "confidence": 0.7, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "entity-count", "param_value": "multiple", "confidence": 0.7, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "entity-count", "param_value": "single", "confidence": 0.7, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "entity-count", "param_value": "single", "confidence": 0.7, "sample_count": sample_count})
 
         # goal-proximity
         if "ACTION6" in top3:
-            rows.append({"board_type": board_type, "param_name": "goal-proximity", "param_value": "1", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "goal-proximity", "param_value": "1", "confidence": 0.6, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "goal-proximity", "param_value": "3", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "goal-proximity", "param_value": "3", "confidence": 0.6, "sample_count": sample_count})
 
         # retry-tolerance
         switch_pct = action_counts.get("ACTION5", 0) / total
         if switch_pct > 0.1:
-            rows.append({"board_type": board_type, "param_name": "retry-tolerance", "param_value": "2", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "retry-tolerance", "param_value": "2", "confidence": 0.6, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "retry-tolerance", "param_value": "5", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "retry-tolerance", "param_value": "5", "confidence": 0.6, "sample_count": sample_count})
 
         # stagnation-threshold
         if switch_pct > 0.1:
-            rows.append({"board_type": board_type, "param_name": "stagnation-threshold", "param_value": "2", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "stagnation-threshold", "param_value": "2", "confidence": 0.6, "sample_count": sample_count})
         else:
-            rows.append({"board_type": board_type, "param_name": "stagnation-threshold", "param_value": "5", "confidence": 0.6, "sample_count": sample_count})
+            result.append({"board_type": key, "param_name": "stagnation-threshold", "param_value": "5", "confidence": 0.6, "sample_count": sample_count})
+
+        # click-action-priority
+        action6_pct = action_counts.get("ACTION6", 0) / total
+        if action6_pct > 0.15:
+            result.append({"board_type": key, "param_name": "click-action-priority", "param_value": "high", "confidence": 0.65, "sample_count": sample_count})
+        elif action6_pct > 0.05:
+            result.append({"board_type": key, "param_name": "click-action-priority", "param_value": "medium", "confidence": 0.65, "sample_count": sample_count})
+        else:
+            result.append({"board_type": key, "param_name": "click-action-priority", "param_value": "low", "confidence": 0.65, "sample_count": sample_count})
+
+        # beam-reflection-type
+        beam_actions = action_counts.get("ACTION5", 0) + action_counts.get("ACTION6", 0)
+        if beam_actions > 0 and horiz > vert:
+            result.append({"board_type": key, "param_name": "beam-reflection-type", "param_value": "horizontal", "confidence": 0.6, "sample_count": sample_count})
+        elif beam_actions > 0 and vert > horiz:
+            result.append({"board_type": key, "param_name": "beam-reflection-type", "param_value": "vertical", "confidence": 0.6, "sample_count": sample_count})
+        else:
+            result.append({"board_type": key, "param_name": "beam-reflection-type", "param_value": "dual", "confidence": 0.6, "sample_count": sample_count})
+
+        # path-restricted
+        action3_pct = action_counts.get("ACTION3", 0) / total
+        if action3_pct > 0.15 and action6_pct > 0.08:
+            result.append({"board_type": key, "param_name": "path-restricted", "param_value": "true", "confidence": 0.55, "sample_count": sample_count})
+        else:
+            result.append({"board_type": key, "param_name": "path-restricted", "param_value": "false", "confidence": 0.55, "sample_count": sample_count})
+
+        return result
+
+    # Extract for each dynamics category
+    for dyn_key, dyn_counts in dyn_actions.items():
+        rows.extend(_extract_rows(dyn_key, dyn_counts, len(dyn_games.get(dyn_key, set()))))
+    # Also extract for legacy board types
+    for bt_key, bt_counts in bt_actions.items():
+        rows.extend(_extract_rows(bt_key, bt_counts, len(bt_games.get(bt_key, set()))))
 
     return rows
 

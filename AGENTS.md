@@ -79,12 +79,25 @@ ARC-AGI-3 Kaggle competition starter kit. The agent system uses ORCH-OR (Orchest
 - **Tests**: Run both `test_orch_or` and `test_executive` after every change.
 
 ## Current State
-- Level 0 (platformer) is NOT completing — win condition requires ALL goal positions covered by sprite pixels (beam + reflections + player), not just reaching a goal.
-- Beam puzzle solver integrated into hyperon memory system (`agi_core/knowledge/beam_solver.py`). Computes mirror position to reflect beam onto uncovered goals using `reflected_x = 2 * mirror_x - beam_x`.
-- Goal_seeker strategy uses beam solver when player is a beam controller (mirror).
-- Solver results cached to SQLite `beam_solutions` table for cross-session learning.
-- Level 0 completion blocked by: score-floor fallback prevents proper switch → mirror aim → shape piece sequence. The agent's fallback mechanics interrupt the switch-aim-navigate pipeline.
-- Level 1 completion requires first completing level 0.
+- AR25 has 8 levels (no "level 0" — first level is Level 1).
+- **Level 1** (mirror reflection puzzle): Shape piece must position itself so its reflection across a static mirror (color 10, grid x=10) covers all 5 goal markers at grid positions (19,15), (17,17), (17,16), (17,15), (18,15).
+- **Level 1 COMPLETING**: The agent navigates the shape piece to the computed target pixel (4, 46) via A* pathfinding in `_try_mirror_placement()` and the game engine's `vplrhaovhr()` detects the win. Verified to achieve `levels_completed=1` within ~15 steps.
+- The game engine renders with letterbox padding (color 5) and a step counter energy bar (color 11) that can confuse component detection. Fixed by: (1) excluding the rightmost column and bottom row from background color sampling in `_detect_background_color()`, (2) selecting the correct goal component (not the energy bar) in `_try_mirror_placement()`.
+
+### Key Fixes Applied
+- **False beam detection fixed**: The game engine renders mirror reflections as color-4 cells (`pbtdgroplk = wxztsweyvs = 4` in `ar25.py:1599`). Fixed in `_detect_beam()` (analyzer.py) by checking if ALL color-4 cells are on the opposite side of a mirror from the player.
+- **Background color detection**: `_detect_background_color()` now excludes the rightmost column (energy bar, color 11) and bottom row (letterbox padding, color 5) from border sampling.
+- **Goal component vs energy bar**: The energy bar (color 11) at column 63 was selected as the goal component. Fixed `_try_mirror_placement()` to select the color-11 component that has cells in interior columns (not column 63).
+- **NameError in `_navigate_to_goal`**: The `goal_score` closure referenced undefined `features` and `beam_cells`. Fixed by using `game_model.features` and computing `beam_cells` inside the method.
+- **Infinite ACTION5 loop from cached solutions fixed**: `_action_from_memory()` returned ACTION5 (`cached_solution_switch_back`) when the player was within 3px of a cached mirror position. Changed to return `_fallback()` instead.
+- **`_switch_count` protected from entity jump resets**: Added `last_action != "ACTION5"` guard.
+- **PuzzleSystem activation for mirror puzzles**: `should_activate()` explicitly checks for mirror components (color 10) with goals on the opposite side.
+- **Heuristic fallback navigation**: Added heuristic movement toward target when A* fails in `_try_mirror_placement()`.
+
+### Level 1 Target Computation
+- Mirror at grid x=10 (pixel x=31). Goals span grid (17-19, 15-17) → pixels (52-58, 46-52).
+- Target: grid (1, 15) → pixel (4, 46). Reflection covers (17-19, 15-17) → all 5 goals.
+- Reflection formula (game engine): `reflected_x = 2 * mirror_sprite_x - original_x`.
 
 ## Cleanup History
 - **All game-specific hardcoding removed**: `_GAME_PRIORS`, `_GAME_RESET_NEEDED`, `_BEAM_STRATEGY` dicts (ar25) removed from `hyperon_bridge.py:385-470`. These are now fully hyperon memory managed via `_load_trained_prior_bucket()` and `_load_board_policy_overrides()`.

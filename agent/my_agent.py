@@ -37,7 +37,7 @@ from agi_core.specialists.symbolic import SymbolicSpecialist
 class MyAgent(Agent):
     """ARC-facing wrapper around the reusable executive runtime."""
 
-    MAX_ACTIONS = 80
+    MAX_ACTIONS = 300
     DEBUG_DECISIONS = os.environ.get("AGI_DEBUG_DECISIONS", "0").strip().lower() in {
         "1",
         "true",

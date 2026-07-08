@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, deque
 
-from agi_core.orch_or.game_model import Component, GameFeatures, GameModel
+from agi_core.orch_or.game_model import Component, DynamicsCategory, GameFeatures, GameModel, SpriteInfo
 from agi_core.orch_or.search import astar
 
 _PLATFORMER_THRESHOLD = 5
@@ -12,7 +12,17 @@ def build_game_model(board: list[list[int]]) -> GameModel:
     height = len(board)
     width = len(board[0]) if height > 0 else 0
     bg_color = _detect_background_color(board, width, height)
-    raw_components = _find_components(board, width, height, bg_color)
+    # Parallelize: grid scale detection runs concurrently with component detection
+    try:
+        from agi_core.orch_or.parallel import ThreadPoolManager
+        pool = ThreadPoolManager.executor()
+        comp_future = pool.submit(_find_components, board, width, height, bg_color)
+        scale_future = pool.submit(_detect_grid_scale, board, width, height)
+        raw_components = comp_future.result()
+        grid_scale = scale_future.result()
+    except Exception:
+        raw_components = _find_components(board, width, height, bg_color)
+        grid_scale = _detect_grid_scale(board, width, height)
     components = _merge_nearby_same_color(raw_components)
     color_freq = _compute_color_frequencies(board, bg_color)
     player_pos = _find_player(components, height, color_freq)
@@ -20,6 +30,14 @@ def build_game_model(board: list[list[int]]) -> GameModel:
     obstacles = _find_obstacles(components, player_pos, goal_positions)
     walkable = _find_walkable(board, width, height, bg_color, obstacles, player_pos, goal_positions, components)
     features = _extract_features(board, width, height, bg_color, components, player_pos, goal_positions, walkable)
+    # Sprite detection: grid scale and entity identification
+    features.grid_scale = grid_scale
+    if grid_scale > 1:
+        features.grid_width = width // grid_scale
+        features.grid_height = height // grid_scale
+        sprites = _detect_sprites(board, grid_scale, bg_color, player_pos, goal_positions, components, width, height)
+    else:
+        sprites = []
     return GameModel(
         board=board,
         height=height,
@@ -30,19 +48,28 @@ def build_game_model(board: list[list[int]]) -> GameModel:
         components=components,
         walkable=walkable,
         features=features,
+        sprites=sprites,
     )
 
 
 def _detect_background_color(board: list[list[int]], width: int, height: int) -> int:
+    """Detect background color, excluding letterbox padding and UI elements.
+    
+    Samples the top row, bottom row, and left column to find the most common
+    color, EXCLUDING the rightmost column (often energy bar/step counter) and
+    bottom-right corner (padding artifact)."""
     border_pixels: list[int] = []
-    if height > 0:
-        if width > 0:
-            border_pixels.extend(board[0])
-            border_pixels.extend(board[-1])
+    if height <= 0 or width <= 0:
+        return -1
+    # Top row: exclude last column (energy bar)
+    for x in range(width - 1):
+        border_pixels.append(board[0][x])
+    # Bottom row: exclude last column
+    for x in range(width - 1):
+        border_pixels.append(board[-1][x])
+    # Left column: exclude first and last row (already counted)
     for y in range(1, height - 1):
-        if width > 0:
-            border_pixels.append(board[y][0])
-            border_pixels.append(board[y][-1])
+        border_pixels.append(board[y][0])
     if not border_pixels:
         return -1
     counts = Counter(border_pixels)
@@ -343,28 +370,115 @@ def _detect_beam(
     board: list[list[int]],
     player_pos: tuple[int, int] | None,
     bg_color: int,
+    width: int = 64,
+    height: int = 64,
 ) -> tuple[bool, int, list[tuple[int, int]], int, float, int]:
     beam_color_candidates = [4]
-    beam_comp = None
+    beam_cells: list[tuple[int, int]] = []
+    beam_color = -1
     for c in components:
-        if c.dominant_color in beam_color_candidates and not c.touches_border:
-            beam_comp = c
-            break
-    if beam_comp is None:
+        if c.dominant_color in beam_color_candidates:
+            beam_color = c.dominant_color
+            beam_cells.extend(c.cells)
+    if not beam_cells:
         return (False, -1, [], 0, float('inf'), -1)
-    beam_cells_set = set(beam_comp.cells)
+
+    # Distinguish real beam cells from mirror-reflection artifacts.
+    # In some games, mirror reflections are rendered as color-4 cells, making them
+    # indistinguishable from real beams. Check: if there's a mirror (color 10) and
+    # ALL color-4 cells are on the opposite side of the mirror from the player,
+    # they are reflection artifacts, not a real beam.
+    if player_pos is not None:
+        mirror_comp = next((c for c in components if c.dominant_color == 10), None)
+        if mirror_comp is not None and len(beam_cells) > 0:
+            mirror_px = sum(cx for cx, _ in mirror_comp.cells) // len(mirror_comp.cells)
+            px, py = player_pos
+            sides = set()
+            for bx, by in beam_cells:
+                if bx < mirror_px:
+                    sides.add("left")
+                elif bx > mirror_px:
+                    sides.add("right")
+            # If all beam cells are on only one side of mirror, and player is on
+            # the opposite side, these are reflection artifacts (no real beam).
+            if len(sides) == 1:
+                beam_side = next(iter(sides))
+                player_side = "left" if px < mirror_px else "right"
+                if beam_side != player_side:
+                    return (False, -1, [], 0, float('inf'), -1)
+
+    beam_cells_set = set(beam_cells)
     goals_lit = sum(1 for gx, gy in goal_positions if (gx, gy) in beam_cells_set)
     min_dist = float('inf')
     mirror_axis = -1
-    if beam_comp.cells:
-        if goal_positions:
-            min_dist = min(
-                min(abs(bx - gx) + abs(by - gy) for gx, gy in goal_positions)
-                for bx, by in beam_comp.cells
-            )
-        mirror_axis = _infer_mirror_axis(beam_comp, player_pos, board)
-    sample = beam_comp.cells[:5]
-    return (True, beam_comp.dominant_color, sample, goals_lit, min_dist, mirror_axis)
+    beam_direction = "point"
+    if goal_positions:
+        min_dist = min(
+            min(abs(bx - gx) + abs(by - gy) for gx, gy in goal_positions)
+            for bx, by in beam_cells
+        )
+    if player_pos is not None:
+        px, py = player_pos
+        for bx, by in beam_cells:
+            if abs(bx - px) + abs(by - py) <= 6:
+                mirror_axis = px
+                break
+    # Infer beam direction from cell positions
+    if len(beam_cells) >= 2:
+        xs = [c[0] for c in beam_cells]
+        ys = [c[1] for c in beam_cells]
+        x_range = max(xs) - min(xs)
+        y_range = max(ys) - min(ys)
+        if x_range > y_range * 2:
+            beam_direction = "horizontal"
+        elif y_range > x_range * 2:
+            beam_direction = "vertical"
+        else:
+            beam_direction = "diagonal"
+    else:
+        beam_direction = "point"
+    sample = beam_cells[:5]
+    return (True, beam_color, sample, goals_lit, min_dist, mirror_axis)
+
+
+def _compute_goal_coverage(
+    player_pos: tuple[int, int],
+    beam_cells: list[tuple[int, int]],
+    goal_positions: list[tuple[int, int]],
+    mirror_x: int,
+    width: int,
+    height: int,
+) -> int:
+    """Compute how many goals are covered by beam + reflection + player."""
+    covered = set(beam_cells)
+    if player_pos is not None:
+        covered.add(player_pos)
+    # Add reflected beam cells
+    for bx, by in beam_cells:
+        rx = 2 * mirror_x - bx
+        if 0 <= rx < width:
+            covered.add((rx, by))
+    return sum(1 for gx, gy in goal_positions if (gx, gy) in covered)
+
+
+def _compute_board_similarity(
+    board1: list[list[int]],
+    board2: list[list[int]],
+    width: int = 64,
+    height: int = 64,
+) -> float:
+    """Compute similarity between two boards (0.0 to 1.0)."""
+    if len(board1) != len(board2) or len(board1[0]) != len(board2[0]):
+        return 0.0
+    total = width * height
+    if total == 0:
+        return 0.0
+    matching = 0
+    for y in range(height):
+        for x in range(width):
+            if board1[y][x] == board2[y][x]:
+                matching += 1
+    return matching / total
 
 
 def _infer_mirror_axis(
@@ -400,15 +514,30 @@ def _extract_features(
         a_star_passable = expanded_walkable | {player_pos} | set(goal_positions)
         path = astar(player_pos, goal_positions[0], a_star_passable, width, height)
         path_possible = path is not None
-    board_type = _classify_board(components, player_pos)
     has_beam, beam_color, beam_positions, goals_lit, beam_min_dist, mirror_axis = _detect_beam(
         components, goal_positions, board, player_pos, bg_color,
+    )
+    # Compute movement axes before dynamics detection
+    movement_axes: set[str] = set()
+    if player_pos is not None and goal_positions:
+        px, py = player_pos
+        all_y = [gy for _, gy in goal_positions]
+        all_x = [gx for gx, _ in goal_positions]
+        if any(abs(gx - px) > 0 for gx in all_x):
+            movement_axes.add("x")
+        if any(abs(gy - py) > 0 for gy in all_y):
+            movement_axes.add("y")
+    dynamics_list, primary_dynamics = _detect_dynamics(
+        board, components, player_pos, goal_positions, bg_color,
+        has_beam, False, movement_axes, width, height,
     )
     features = GameFeatures(
         background_color=bg_color,
         player_detectable=player_pos is not None,
         goal_detectable=len(goal_positions) > 0,
-        board_type=board_type,
+        board_type=primary_dynamics,
+        dynamics=dynamics_list,
+        primary_dynamics=primary_dynamics,
         tile_size=_detect_tile_size(board, width, height, bg_color),
         path_to_goal_possible=path_possible,
         has_beam=has_beam,
@@ -418,7 +547,7 @@ def _extract_features(
         beam_min_dist_to_goal=beam_min_dist,
         mirror_axis=mirror_axis,
     )
-    features.has_gravity = board_type == "platformer"
+    features.has_gravity = "gravity" in dynamics_list
     if player_pos is not None:
         player_comp = _find_player_component(components, player_pos)
         if player_comp is not None and player_comp.dominant_color != 0:
@@ -429,17 +558,8 @@ def _extract_features(
         if 0 <= gy < height and 0 <= gx < width:
             features.goal_color = board[gy][gx]
             break
-    if player_pos is not None and goal_positions:
-        px, py = player_pos
-        all_y = [gy for _, gy in goal_positions]
-        all_x = [gx for gx, _ in goal_positions]
-        axes: set[str] = set()
-        if any(abs(gx - px) > 0 for gx in all_x):
-            axes.add("x")
-        if any(abs(gy - py) > 0 for gy in all_y):
-            axes.add("y")
-        if axes:
-            features.movement_axes = axes
+    if movement_axes:
+        features.movement_axes = movement_axes
     player_region = [c for c in components if not c.touches_border and 1 <= c.size <= 80]
     top_colors = set()
     for c in player_region:
@@ -461,14 +581,346 @@ def _find_player_component(components: list[Component], player_pos: tuple[int, i
     return max(candidates, key=lambda c: c.size)
 
 
-def _classify_board(components: list[Component], player_pos: tuple[int, int] | None = None) -> str:
+def _detect_dynamics(
+    board: list[list[int]],
+    components: list[Component],
+    player_pos: tuple[int, int] | None,
+    goal_positions: list[tuple[int, int]],
+    bg_color: int,
+    has_beam: bool,
+    has_click_interaction: bool,
+    movement_axes: set[str],
+    board_width: int,
+    board_height: int,
+) -> tuple[list[str], str]:
+    detected: list[str] = []
+
+    if player_pos is None and not goal_positions:
+        return (["static"], "static")
+
     non_border = [c for c in components if not c.touches_border]
+
+    # Multi-agent candidates: non-border components that could be entities
+    candidate_entities = [
+        c for c in non_border
+        if c.dominant_color != bg_color
+        and c.dominant_color not in (0, 4, 11)
+        and c.size >= 4
+    ]
     if player_pos is not None:
-        non_border = [c for c in non_border if not _in_bbox(player_pos, c.bbox)]
-    distinct_colors = set(c.dominant_color for c in non_border)
-    if len(non_border) <= 5 and len(distinct_colors) <= 4:
-        return "platformer"
-    return "puzzle"
+        player_comp = _find_player_component(components, player_pos)
+        if player_comp is not None:
+            candidate_entities = [c for c in candidate_entities if c is not player_comp]
+    entity_count = len(candidate_entities)
+    if entity_count >= 2:
+        detected.append("multi-agent")
+
+    # Beam
+    if has_beam:
+        detected.append("beam")
+
+    # Mirror reflection puzzle: mirror (color 10) with goals on opposite side from player
+    if player_pos is not None and goal_positions:
+        mirror_comp = next((c for c in components if c.dominant_color == 10), None)
+        if mirror_comp is not None:
+            mirror_px = sum(cx for cx, _ in mirror_comp.cells) // len(mirror_comp.cells) if mirror_comp.cells else 0
+            px, py = player_pos
+            goal_xs = [gx for gx, _ in goal_positions]
+            min_gx, max_gx = min(goal_xs), max(goal_xs)
+            if (px < mirror_px < min_gx) or (px > mirror_px > max_gx):
+                detected.append("puzzle")
+
+    # Push/Pull: manipulable components adjacent to player
+    if player_pos is not None:
+        px, py = player_pos
+        neighbors = {(px - 1, py), (px + 1, py), (px, py - 1), (px, py + 1)}
+        adjacent_manipulable = [
+            c for c in non_border
+            if c.dominant_color != bg_color
+            and c.dominant_color not in (0, 4, 11)
+            and any(cell in neighbors for cell in c.cells)
+            and c.size <= 12
+        ]
+        if adjacent_manipulable:
+            detected.append("push-pull")
+
+    # Gravity: player in bottom third with empty space below, or components stacked at bottom
+    if player_pos is not None and board_height > 0:
+        px, py = player_pos
+        bottom_third = board_height * 2 // 3
+        if py >= bottom_third:
+            below_empty = False
+            for y in range(py + 1, board_height):
+                if y < board_height and board[y][px] == bg_color:
+                    below_empty = True
+                else:
+                    break
+            if below_empty:
+                detected.append("gravity")
+
+    # Inventory: small non-border components (collectible-sized)
+    if player_pos is not None:
+        small_components = [
+            c for c in non_border
+            if c.dominant_color != bg_color
+            and c.dominant_color not in (0, 4, 11)
+            and c.size <= 4
+        ]
+        if len(small_components) >= 2:
+            detected.append("inventory")
+
+    # Sliding: long unobstructed corridors in movement axes
+    if player_pos is not None:
+        px, py = player_pos
+        long_corridor = False
+        if not movement_axes or "x" in movement_axes:
+            for y in range(max(0, py - 3), min(board_height, py + 4)):
+                run = 0
+                for x in range(board_width):
+                    if board[y][x] == bg_color or board[y][x] == 0:
+                        run += 1
+                        if run >= 12:
+                            long_corridor = True
+                            break
+                    else:
+                        run = 0
+                if long_corridor:
+                    break
+        if not long_corridor and (not movement_axes or "y" in movement_axes):
+            for x in range(max(0, px - 3), min(board_width, px + 4)):
+                run = 0
+                for y in range(board_height):
+                    if board[y][x] == bg_color or board[y][x] == 0:
+                        run += 1
+                        if run >= 12:
+                            long_corridor = True
+                            break
+                    else:
+                        run = 0
+                if long_corridor:
+                    break
+        if long_corridor:
+            detected.append("sliding")
+
+    # Signal: many interactive-looking non-border components
+    interactive_count = sum(
+        1 for c in non_border
+        if c.dominant_color not in (bg_color, 0, 4, 11)
+        and 4 <= c.size <= 20
+    )
+    if interactive_count >= 3:
+        detected.append("signal")
+
+    # Pattern-transform: many distinct colors among non-border components
+    distinct_colors = set(c.dominant_color for c in non_border if c.dominant_color != bg_color)
+    if len(distinct_colors) >= 6 and len(non_border) >= 10:
+        detected.append("pattern-transform")
+
+    # Cellular-automata: many tiny components suggesting grid evolution
+    tiny_count = sum(1 for c in non_border if c.size <= 3 and c.dominant_color != bg_color)
+    if tiny_count >= 8 and len(non_border) >= 15:
+        detected.append("cellular-automata")
+
+    # Navigation: default when player and goals exist
+    if player_pos is not None and goal_positions:
+        if not detected:
+            detected.append("navigation")
+    elif not detected:
+        detected.append("navigation")
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_detected: list[str] = []
+    for d in detected:
+        if d not in seen:
+            seen.add(d)
+            unique_detected.append(d)
+
+    primary = _pick_primary_dynamics(unique_detected, has_beam, player_pos is not None, bool(goal_positions))
+
+    if len(unique_detected) >= 2:
+        unique_detected.append("hybrid")
+
+    return (unique_detected, primary)
+
+
+def _pick_primary_dynamics(
+    detected: list[str],
+    has_beam: bool,
+    has_player: bool,
+    has_goals: bool,
+) -> str:
+    priority = [
+        "static", "beam", "puzzle", "gravity", "sliding", "push-pull", "signal",
+        "cellular-automata", "pattern-transform", "multi-agent",
+        "inventory", "navigation", "hybrid",
+    ]
+    for p in priority:
+        if p in detected:
+            return p
+    return "navigation"
+
+
+def _detect_grid_scale(board: list[list[int]], width: int = 64, height: int = 64) -> int:
+    """Detect the pixel-to-grid scale factor using multi-resolution analysis.
+    
+    Strategy:
+    1. Block uniformity: check % of s×s blocks with uniform color
+    2. Edge periodicity: find repeating color transitions
+    3. Returns scale with >50% uniform blocks (strict)
+    """
+    # Quick check: if all cells are same color, scale is 1
+    first_color = board[0][0] if height > 0 and width > 0 else -1
+    all_same = all(board[y][x] == first_color for y in range(height) for x in range(width))
+    if all_same:
+        return 1
+    scores: dict[int, float] = {}
+    for scale in range(2, 17):
+        bw = width // scale
+        bh = height // scale
+        if bw < 4 or bh < 4:
+            continue
+        uniform = 0
+        total = 0
+        for by in range(bh):
+            for bx in range(bw):
+                px = bx * scale
+                py = by * scale
+                block_color = board[py][px]
+                is_uniform = True
+                for dy in range(scale):
+                    row = board[py + dy]
+                    for dx in range(scale):
+                        if row[px + dx] != block_color:
+                            is_uniform = False
+                            break
+                    if not is_uniform:
+                        break
+                if is_uniform:
+                    uniform += 1
+                total += 1
+        if total > 0:
+            scores[scale] = uniform / total
+    # Also check edge periodicity
+    edge_scores: dict[int, int] = {}
+    for y in range(height):
+        prev = -2
+        gap = 0
+        for x in range(width):
+            val = board[y][x]
+            if val != prev and prev >= 0:
+                if gap > 0 and gap < 10:
+                    edge_scores[gap] = edge_scores.get(gap, 0) + 1
+                gap = 0
+            gap += 1
+            prev = val
+    # Combine scores
+    best_scale = 1
+    best_score = 0.0
+    for scale in range(2, 17):
+        uniformity = scores.get(scale, 0.0)
+        edge_bonus = edge_scores.get(scale, 0) / max(1, width * height // 100)
+        combined = uniformity * 0.7 + min(edge_bonus, 0.3)
+        if combined > best_score and uniformity > 0.50:
+            best_score = combined
+            best_scale = scale
+    return best_scale
+
+
+def _detect_sprites(
+    board: list[list[int]],
+    grid_scale: int,
+    bg_color: int,
+    player_pos: tuple[int, int] | None,
+    goal_positions: list[tuple[int, int]],
+    components: list[Component],
+    width: int = 64,
+    height: int = 64,
+) -> list[SpriteInfo]:
+    """Detect game sprites from the pixel board at grid resolution.
+    
+    Uses grid-scale downsampling, flood-fill with 8-connectivity, and shape heuristics.
+    Links color-0 selection overlay to underlying entity sprites.
+    """
+    if grid_scale <= 1:
+        return []
+    gw = width // grid_scale
+    gh = height // grid_scale
+    if gw < 4 or gh < 4:
+        return []
+    # Downsample: sample center of each grid cell
+    grid = [[0] * gw for _ in range(gh)]
+    for gy in range(gh):
+        cy = gy * grid_scale + grid_scale // 2
+        for gx in range(gw):
+            cx = gx * grid_scale + grid_scale // 2
+            if cy < height and cx < width:
+                grid[gy][gx] = board[cy][cx]
+    # Flood-fill with 8-connectivity (including diagonals)
+    visited = [[False] * gw for _ in range(gh)]
+    sprite_list: list[SpriteInfo] = []
+    color_0_cells: set[tuple[int, int]] = set()
+    dirs8 = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+    for gy in range(gh):
+        for gx in range(gw):
+            if visited[gy][gx]:
+                continue
+            color = grid[gy][gx]
+            if color == bg_color or color < 0:
+                visited[gy][gx] = True
+                continue
+            cells: list[tuple[int, int]] = []
+            stack = [(gx, gy)]
+            visited[gy][gx] = True
+            while stack:
+                cx, cy = stack.pop()
+                cells.append((cx, cy))
+                for dx, dy in dirs8:
+                    nx, ny = cx + dx, cy + dy
+                    if 0 <= nx < gw and 0 <= ny < gh and not visited[ny][nx] and grid[ny][nx] == color:
+                        visited[ny][nx] = True
+                        stack.append((nx, ny))
+            if color == 0:
+                color_0_cells.update(cells)
+                continue
+            min_gx = min(c[0] for c in cells)
+            max_gx = max(c[0] for c in cells)
+            min_gy = min(c[1] for c in cells)
+            max_gy = max(c[1] for c in cells)
+            span_x = max_gx - min_gx + 1
+            span_y = max_gy - min_gy + 1
+            # Classify by shape
+            is_strip = (span_x == 1 or span_y == 1) and len(cells) >= 3
+            is_mirror = (color == 10 and is_strip)
+            is_goal = (color == 11)
+            is_entity = (color == 5)
+            is_beam = (color == 4)
+            sprite_id = f"s{color}_{min_gx}_{min_gy}"
+            si = SpriteInfo(
+                grid_x=min_gx,
+                grid_y=min_gy,
+                grid_w=span_x,
+                grid_h=span_y,
+                pixel_x=min_gx * grid_scale,
+                pixel_y=min_gy * grid_scale,
+                color=color,
+                is_clickable=is_entity or is_mirror,
+                is_mirror=is_mirror,
+                is_goal=is_goal,
+                sprite_id=sprite_id,
+            )
+            sprite_list.append(si)
+    # Link color-0 overlay to player entity
+    if color_0_cells and player_pos is not None:
+        px, py = player_pos
+        if px < width and py < height:
+            pgx = px // grid_scale
+            pgy = py // grid_scale
+            for si in sprite_list:
+                if si.color == 5 and si.grid_x <= pgx <= si.grid_x + si.grid_w - 1 and si.grid_y <= pgy <= si.grid_y + si.grid_h - 1:
+                    si.is_player = True
+                    break
+    return sprite_list
 
 
 def _detect_tile_size(board: list[list[int]], width: int, height: int, bg_color: int) -> int:

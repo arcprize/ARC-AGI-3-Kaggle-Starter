@@ -189,7 +189,10 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                 return steps
         # Direct navigation toward the nearest goal when the current entity does
         # not control the beam (e.g. a secondary sprite in a puzzle level).
-        if features.goal_detectable and game_model.goal_positions and (features.board_type == "platformer" or (features.board_type == "puzzle" and features.player_color in non_beam_set)):
+        _pd = features.primary_dynamics
+        _direct_nav = _pd in ("navigation", "gravity", "inventory") or (features.board_type == "platformer")
+        _puzzle_nav = _pd in ("beam", "signal", "push-pull", "multi-agent", "pattern-transform", "hybrid", "puzzle") and features.player_color in non_beam_set
+        if features.goal_detectable and game_model.goal_positions and (_direct_nav or _puzzle_nav):
             # Board-type goal proximity: within this distance, consider the
             # goal reached and stop navigating.
             _proximity = 2
@@ -252,8 +255,9 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                     pass  # Use A* to pathfind (handled by other strategies)
         except Exception:
             pass
-        # Search order fallback for puzzle boards with goal detectable
-        if features.board_type == "puzzle":
+        # Search order fallback for puzzle-like boards with goal detectable
+        puzzle_like = features.primary_dynamics in ("beam", "signal", "push-pull", "multi-agent", "pattern-transform", "hybrid", "puzzle") or (features.board_type == "puzzle" and features.primary_dynamics in ("unknown", "navigation"))
+        if puzzle_like:
             _explore_bias = "vertical"
             try:
                 board_bias_rows = (context or {}).get("board_explore_bias", [])

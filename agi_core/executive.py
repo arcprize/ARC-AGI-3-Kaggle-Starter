@@ -11,6 +11,8 @@ from agi_core.image_input import (
 )
 from agi_core.memory import EpisodicMemory
 from agi_core.types import ActionDecision, ExecutiveContext, GoalState, MemoryBundle
+from agi_core.orch_or.parallel import ThreadPoolManager
+from concurrent.futures import TimeoutError
 
 
 class Executive:
@@ -58,10 +60,20 @@ class Executive:
         )
         replan_mode = self._should_enter_replan_mode(context)
         context.replan_mode = replan_mode
-        reactive_proposals = [] if replan_mode else self.reactive.propose(context)
-        symbolic_proposals = self.symbolic.propose(context)
-        if self.llm is not None:
-            self._refresh_llm_memory_bundle(context, symbolic_proposals, reactive_proposals)
+        reactive_proposals = []
+        symbolic_proposals = []
+        pool = ThreadPoolManager.executor()
+        reactive_task = pool.submit(self.reactive.propose, context) if not replan_mode else None
+        symbolic_task = pool.submit(self.symbolic.propose, context)
+        if reactive_task is not None:
+            try:
+                reactive_proposals = reactive_task.result(timeout=2.0)
+            except Exception:
+                reactive_proposals = []
+        try:
+            symbolic_proposals = symbolic_task.result(timeout=2.0)
+        except Exception:
+            symbolic_proposals = []
         proposals = list(reactive_proposals) + list(symbolic_proposals)
         score_floor_fallback_cooldown = context.memory.recent_score_floor_fallback(
             context.observation
@@ -75,6 +87,7 @@ class Executive:
             symbolic_proposals,
         )
         if self.llm is not None:
+            self._refresh_llm_memory_bundle(context, symbolic_proposals, reactive_proposals)
             if context.force_llm_replan and not context.llm_subgoal_hint:
                 context.llm_subgoal_hint = "replan"
             if (

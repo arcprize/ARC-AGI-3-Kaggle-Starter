@@ -1,7 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class DynamicsCategory(str, Enum):
+    STATIC = "static"
+    NAVIGATION = "navigation"
+    SLIDING = "sliding"
+    GRAVITY = "gravity"
+    PUSH_PULL = "push-pull"
+    BEAM = "beam"
+    SIGNAL = "signal"
+    CELLULAR_AUTOMATA = "cellular-automata"
+    PATTERN_TRANSFORM = "pattern-transform"
+    MULTI_AGENT = "multi-agent"
+    INVENTORY = "inventory"
+    HYBRID = "hybrid"
 
 
 @dataclass(slots=True)
@@ -11,6 +27,22 @@ class Component:
     size: int
     dominant_color: int
     touches_border: bool
+
+
+@dataclass(slots=True)
+class SpriteInfo:
+    grid_x: int
+    grid_y: int
+    grid_w: int
+    grid_h: int
+    pixel_x: int
+    pixel_y: int
+    color: int
+    is_clickable: bool = False
+    is_player: bool = False
+    is_mirror: bool = False
+    is_goal: bool = False
+    sprite_id: str = ""
 
 
 @dataclass(slots=True)
@@ -24,6 +56,8 @@ class GameFeatures:
     player_detectable: bool = False
     goal_detectable: bool = False
     board_type: str = "unknown"
+    dynamics: list[str] = field(default_factory=list)
+    primary_dynamics: str = "unknown"
     path_to_goal_possible: bool = False
     tile_size: int = 6
     background_color: int = -1
@@ -36,6 +70,10 @@ class GameFeatures:
     goals_lit_by_beam: int = 0
     beam_min_dist_to_goal: float = float('inf')
     mirror_axis: int = -1
+    beam_direction: str = ""
+    grid_scale: int = 0
+    grid_width: int = 0
+    grid_height: int = 0
 
 
 @dataclass(slots=True)
@@ -49,6 +87,7 @@ class GameModel:
     components: list[Component]
     walkable: set[tuple[int, int]]
     features: GameFeatures
+    sprites: list[SpriteInfo] = field(default_factory=list)
 
 
 @dataclass(slots=True)

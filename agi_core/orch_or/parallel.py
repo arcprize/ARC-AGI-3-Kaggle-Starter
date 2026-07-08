@@ -83,3 +83,13 @@ class ThreadPoolManager:
         for future in set(futures.keys()) - done:
             future.cancel()
         return results
+
+    @classmethod
+    def submit(cls, fn, *args, **kwargs):
+        """Submit a single task and return a future."""
+        return cls.executor().submit(fn, *args, **kwargs)
+
+    @classmethod
+    def map(cls, fn, *iterables, timeout=None):
+        """Map a function over iterables concurrently, returning results in order."""
+        return cls.executor().map(fn, *iterables, timeout=timeout)

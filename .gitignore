@@ -1,8 +1,6 @@
-# Kaggle credentials (project-local, never check in)
-.kaggle/
+.*/
 
 # Python
-.venv/
 __pycache__/
 *.pyc
 
@@ -29,12 +27,7 @@ tmp*/
 
 # OS / editors
 .DS_Store
-.idea/
-.vscode/
 /third_party
-/.tmp*
-/.pip-cache/http-v2
-/.vs
 /models
 /*.sqlite3
 /*.sqlite3-journal

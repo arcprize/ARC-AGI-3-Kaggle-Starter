@@ -72,7 +72,10 @@ class ObjectiveReduction:
         # Feed board_type into hyperon facts so game-action-priors can use it.
         try:
             if hasattr(context.hyperon, "facts"):
-                context.hyperon.facts.setdefault("episode", {})["board_type"] = game_model.features.board_type
+                ep = context.hyperon.facts.setdefault("episode", {})
+                ep["board_type"] = game_model.features.board_type
+                ep["primary_dynamics"] = game_model.features.primary_dynamics
+                ep["dynamics"] = list(game_model.features.dynamics)
         except Exception:
             pass
         logger.debug(
@@ -85,12 +88,15 @@ class ObjectiveReduction:
         )
 
         # Clear per-level state when a new level starts (player jumps far)
-        if context.memory.most_recent_action() in ("RESET", None):
+        last_action = context.memory.most_recent_action()
+        if last_action in ("RESET", None):
             self._failed_directions.clear()
         if self._previous_model is not None and self._previous_model.player_pos is not None and game_model.player_pos is not None:
             prev_p = self._previous_model.player_pos
             curr_p = game_model.player_pos
-            if abs(curr_p[0] - prev_p[0]) + abs(curr_p[1] - prev_p[1]) > _LEVEL_JUMP_THRESHOLD:
+            player_jumped = abs(curr_p[0] - prev_p[0]) + abs(curr_p[1] - prev_p[1]) > _LEVEL_JUMP_THRESHOLD
+            # Don't clear switch state on entity switches (ACTION5 jumps between entities)
+            if player_jumped and last_action != "ACTION5":
                 self._non_beam_controllers.clear()
                 self._switch_count = 0
                 self._failed_directions.clear()
@@ -562,6 +568,7 @@ class ObjectiveReduction:
                     "memory_db_path": getattr(context.config, "memory_db_path", None),
                     "beam_cells": [],
                     "mirror_axis": game_model.features.mirror_axis,
+                    "abstract_memories": list(context.memory_bundle.abstract_memories) if context.memory_bundle and context.memory_bundle.abstract_memories else [],
                 }
                 if game_model.features.has_beam:
                     beam_comps = [c for c in game_model.components if c.dominant_color == game_model.features.beam_color and not c.touches_border]
@@ -591,7 +598,8 @@ class ObjectiveReduction:
 
     def _fallback_executive_parallel(self, context: ExecutiveContext, timeout: float = 2.0) -> ActionDecision:
         try:
-            future = ThreadPoolManager.executor().submit(self._executive.decide, context)
+            from agi_core.orch_or.parallel import ThreadPoolManager
+            future = ThreadPoolManager.submit(self._executive.decide, context)
             return future.result(timeout=timeout)
         except TimeoutError:
             return ActionDecision(

@@ -66,7 +66,8 @@ def reduce(
             reach.sub_objectives = [_explore()]
             root.sub_objectives = [reach]
             return root
-        if features.board_type == "puzzle":
+        puzzle_like = features.primary_dynamics in ("beam", "signal", "push-pull", "multi-agent", "pattern-transform", "hybrid", "puzzle") or (features.board_type == "puzzle" and features.primary_dynamics in ("unknown", "navigation"))
+        if puzzle_like:
             reach = _reach_goal()
             has_interactive = any(otype == "interactive" for _, _, otype in game_model.obstacles)
             if features.path_to_goal_possible:

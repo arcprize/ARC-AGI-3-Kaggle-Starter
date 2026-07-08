@@ -36,6 +36,156 @@ from agi_core.types import ActionProposal, EpisodeRecord, GoalState, MemoryBundl
 
 logger = logging.getLogger(__name__)
 
+# Dynamics-based board policy defaults for the 12-category taxonomy.
+# Keyed by dynamics category name -> {param_key: value}.
+# These provide sensible defaults; trained overrides from SQLite take precedence.
+_DYNAMICS_PARAMS: dict[str, dict[str, Any]] = {
+    "static": {
+        "goal-hint": "none", "stagnation-threshold": 10, "reset-threshold": 20,
+        "explore-bias": "none", "interact-range": 0, "move-bias": "none",
+        "beam-priority": "low", "switch-urgency": "low", "path-preference": "balanced",
+        "retry-tolerance": 10, "goal-proximity": 5, "entity-count": "single",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "position", "probe-strategy": "click", "focus-mode": "single",
+        "nav-style": "free", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "low", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "navigation": {
+        "goal-hint": "navigate-to-goal", "stagnation-threshold": 5, "reset-threshold": 10,
+        "explore-bias": "horizontal", "interact-range": 2, "move-bias": "right",
+        "beam-priority": "low", "switch-urgency": "low", "path-preference": "direct",
+        "retry-tolerance": 5, "goal-proximity": 2, "entity-count": "single",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "position", "probe-strategy": "click", "focus-mode": "single",
+        "nav-style": "free", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "low", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "sliding": {
+        "goal-hint": "navigate-to-goal", "stagnation-threshold": 6, "reset-threshold": 12,
+        "explore-bias": "horizontal", "interact-range": 2, "move-bias": "right",
+        "beam-priority": "low", "switch-urgency": "low", "path-preference": "safe",
+        "retry-tolerance": 6, "goal-proximity": 2, "entity-count": "single",
+        "gravity-enabled": "false", "horizontal-scroll": "true", "collision-type": "solid",
+        "exit-type": "position", "probe-strategy": "click", "focus-mode": "single",
+        "nav-style": "free", "danger-detection": "avoid", "viewport-style": "follow",
+        "click-action-priority": "low", "beam-reflection-type": "dual",
+        "path-restricted": "true",
+    },
+    "gravity": {
+        "goal-hint": "navigate-to-goal", "stagnation-threshold": 5, "reset-threshold": 12,
+        "explore-bias": "horizontal", "interact-range": 2, "move-bias": "right",
+        "beam-priority": "low", "switch-urgency": "low", "path-preference": "safe",
+        "retry-tolerance": 5, "goal-proximity": 3, "entity-count": "single",
+        "gravity-enabled": "true", "horizontal-scroll": "true", "collision-type": "solid",
+        "exit-type": "position", "probe-strategy": "swipe", "focus-mode": "single",
+        "nav-style": "free", "danger-detection": "avoid", "viewport-style": "follow",
+        "click-action-priority": "low", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "push-pull": {
+        "goal-hint": "explore-board", "stagnation-threshold": 3, "reset-threshold": 10,
+        "explore-bias": "vertical", "interact-range": 1, "move-bias": "down",
+        "beam-priority": "medium", "switch-urgency": "medium", "path-preference": "direct",
+        "retry-tolerance": 3, "goal-proximity": 1, "entity-count": "single",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "position", "probe-strategy": "click", "focus-mode": "single",
+        "nav-style": "grid", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "high", "beam-reflection-type": "dual",
+        "path-restricted": "true",
+    },
+    "beam": {
+        "goal-hint": "explore-board", "stagnation-threshold": 2, "reset-threshold": 8,
+        "explore-bias": "vertical", "interact-range": 4, "move-bias": "down",
+        "beam-priority": "high", "switch-urgency": "high", "path-preference": "direct",
+        "retry-tolerance": 2, "goal-proximity": 1, "entity-count": "multiple",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "action", "probe-strategy": "click", "focus-mode": "multi",
+        "nav-style": "grid", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "high", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "signal": {
+        "goal-hint": "explore-board", "stagnation-threshold": 3, "reset-threshold": 8,
+        "explore-bias": "vertical", "interact-range": 4, "move-bias": "down",
+        "beam-priority": "medium", "switch-urgency": "high", "path-preference": "direct",
+        "retry-tolerance": 3, "goal-proximity": 1, "entity-count": "multiple",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "action", "probe-strategy": "click", "focus-mode": "multi",
+        "nav-style": "grid", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "medium", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "cellular-automata": {
+        "goal-hint": "observe", "stagnation-threshold": 8, "reset-threshold": 15,
+        "explore-bias": "horizontal", "interact-range": 1, "move-bias": "right",
+        "beam-priority": "low", "switch-urgency": "low", "path-preference": "balanced",
+        "retry-tolerance": 8, "goal-proximity": 3, "entity-count": "single",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "position", "probe-strategy": "click", "focus-mode": "single",
+        "nav-style": "free", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "low", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "pattern-transform": {
+        "goal-hint": "observe", "stagnation-threshold": 6, "reset-threshold": 12,
+        "explore-bias": "vertical", "interact-range": 3, "move-bias": "down",
+        "beam-priority": "medium", "switch-urgency": "medium", "path-preference": "direct",
+        "retry-tolerance": 6, "goal-proximity": 2, "entity-count": "single",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "action", "probe-strategy": "click", "focus-mode": "multi",
+        "nav-style": "grid", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "medium", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "multi-agent": {
+        "goal-hint": "explore-board", "stagnation-threshold": 3, "reset-threshold": 8,
+        "explore-bias": "vertical", "interact-range": 3, "move-bias": "down",
+        "beam-priority": "medium", "switch-urgency": "high", "path-preference": "direct",
+        "retry-tolerance": 3, "goal-proximity": 1, "entity-count": "multiple",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "action", "probe-strategy": "click", "focus-mode": "multi",
+        "nav-style": "grid", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "medium", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "inventory": {
+        "goal-hint": "navigate-to-goal", "stagnation-threshold": 4, "reset-threshold": 10,
+        "explore-bias": "horizontal", "interact-range": 1, "move-bias": "right",
+        "beam-priority": "low", "switch-urgency": "low", "path-preference": "direct",
+        "retry-tolerance": 4, "goal-proximity": 2, "entity-count": "single",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "position", "probe-strategy": "click", "focus-mode": "single",
+        "nav-style": "free", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "medium", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "hybrid": {
+        "goal-hint": "explore-board", "stagnation-threshold": 3, "reset-threshold": 8,
+        "explore-bias": "vertical", "interact-range": 3, "move-bias": "down",
+        "beam-priority": "medium", "switch-urgency": "medium", "path-preference": "direct",
+        "retry-tolerance": 3, "goal-proximity": 1, "entity-count": "multiple",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "action", "probe-strategy": "click", "focus-mode": "multi",
+        "nav-style": "grid", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "medium", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+    "puzzle": {
+        "goal-hint": "explore-board", "stagnation-threshold": 2, "reset-threshold": 8,
+        "explore-bias": "vertical", "interact-range": 4, "move-bias": "down",
+        "beam-priority": "high", "switch-urgency": "high", "path-preference": "direct",
+        "retry-tolerance": 2, "goal-proximity": 1, "entity-count": "multiple",
+        "gravity-enabled": "false", "horizontal-scroll": "false", "collision-type": "solid",
+        "exit-type": "action", "probe-strategy": "click", "focus-mode": "multi",
+        "nav-style": "grid", "danger-detection": "ignore", "viewport-style": "fixed",
+        "click-action-priority": "high", "beam-reflection-type": "dual",
+        "path-restricted": "false",
+    },
+}
+
+
 class HyperonBridge:
     """Defensive Hyperon wrapper with a deterministic shadow fact store."""
 
@@ -385,6 +535,7 @@ class HyperonBridge:
             ]
         if query_name == "game-action-priors":
             board_type = str(episode.get("board_type", "") or "")
+            dynamics = str(episode.get("primary_dynamics", "") or "")
             base = self._action_priors(
                 legal_actions, memory,
                 learned=self.facts.get("learned", {}),
@@ -392,176 +543,103 @@ class HyperonBridge:
                 current_subgoal=query_arg,
                 current_frame_signature=str(episode.get("frame_signature", "") or ""),
             )
-            # Override with board-type-specific priors.
+            # Override with dynamics-based or board-type-specific priors.
             _BOARD_PRIORS: dict[str, dict[str, float]] = {
                 "puzzle": {"ACTION1": 0.30, "ACTION2": 0.35, "ACTION3": 0.30,
                            "ACTION4": 0.30, "ACTION5": 0.80, "ACTION6": 0.70},
                 "platformer": {"ACTION1": 0.60, "ACTION2": 0.65, "ACTION3": 0.60,
                                "ACTION4": 0.65, "ACTION5": 0.40, "ACTION6": 0.35},
             }
-            if board_type in _BOARD_PRIORS:
-                for action, conf in _BOARD_PRIORS[board_type].items():
+            _DYNAMICS_PRIORS: dict[str, dict[str, float]] = {
+                "beam": {"ACTION5": 0.80, "ACTION6": 0.75},
+                "signal": {"ACTION5": 0.75, "ACTION6": 0.65},
+                "push-pull": {"ACTION6": 0.70},
+                "multi-agent": {"ACTION5": 0.70},
+                "gravity": {"ACTION1": 0.65, "ACTION2": 0.30},
+                "navigation": {"ACTION1": 0.55, "ACTION2": 0.55, "ACTION3": 0.55, "ACTION4": 0.55},
+                "inventory": {"ACTION1": 0.50, "ACTION4": 0.50},
+            }
+            prior_source = dynamics if dynamics in _DYNAMICS_PRIORS else board_type
+            prior_map = _DYNAMICS_PRIORS.get(dynamics) if dynamics in _DYNAMICS_PRIORS else _BOARD_PRIORS.get(board_type)
+            if prior_map:
+                for action, conf in prior_map.items():
                     base = [p for p in base if p.get("action_name") != action]
-                    base.append({"action_name": action, "confidence": conf, "reason": f"board-prior:{board_type}"})
+                    base.append({"action_name": action, "confidence": conf, "reason": f"board-prior:{prior_source}"})
             return base
         if query_name == "game-goal-hints":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("goal-hint")
-            if trained is not None:
-                return [{"subgoal": str(trained), "confidence": 0.75,
-                         "reason": f"trained-goal-hint:{board_type}"}]
-            _BOARD_GOAL_HINTS: dict[str, str] = {
-                "puzzle": "explore-board",
-                "platformer": "navigate-to-goal",
-            }
-            if board_type in _BOARD_GOAL_HINTS:
-                return [{"subgoal": _BOARD_GOAL_HINTS[board_type], "confidence": 0.75,
-                         "reason": f"board-goal-hint:{board_type}"}]
+            goal_hint = self._get_board_policy_value(episode, "goal-hint", cast=str, board_defaults={"puzzle": "explore-board", "platformer": "navigate-to-goal"}, fallback=None)
+            if goal_hint is not None:
+                return [{"subgoal": goal_hint, "confidence": 0.75,
+                         "reason": f"board-goal-hint:{episode.get('board_type', 'unknown')}"}]
             return self._run_shadow_rules("goal-hints")
         if query_name == "game-stagnation":
-            board_type = str(episode.get("board_type", "") or "unknown")
             stagnation_steps = int(memory.get("stagnation_steps", 0) or 0)
-            trained = self._load_board_policy_overrides(board_type).get("stagnation-threshold")
-            if trained is not None:
-                threshold = int(trained)
-            else:
-                _BOARD_STAGNATION_THRESHOLD: dict[str, int] = {
-                    "puzzle": 2,
-                    "platformer": 5,
-                    "unknown": 3,
-                }
-                threshold = _BOARD_STAGNATION_THRESHOLD.get(board_type, 3)
+            threshold = self._get_board_policy_value(episode, "stagnation-threshold", cast=int, board_defaults={"puzzle": 2, "platformer": 5, "unknown": 3}, fallback=3)
             if stagnation_steps >= threshold:
                 return [{"flag": "stagnation", "confidence": 0.74,
-                         "reason": f"board-stagnation:{board_type}"}]
+                         "reason": f"board-stagnation:{episode.get('board_type', 'unknown')}"}]
             return []
         if query_name == "game-reset-needed":
             return self._run_shadow_rules("reset-needed")
         if query_name == "beam-strategy":
             return []
         if query_name == "board-reset-threshold":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("reset-threshold")
-            _BOARD_RESET: dict[str, int] = {"puzzle": 8, "platformer": 12, "unknown": 6}
-            value = int(trained) if trained is not None else _BOARD_RESET.get(board_type, 6)
-            return [{"threshold": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "reset-threshold", cast=int, board_defaults={"puzzle": 8, "platformer": 12, "unknown": 6}, fallback=6)
+            return [{"threshold": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-explore-bias":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("explore-bias")
-            _BOARD_BIAS: dict[str, str] = {"puzzle": "vertical", "platformer": "horizontal", "unknown": "horizontal"}
-            value = str(trained) if trained is not None else _BOARD_BIAS.get(board_type, "horizontal")
-            return [{"axis": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "explore-bias", cast=str, board_defaults={"puzzle": "vertical", "platformer": "horizontal", "unknown": "horizontal"}, fallback="horizontal")
+            return [{"axis": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-interact-range":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("interact-range")
-            _BOARD_RANGE: dict[str, int] = {"puzzle": 4, "platformer": 2, "unknown": 3}
-            value = int(trained) if trained is not None else _BOARD_RANGE.get(board_type, 3)
-            return [{"range": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "interact-range", cast=int, board_defaults={"puzzle": 4, "platformer": 2, "unknown": 3}, fallback=3)
+            return [{"range": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-move-bias":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("move-bias")
-            _BOARD_MOVE: dict[str, str] = {"puzzle": "down", "platformer": "right", "unknown": "right"}
-            value = str(trained) if trained is not None else _BOARD_MOVE.get(board_type, "right")
-            return [{"direction": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "move-bias", cast=str, board_defaults={"puzzle": "down", "platformer": "right", "unknown": "right"}, fallback="right")
+            return [{"direction": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-beam-priority":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("beam-priority")
-            _BOARD_BEAM: dict[str, str] = {"puzzle": "high", "platformer": "low", "unknown": "medium"}
-            value = str(trained) if trained is not None else _BOARD_BEAM.get(board_type, "medium")
-            return [{"priority": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "beam-priority", cast=str, board_defaults={"puzzle": "high", "platformer": "low", "unknown": "medium"}, fallback="medium")
+            return [{"priority": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-switch-urgency":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("switch-urgency")
-            _BOARD_SWITCH: dict[str, str] = {"puzzle": "high", "platformer": "low", "unknown": "medium"}
-            value = str(trained) if trained is not None else _BOARD_SWITCH.get(board_type, "medium")
-            return [{"urgency": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "switch-urgency", cast=str, board_defaults={"puzzle": "high", "platformer": "low", "unknown": "medium"}, fallback="medium")
+            return [{"urgency": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-path-preference":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("path-preference")
-            _BOARD_PATH: dict[str, str] = {"puzzle": "direct", "platformer": "safe", "unknown": "balanced"}
-            value = str(trained) if trained is not None else _BOARD_PATH.get(board_type, "balanced")
-            return [{"preference": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "path-preference", cast=str, board_defaults={"puzzle": "direct", "platformer": "safe", "unknown": "balanced"}, fallback="balanced")
+            return [{"preference": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-retry-tolerance":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("retry-tolerance")
-            _BOARD_RETRY: dict[str, int] = {"puzzle": 2, "platformer": 5, "unknown": 3}
-            value = int(trained) if trained is not None else _BOARD_RETRY.get(board_type, 3)
-            return [{"tolerance": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "retry-tolerance", cast=int, board_defaults={"puzzle": 2, "platformer": 5, "unknown": 3}, fallback=3)
+            return [{"tolerance": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-goal-proximity":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("goal-proximity")
-            _BOARD_PROX: dict[str, int] = {"puzzle": 1, "platformer": 3, "unknown": 2}
-            value = int(trained) if trained is not None else _BOARD_PROX.get(board_type, 2)
-            return [{"proximity": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "goal-proximity", cast=int, board_defaults={"puzzle": 1, "platformer": 3, "unknown": 2}, fallback=2)
+            return [{"proximity": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-entity-count":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("entity-count")
-            _BOARD_ENT: dict[str, str] = {"puzzle": "multiple", "platformer": "single", "unknown": "single"}
-            value = str(trained) if trained is not None else _BOARD_ENT.get(board_type, "single")
-            return [{"count": value, "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "entity-count", cast=str, board_defaults={"puzzle": "multiple", "platformer": "single", "unknown": "single"}, fallback="single")
+            return [{"count": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-gravity-enabled":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("gravity-enabled")
-            if trained is not None:
-                return [{"gravity": str(trained), "board_type": board_type}]
-            _BOARD_GRV: dict[str, str] = {"puzzle": "false", "platformer": "true", "unknown": "false"}
-            return [{"gravity": _BOARD_GRV.get(board_type, "false"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "gravity-enabled", cast=str, board_defaults={"puzzle": "false", "platformer": "true", "unknown": "false"}, fallback="false")
+            return [{"gravity": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-horizontal-scroll":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("horizontal-scroll")
-            if trained is not None:
-                return [{"scroll": str(trained), "board_type": board_type}]
-            _BOARD_SCR: dict[str, str] = {"puzzle": "false", "platformer": "true", "unknown": "false"}
-            return [{"scroll": _BOARD_SCR.get(board_type, "false"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "horizontal-scroll", cast=str, board_defaults={"puzzle": "false", "platformer": "true", "unknown": "false"}, fallback="false")
+            return [{"scroll": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-collision-type":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("collision-type")
-            if trained is not None:
-                return [{"collision": str(trained), "board_type": board_type}]
-            _BOARD_COL: dict[str, str] = {"puzzle": "solid", "platformer": "solid", "unknown": "solid"}
-            return [{"collision": _BOARD_COL.get(board_type, "solid"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "collision-type", cast=str, board_defaults={"puzzle": "solid", "platformer": "solid", "unknown": "solid"}, fallback="solid")
+            return [{"collision": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-exit-type":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("exit-type")
-            if trained is not None:
-                return [{"exit": str(trained), "board_type": board_type}]
-            _BOARD_EXT: dict[str, str] = {"puzzle": "action", "platformer": "position", "unknown": "position"}
-            return [{"exit": _BOARD_EXT.get(board_type, "position"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "exit-type", cast=str, board_defaults={"puzzle": "action", "platformer": "position", "unknown": "position"}, fallback="position")
+            return [{"exit": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-probe-strategy":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("probe-strategy")
-            if trained is not None:
-                return [{"strategy": str(trained), "board_type": board_type}]
-            _BOARD_PROBE: dict[str, str] = {"puzzle": "click", "platformer": "swipe", "unknown": "click"}
-            return [{"strategy": _BOARD_PROBE.get(board_type, "click"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "probe-strategy", cast=str, board_defaults={"puzzle": "click", "platformer": "swipe", "unknown": "click"}, fallback="click")
+            return [{"strategy": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-focus-mode":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("focus-mode")
-            if trained is not None:
-                return [{"mode": str(trained), "board_type": board_type}]
-            _BOARD_FOCUS: dict[str, str] = {"puzzle": "multi", "platformer": "single", "unknown": "single"}
-            return [{"mode": _BOARD_FOCUS.get(board_type, "single"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "focus-mode", cast=str, board_defaults={"puzzle": "multi", "platformer": "single", "unknown": "single"}, fallback="single")
+            return [{"mode": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-nav-style":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("nav-style")
-            if trained is not None:
-                return [{"style": str(trained), "board_type": board_type}]
-            _BOARD_NAV: dict[str, str] = {"puzzle": "grid", "platformer": "free", "unknown": "free"}
-            return [{"style": _BOARD_NAV.get(board_type, "free"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "nav-style", cast=str, board_defaults={"puzzle": "grid", "platformer": "free", "unknown": "free"}, fallback="free")
+            return [{"style": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-danger-detection":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("danger-detection")
-            if trained is not None:
-                return [{"detection": str(trained), "board_type": board_type}]
-            _BOARD_DANGER: dict[str, str] = {"puzzle": "ignore", "platformer": "avoid", "unknown": "ignore"}
-            return [{"detection": _BOARD_DANGER.get(board_type, "ignore"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "danger-detection", cast=str, board_defaults={"puzzle": "ignore", "platformer": "avoid", "unknown": "ignore"}, fallback="ignore")
+            return [{"detection": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "board-viewport-style":
-            board_type = str(episode.get("board_type", "") or "unknown")
-            trained = self._load_board_policy_overrides(board_type).get("viewport-style")
-            if trained is not None:
-                return [{"style": str(trained), "board_type": board_type}]
-            _BOARD_VIEW: dict[str, str] = {"puzzle": "fixed", "platformer": "follow", "unknown": "fixed"}
-            return [{"style": _BOARD_VIEW.get(board_type, "fixed"), "board_type": board_type}]
+            value = self._get_board_policy_value(episode, "viewport-style", cast=str, board_defaults={"puzzle": "fixed", "platformer": "follow", "unknown": "fixed"}, fallback="fixed")
+            return [{"style": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
         if query_name == "beam-solver":
             try:
                 from agi_core.knowledge.beam_solver import solve_beam_puzzle
@@ -598,19 +676,81 @@ class HyperonBridge:
                 from agi_core.knowledge.puzzle_system import PuzzleSystem
                 if self._puzzle_system is None:
                     self._puzzle_system = PuzzleSystem(memory_db_path=self.memory_db_path)
+                dynamics = str(episode.get("primary_dynamics", "") or "")
                 game_model_data = {
                     "has_beam": bool(episode.get("has_beam", False)),
                     "board_type": str(episode.get("board_type", "")),
+                    "primary_dynamics": dynamics,
                     "player_pos": episode.get("player_pos"),
                     "goal_positions": episode.get("goal_positions", []),
                     "mirror_axis": int(episode.get("mirror_axis", -1)),
+                    "has_interactive": bool(episode.get("has_interactive", False)),
+                    "has_sprites": bool(episode.get("has_sprites", False)),
                 }
-                if game_model_data["has_beam"] or game_model_data["board_type"] == "puzzle":
+                puzzle_dynamics = {"beam", "signal", "push-pull", "multi-agent", "pattern-transform", "hybrid", "puzzle"}
+                if (game_model_data["has_beam"]
+                    or game_model_data["board_type"] in ("puzzle", "unknown")
+                    or dynamics in puzzle_dynamics
+                    or game_model_data["has_interactive"]
+                    or game_model_data["has_sprites"]):
                     return [{"activated": True, "source": "puzzle_system"}]
             except Exception as exc:
                 logger.debug("puzzle-solver shadow rule failed: %s", exc)
             return [{"activated": False}]
+        if query_name == "board-click-action-priority":
+            value = self._get_board_policy_value(episode, "click-action-priority", cast=str, board_defaults={"puzzle": "high", "platformer": "low", "unknown": "medium"}, fallback="medium")
+            return [{"priority": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
+        if query_name == "board-beam-reflection-type":
+            value = self._get_board_policy_value(episode, "beam-reflection-type", cast=str, board_defaults={}, fallback="dual")
+            return [{"type": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
+        if query_name == "board-path-restricted":
+            value = self._get_board_policy_value(episode, "path-restricted", cast=str, board_defaults={"puzzle": "false", "platformer": "false", "unknown": "false"}, fallback="false")
+            return [{"restricted": value, "board_type": episode.get("board_type", "unknown"), "dynamics": episode.get("primary_dynamics", "")}]
+        if query_name == "board-puzzle-strategy":
+            board_type = str(episode.get("board_type", "") or "unknown")
+            dynamics = str(episode.get("primary_dynamics", "") or "")
+            has_beam = bool(episode.get("has_beam", False))
+            has_interactive = bool(episode.get("has_interactive", False))
+            if dynamics == "beam" or (not dynamics and has_beam):
+                return [{"strategy": "beam", "board_type": board_type, "dynamics": dynamics}]
+            elif dynamics in ("signal", "push-pull", "multi-agent") or (not dynamics and has_interactive):
+                return [{"strategy": "interact", "board_type": board_type, "dynamics": dynamics}]
+            else:
+                return [{"strategy": "navigate", "board_type": board_type, "dynamics": dynamics}]
         return []
+
+    def _get_board_policy_value(
+        self,
+        episode: dict[str, Any],
+        param_key: str,
+        *,
+        cast: type = str,
+        board_defaults: dict[str, Any] | None = None,
+        fallback: Any = None,
+    ) -> Any:
+        dynamics = str(episode.get("primary_dynamics", "") or "")
+        board_type = str(episode.get("board_type", "") or "unknown")
+        # 1. Trained overrides for dynamics
+        if dynamics:
+            trained = self._load_board_policy_overrides(dynamics).get(param_key)
+            if trained is not None:
+                return cast(trained)
+        # 2. Dynamics defaults matrix
+        if dynamics and dynamics in _DYNAMICS_PARAMS:
+            dyn_val = _DYNAMICS_PARAMS[dynamics].get(param_key)
+            if dyn_val is not None:
+                return cast(dyn_val)
+        # 3. Trained overrides for board_type
+        trained = self._load_board_policy_overrides(board_type).get(param_key)
+        if trained is not None:
+            return cast(trained)
+        # 4. Board_type defaults
+        if board_defaults and board_type in board_defaults:
+            return cast(board_defaults[board_type])
+        # 5. Fallback
+        if fallback is not None:
+            return cast(fallback)
+        return None
 
     def _working_memory_goal_hint(
         self,
@@ -2978,24 +3118,25 @@ class HyperonBridge:
         summary.setdefault("frame_signatures", {})
         return summary
 
-    def _load_board_policy_overrides(self, board_type: str) -> dict[str, str]:
+    def _load_board_policy_overrides(self, key: str) -> dict[str, str]:
         if self.trained_priors_db_path is None:
             return {}
         if self._board_policy_params_cache is None:
             self._board_policy_params_cache = {}
+            # Load all known board types and dynamics from the trained DB.
             try:
-                puzzle = load_board_policy_params(self.trained_priors_db_path, "puzzle")
-                platformer = load_board_policy_params(self.trained_priors_db_path, "platformer")
-                unknown = load_board_policy_params(self.trained_priors_db_path, "unknown")
-                if puzzle:
-                    self._board_policy_params_cache["puzzle"] = puzzle
-                if platformer:
-                    self._board_policy_params_cache["platformer"] = platformer
-                if unknown:
-                    self._board_policy_params_cache["unknown"] = unknown
+                for known_type in ("puzzle", "platformer", "unknown",
+                                   "static", "navigation", "sliding", "gravity",
+                                   "push-pull", "beam", "signal",
+                                   "cellular-automata", "pattern-transform",
+                                   "multi-agent", "inventory", "hybrid",
+                                   "puzzle"):
+                    params = load_board_policy_params(self.trained_priors_db_path, known_type)
+                    if params:
+                        self._board_policy_params_cache[known_type] = params
             except Exception:
                 self._board_policy_params_cache = {}
-        return self._board_policy_params_cache.get(board_type, {})
+        return self._board_policy_params_cache.get(key, {})
 
     def _load_trained_prior_bucket(
         self,

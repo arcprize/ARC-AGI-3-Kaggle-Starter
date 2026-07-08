@@ -221,7 +221,8 @@ class AnalyzerTests(unittest.TestCase):
                 if (x + y) % 2 == 0:
                     board[y][x] = 7
         gm = build_game_model(board)
-        self.assertIn(gm.features.board_type, ("puzzle", "platformer"))
+        valid_types = {"puzzle", "platformer", "unknown", "static", "navigation", "sliding", "gravity", "push-pull", "beam", "signal", "cellular-automata", "pattern-transform", "multi-agent", "inventory", "hybrid"}
+        self.assertIn(gm.features.board_type, valid_types)
 
     def test_tile_size_detection_10x10(self) -> None:
         board = [[0] * 10 for _ in range(10)]

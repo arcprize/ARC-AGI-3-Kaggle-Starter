@@ -15,29 +15,29 @@ def astar(
         return None
     if start == goal:
         return [start]
-    open_set = [(0, start)]
+    open_set = [(0, 0, start)]
     came_from: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
     g_score: dict[tuple[int, int], float] = {start: 0}
 
     gx, gy = goal
     sx, sy = start
-    dirs = []
-    if gx > sx: dirs.append((1, 0))
-    if gx < sx: dirs.append((-1, 0))
-    if gy > sy: dirs.append((0, 1))
-    if gy < sy: dirs.append((0, -1))
-    for d in [(1,0), (-1,0), (0,1), (0,-1)]:
-        if d not in dirs:
-            dirs.append(d)
+    dx_goal = abs(gx - sx)
+    dy_goal = abs(gy - sy)
+    # Prefer the axis with larger distance
+    prefer_right = gx > sx and dx_goal >= dy_goal
+    prefer_left = gx < sx and dx_goal >= dy_goal
+    prefer_down = gy > sy and dy_goal > dx_goal
+    prefer_up = gy < sy and dy_goal > dx_goal
 
     while open_set:
-        _, current = heapq.heappop(open_set)
+        _, _, current = heapq.heappop(open_set)
         if current == goal:
             return _reconstruct_path(came_from, current)
         if len(g_score) > max_steps:
             return None
-        for dx, dy in dirs:
-            neighbor = (current[0] + dx, current[1] + dy)
+        cx, cy = current
+        for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:
+            neighbor = (cx + dx, cy + dy)
             if neighbor[0] < 0 or neighbor[0] >= width or neighbor[1] < 0 or neighbor[1] >= height:
                 continue
             if neighbor not in passable:
@@ -45,8 +45,15 @@ def astar(
             tentative = g_score[current] + 1
             if neighbor not in g_score or tentative < g_score[neighbor]:
                 g_score[neighbor] = tentative
-                priority = tentative + _manhattan(neighbor, goal)
-                heapq.heappush(open_set, (priority, neighbor))
+                h = _manhattan(neighbor, goal)
+                priority = tentative + h
+                # Tiebreaker: prefer direction toward goal's primary axis
+                pref = 0
+                if dx == 1 and prefer_right: pref = -1
+                elif dx == -1 and prefer_left: pref = -1
+                elif dy == 1 and prefer_down: pref = -1
+                elif dy == -1 and prefer_up: pref = -1
+                heapq.heappush(open_set, (priority, pref, neighbor))
                 came_from[neighbor] = current
     return None
 
