@@ -101,6 +101,14 @@ class ObjectiveReduction:
                 self._switch_count = 0
                 self._failed_directions.clear()
                 self._stable_goal = None
+                # Reset puzzle system per-level state so stale state from
+                # the previous level doesn't carry over (e.g. _impassable_cells,
+                # _beam_puzzle_completed, _last_pos, etc.).
+                try:
+                    if self._puzzle_system is not None:
+                        self._puzzle_system.reset_level()
+                except Exception:
+                    pass
         elif self._previous_model is None:
             self._non_beam_controllers.clear()
             self._switch_count = 0

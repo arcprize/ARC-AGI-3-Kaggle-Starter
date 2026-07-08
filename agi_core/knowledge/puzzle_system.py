@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 class PuzzleSystem:
     def __init__(self, memory_db_path: str | Path | None = None) -> None:
         self._memory_db_path = Path(memory_db_path) if memory_db_path else None
+        self.reset_level()
+
+    def reset_level(self) -> None:
+        """Reset per-level state. Called on level transitions."""
         self._action_history: dict[str, int] = {}
         self._mirror_frames: int = 0
         self._last_pos: tuple[int, int] | None = None
@@ -412,7 +416,6 @@ class PuzzleSystem:
                       if c[0] < game_model.width - 1 and c[1] < game_model.height - 1]
         if not goal_cells:
             return None
-            return None
         min_goal_px = min(c[0] for c in goal_cells)
         min_goal_py = min(c[1] for c in goal_cells)
         max_goal_px = max(c[0] for c in goal_cells)
@@ -421,7 +424,35 @@ class PuzzleSystem:
         max_goal_gx = max_goal_px // grid_scale
         min_goal_gy = min_goal_py // grid_scale
         max_goal_gy = max_goal_py // grid_scale
-        # Check player and goals are on opposite sides of the mirror
+        # Check player and goals are on opposite sides of the mirror.
+        # If player is at the mirror (same grid x), move right (away from goals)
+        # to reach the correct side for reflection.
+        if player_grid_x == mirror_grid_x:
+            # Player is at the mirror. Move AWAY from goals to reach the
+            # correct side for reflection. Goals at x < mirror → move right.
+            # Goals at x > mirror → move left.
+            if max_goal_gx <= mirror_grid_x:
+                # Goals are left of mirror, move right
+                target_px = (mirror_grid_x + 2) * grid_scale + 1
+            else:
+                # Goals are right of mirror, move left
+                target_px = max(0, (mirror_grid_x - 2) * grid_scale + 1)
+            target_py = py
+            expanded = self._build_expanded_walkable(game_model, context, plan_context)
+            path = astar(player, (target_px, target_py), expanded,
+                         game_model.width, game_model.height, max_steps=5000)
+            if path and len(path) > 1:
+                nx, ny = path[1]
+                d = "right" if nx > px else ("left" if nx < px else ("down" if ny > py else "up"))
+                self._last_move_target = (nx, ny)
+                self._store_state(context, game_model, [], _dir_to_action(d), "mirror_position")
+                return ActionDecision(
+                    action_name=_dir_to_action(d),
+                    source="puzzle_system:mirror_position",
+                    confidence=0.60,
+                    reason=f"mirror_position_{d}",
+                )
+            return None
         if not ((player_grid_x < mirror_grid_x < min_goal_gx) or
                 (player_grid_x > mirror_grid_x > max_goal_gx)):
             return None
