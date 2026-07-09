@@ -639,6 +639,10 @@ def _detect_dynamics(
             min_gx, max_gx = min(goal_xs), max(goal_xs)
             if (px < mirror_px < min_gx) or (px > mirror_px > max_gx):
                 detected.append("puzzle")
+            # Also detect as puzzle when player IS at the mirror (player entity
+            # IS the mirror on some levels like AR25 L2 where yvifanjrcyu = mirror).
+            elif abs(px - mirror_px) <= 6 and goal_xs:
+                detected.append("puzzle")
 
     # Push/Pull: manipulable components adjacent to player
     if player_pos is not None:

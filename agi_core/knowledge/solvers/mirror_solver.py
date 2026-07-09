@@ -146,8 +146,21 @@ class MirrorSolver(DynamicsSolver):
         max_ggx = max_gpx // gs
         min_ggy = min_gpy // gs
 
-        # Determine if player IS the mirror
+        # Determine if player IS the mirror by checking:
+        # 1. Player grid x is near mirror grid x, OR
+        # 2. Player is at a color-0 cell at the mirror's position
         player_is_mirror = abs(player_gx - mirror_gx) <= 1
+        if not player_is_mirror:
+            mirror_px = mirror_gx * gs + 1
+            for c in gm.components:
+                if c.dominant_color == 0 and not c.touches_border and 1 <= c.size <= 30:
+                    cx, _ = _component_center(c)
+                    if abs(cx - mirror_px) <= gs:
+                        player_is_mirror = True
+                        px = cx
+                        player_gx = px // gs
+                        break
+
 
         if player_is_mirror and has_shape:
             # Player IS the mirror — compute mirror target from shape + goals
