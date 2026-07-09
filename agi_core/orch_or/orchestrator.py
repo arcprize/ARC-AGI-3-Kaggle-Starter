@@ -53,6 +53,7 @@ class ObjectiveReduction:
         self._hyperon_priors: dict[str, float] = {}
         self._goal_history: list[list[tuple[int, int]]] = []
         self._puzzle_system = None
+        self._solver_selector = None
 
     def decide(self, context: ExecutiveContext) -> ActionDecision:
         context.hyperon.sync(context.observation, context.memory, context.goals)
@@ -66,6 +67,14 @@ class ObjectiveReduction:
         # Debug: log player and goals for level transition detection
         if context.observation.levels_completed > 0 and game_model.player_pos is not None:
             pass  # logger.debug("L2 player: %s goals: %s mirrors: %s", ...)
+        # Try the hyperon memory-based solver system first (handles all 12 dynamics)
+        solver_decision, sctx = self._try_solver_system(context, game_model)
+        if solver_decision is not None:
+            if sctx and sctx.get("switch_attempted", 0) > self._switch_count:
+                self._switch_count = sctx["switch_attempted"]
+            logger.debug("solver system primary decision: %s", solver_decision.action_name)
+            return solver_decision
+        # Fall back to legacy puzzle system for backward compatibility
         puzzle_decision, pctx = self._try_puzzle_system(context, game_model)
         if puzzle_decision is not None:
             if pctx and pctx.get("switch_attempted", 0) > self._switch_count:
@@ -589,6 +598,47 @@ class ObjectiveReduction:
                 return (self._puzzle_system.decide(context, game_model, pctx), pctx)
         except Exception:
             logger.debug("puzzle system failed", exc_info=True)
+        return (None, None)
+
+    def _try_solver_system(
+        self,
+        context: ExecutiveContext,
+        game_model: GameModel,
+    ) -> tuple[ActionDecision | None, dict[str, Any] | None]:
+        try:
+            from agi_core.knowledge.solver_selector import SolverSelector
+            if self._solver_selector is None:
+                memory_db = getattr(context.config, "memory_db_path", None)
+                self._solver_selector = SolverSelector(
+                    context.hyperon, memory_db_path=memory_db,
+                )
+            solver = self._solver_selector.select_solver(game_model, context)
+            if solver is not None:
+                pctx: dict[str, Any] = {
+                    "non_beam_controllers": self._non_beam_controllers.copy(),
+                    "failed_directions": self._failed_directions.copy(),
+                    "stable_goal": self._stable_goal,
+                    "switch_attempted": self._switch_count,
+                    "action_priors": {},
+                    "memory_db_path": getattr(context.config, "memory_db_path", None),
+                    "beam_cells": [],
+                    "mirror_axis": game_model.features.mirror_axis,
+                    "goal_history": list(self._goal_history),
+                    "abstract_memories": list(context.memory_bundle.abstract_memories) if context.memory_bundle and context.memory_bundle.abstract_memories else [],
+                }
+                if game_model.features.has_beam:
+                    beam_comps = [c for c in game_model.components if c.dominant_color == game_model.features.beam_color and not c.touches_border]
+                    if beam_comps:
+                        pctx["beam_cells"] = beam_comps[0].cells[:20]
+                ctx = self._solver_selector.build_solver_context(game_model, pctx, context)
+                if solver.should_activate(ctx):
+                    decision = solver.decide(ctx)
+                    if decision is not None:
+                        self._solver_selector.record_outcome(context, game_model, decision, pctx)
+                        logger.debug("solver %s decision: %s", solver.dynamics, decision.action_name)
+                        return (decision, pctx)
+        except Exception:
+            logger.debug("solver system failed", exc_info=True)
         return (None, None)
 
     def _fallback_executive(self, context: ExecutiveContext) -> ActionDecision:

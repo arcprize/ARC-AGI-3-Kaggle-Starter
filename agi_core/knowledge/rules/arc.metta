@@ -166,6 +166,22 @@
 (= (board-viewport-style platformer) follow)
 (= (board-viewport-style unknown) fixed)
 
+; Solver selection rules — map dynamics categories to solver names.
+(= (solver-for static) noop)
+(= (solver-for navigation) navigation)
+(= (solver-for sliding) sliding)
+(= (solver-for gravity) gravity)
+(= (solver-for push-pull) push-pull)
+(= (solver-for beam) beam)
+(= (solver-for signal) signal)
+(= (solver-for cellular-automata) observe)
+(= (solver-for pattern-transform) observe)
+(= (solver-for multi-agent) multi-agent)
+(= (solver-for inventory) inventory)
+(= (solver-for hybrid) hybrid)
+(= (solver-for puzzle) mirror)
+(= (solver-for mirror) mirror)
+
 ; ---------------------------------------------------------------------------
 ; Dynamics-based board policy rules (12-category taxonomy).
 ; These augment the board-type rules above and are preferred when the primary

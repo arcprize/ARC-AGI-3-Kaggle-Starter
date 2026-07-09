@@ -92,8 +92,34 @@ def initialize_puzzle_schema(db_path: str | Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_interaction_game
             ON interaction_records(game_id, outcome)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS solver_strategies (
+                game_id TEXT NOT NULL,
+                dynamics TEXT NOT NULL,
+                board_hash TEXT NOT NULL,
+                solver_name TEXT NOT NULL,
+                action_sequence TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0.5,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                last_success_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (game_id, dynamics, board_hash)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS solver_outcomes (
+                game_id TEXT NOT NULL,
+                dynamics TEXT NOT NULL,
+                solver_name TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                avg_steps_to_complete REAL NOT NULL DEFAULT 0.0,
+                last_outcome TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (game_id, dynamics, solver_name)
+            )
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_puzzle_states_game ON puzzle_board_states(game_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_puzzle_episodes_game ON puzzle_episodes(game_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_solver_outcomes_dynamics ON solver_outcomes(dynamics)")
         conn.commit()
 
 
@@ -423,3 +449,104 @@ def query_best_interaction(
                 best_score = score
                 best = (rx, ry)
         return best
+
+
+def save_solver_strategy(
+    db_path: str | Path,
+    game_id: str,
+    dynamics: str,
+    board_hash: str,
+    solver_name: str,
+    action_sequence: list[str],
+    confidence: float = 0.7,
+) -> None:
+    """Store a successful solver strategy for future retrieval."""
+    path = Path(db_path)
+    if not path.parent.exists():
+        return
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO solver_strategies
+               (game_id, dynamics, board_hash, solver_name, action_sequence,
+                confidence, use_count, last_success_at)
+               VALUES (?, ?, ?, ?, ?, ?,
+                       COALESCE((SELECT use_count + 1 FROM solver_strategies
+                        WHERE game_id = ? AND dynamics = ? AND board_hash = ?), 1),
+                       ?)""",
+            [game_id, dynamics, board_hash, solver_name,
+             json.dumps(action_sequence), confidence,
+             game_id, dynamics, board_hash,
+             datetime.now(timezone.utc).isoformat()],
+        )
+        conn.commit()
+
+
+def update_solver_outcome(
+    db_path: str | Path,
+    game_id: str,
+    dynamics: str,
+    solver_name: str,
+    succeeded: bool,
+    steps_taken: int = 0,
+) -> None:
+    """Record solver success/failure outcome."""
+    path = Path(db_path)
+    if not path.parent.exists():
+        return
+    with closing(sqlite3.connect(path)) as conn:
+        row = conn.execute(
+            """SELECT attempt_count, success_count, avg_steps_to_complete
+               FROM solver_outcomes
+               WHERE game_id = ? AND dynamics = ? AND solver_name = ?""",
+            [game_id, dynamics, solver_name],
+        ).fetchone()
+        if row:
+            n = row[0] + 1
+            s = row[1] + (1 if succeeded else 0)
+            avg = (row[2] * row[0] + steps_taken) / n if steps_taken > 0 else row[2]
+            conn.execute(
+                """UPDATE solver_outcomes SET attempt_count = ?, success_count = ?,
+                   avg_steps_to_complete = ?, last_outcome = ?
+                   WHERE game_id = ? AND dynamics = ? AND solver_name = ?""",
+                [n, s, avg, "success" if succeeded else "failure",
+                 game_id, dynamics, solver_name],
+            )
+        else:
+            conn.execute(
+                """INSERT INTO solver_outcomes
+                   (game_id, dynamics, solver_name, attempt_count, success_count,
+                    avg_steps_to_complete, last_outcome)
+                   VALUES (?, ?, ?, 1, ?, ?, ?)""",
+                [game_id, dynamics, solver_name,
+                 1 if succeeded else 0,
+                 steps_taken if succeeded else 0.0,
+                 "success" if succeeded else "failure"],
+            )
+        conn.commit()
+
+
+def query_best_solver(
+    db_path: str | Path,
+    dynamics: str,
+    board_hash: str,
+) -> dict[str, Any] | None:
+    """Find the best solver strategy for a given dynamics + board hash."""
+    path = Path(db_path)
+    if not path.exists():
+        return None
+    with closing(sqlite3.connect(path)) as conn:
+        row = conn.execute(
+            """SELECT solver_name, action_sequence, confidence, use_count
+               FROM solver_strategies
+               WHERE dynamics = ? AND board_hash = ?
+               ORDER BY confidence DESC, use_count DESC LIMIT 1""",
+            [dynamics, board_hash],
+        ).fetchone()
+        if row is not None:
+            return {
+                "solver_name": row[0],
+                "action_sequence": json.loads(row[1]),
+                "confidence": row[2],
+                "use_count": row[3],
+            }
+    return None

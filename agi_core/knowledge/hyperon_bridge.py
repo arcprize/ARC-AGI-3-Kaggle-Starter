@@ -717,6 +717,23 @@ class HyperonBridge:
                 return [{"strategy": "interact", "board_type": board_type, "dynamics": dynamics}]
             else:
                 return [{"strategy": "navigate", "board_type": board_type, "dynamics": dynamics}]
+        if query_name == "solver-select":
+            dynamics = str(episode.get("primary_dynamics", "") or "navigation")
+            _SOLVER_MAP = {
+                "beam": "beam", "puzzle": "mirror", "mirror": "mirror",
+                "navigation": "navigation", "static": "noop",
+                "sliding": "sliding", "gravity": "gravity",
+                "push-pull": "push-pull", "signal": "signal",
+                "cellular-automata": "observe", "pattern-transform": "observe",
+                "multi-agent": "multi-agent", "inventory": "inventory",
+                "hybrid": "hybrid",
+            }
+            trained = self._load_board_policy_overrides(dynamics).get("preferred-solver")
+            if trained:
+                return [{"solver": str(trained), "dynamics": dynamics}]
+            return [{"solver": _SOLVER_MAP.get(dynamics, "navigation"), "dynamics": dynamics}]
+        if query_name == "solver-persist":
+            return [{"stored": True}]
         return []
 
     def _get_board_policy_value(
