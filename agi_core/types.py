@@ -126,6 +126,7 @@ class ExecutiveContext:
     goal_stack: Any = None
     working_memory: Any = None
     chunk_library: Any = None
+    attention: Any = None
 
 
 @runtime_checkable

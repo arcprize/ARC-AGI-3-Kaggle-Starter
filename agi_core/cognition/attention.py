@@ -119,6 +119,17 @@ class AttentionFocus:
                         50, self._visitation_counts[y][x] + 1,
                     )
 
+    def novelty_bonus(self, x: int, y: int) -> float:
+        """Return a novelty bonus [0, 0.2] for under-visited cells.
+        
+        This drives exploration — cells that have been visited fewer times
+        get a bonus that makes the agent more likely to explore them.
+        """
+        if 0 <= x < self.salience.width and 0 <= y < self.salience.height:
+            vis = self._visitation_counts[y][x]
+            return 0.2 * max(0.0, 1.0 - vis / 30.0)
+        return 0.0
+
     def reset_visitation(self) -> None:
         """Reset visitation counts (new level)."""
         h, w = self.salience.height, self.salience.width

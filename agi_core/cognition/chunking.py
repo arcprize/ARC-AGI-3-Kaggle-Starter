@@ -120,6 +120,27 @@ class ChunkLibrary:
         self.add(chunk)
         return chunk
 
+    def extract_from_window(
+        self,
+        action_window: list[str],
+        dynamics: str,
+        goal_count: int,
+    ) -> Chunk | None:
+        """Extract a chunk from the last N actions (frame-level window).
+        
+        Called periodically during gameplay (not just on win).  If the
+        window contains a non-trivial action sequence that looks reusable,
+        save it as a chunk.
+        """
+        if len(action_window) < 5:
+            return None
+        # Look for a repeating pattern (action-A, action-B, action-A, action-B, ...)
+        half = len(action_window) // 2
+        pattern = action_window[:half]
+        if action_window[half:] == pattern:
+            return self.extract(pattern, dynamics, goal_count, "progress")
+        return None
+
     def update_outcome(self, chunk_name: str, success: bool) -> None:
         """Update a chunk's reliability based on execution outcome."""
         chunk = self._chunks.get(chunk_name)

@@ -137,13 +137,18 @@ class ConsolidatedMemory:
         return 1.0 / (1.0 + k * (age_hours ** b))
 
     def apply_forgetting(self) -> None:
-        """Decay all trace strengths by the power law since last access."""
+        """Decay all trace strengths by the power law since last access.
+        Prunes traces below a minimum strength threshold."""
         now = time.monotonic()
+        dead = []
         for trace in self._traces.values():
             age_hours = (now - trace.last_access) / 3600.0
             trace.strength = self._power_law_strength(age_hours)
-            # Boost for repeated access (spacing effect)
             trace.strength = min(1.0, trace.strength + 0.05 * math.log1p(trace.access_count))
+            if trace.strength < 0.02:
+                dead.append(trace.trace_id)
+        for tid in dead:
+            self._traces.pop(tid, None)
 
     # ── analogical retrieval ──────────────────────────────────────────
 

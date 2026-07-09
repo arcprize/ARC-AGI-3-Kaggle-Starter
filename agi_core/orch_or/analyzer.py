@@ -8,7 +8,7 @@ from agi_core.orch_or.search import astar
 _PLATFORMER_THRESHOLD = 5
 
 
-def build_game_model(board: list[list[int]]) -> GameModel:
+def build_game_model(board: list[list[int]], attention=None) -> GameModel:
     height = len(board)
     width = len(board[0]) if height > 0 else 0
     bg_color = _detect_background_color(board, width, height)
@@ -33,11 +33,12 @@ def build_game_model(board: list[list[int]]) -> GameModel:
     obstacles = _find_obstacles(components, player_pos, goal_positions)
 
     # Phase 2: walkable + sprites + tile_size are independent — run in parallel
+    # Use attention salience to skip low-salience regions in walkable scan.
     try:
         pool = ThreadPoolManager.executor()
         walk_future = pool.submit(
             _find_walkable, board, width, height, bg_color, obstacles,
-            player_pos, goal_positions, components,
+            player_pos, goal_positions, components, attention=attention,
         )
         if grid_scale > 1:
             sprite_future = pool.submit(
@@ -54,7 +55,7 @@ def build_game_model(board: list[list[int]]) -> GameModel:
         tile_size = tile_future.result()
     except Exception:
         walkable = _find_walkable(board, width, height, bg_color, obstacles,
-                                  player_pos, goal_positions, components)
+                                  player_pos, goal_positions, components, attention=attention)
         if grid_scale > 1:
             sprites = _detect_sprites(board, grid_scale, bg_color,
                                       player_pos, goal_positions, components, width, height)
@@ -385,6 +386,7 @@ def _find_walkable(
     player_pos: tuple[int, int] | None = None,
     goal_positions: list[tuple[int, int]] | None = None,
     components: list[Component] | None = None,
+    attention=None,
 ) -> set[tuple[int, int]]:
     passable: set[tuple[int, int]] = set()
     obs_set = set((ox, oy) for ox, oy, otype in obstacles if otype == "wall")
@@ -400,9 +402,23 @@ def _find_walkable(
     walkable_colors.update(goal_colors)
     for y in range(height):
         for x in range(width):
+            if attention is not None and not attention.is_relevant(x, y):
+                continue
             val = board[y][x]
             if val in walkable_colors and (x, y) not in obs_set:
                 passable.add((x, y))
+    # Always include player and goal cells regardless of salience.
+    if player_pos is not None:
+        passable.add(player_pos)
+    if goal_positions:
+        passable.update(goal_positions)
+    # Include non-obstacle component cells (skip mirrors/beams/walls).
+    if components:
+        for c in components:
+            if c.touches_border or c.dominant_color in (4, 10):
+                continue
+            for cx, cy in c.cells:
+                passable.add((cx, cy))
     return passable
 
 

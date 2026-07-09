@@ -52,9 +52,11 @@ class GoalStack:
     - Completed subgoals are marked so they are not retried.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_failures_per_goal: int = 3) -> None:
         self._root: Goal | None = None
         self._active_path: list[Goal] = []
+        self._max_failures_per_goal = max_failures_per_goal
+        self._progress_history: list[str] = []  # last N goal names
 
     # ── properties ────────────────────────────────────────────────────
 
@@ -104,15 +106,42 @@ class GoalStack:
         return g
 
     def backtrack(self) -> Goal | None:
-        """Mark the current active goal as FAILED and return to its parent."""
+        """Mark the current active goal as FAILED and return to its parent.
+        If a goal has failed more than ``_max_failures_per_goal`` times,
+        skip it entirely (FAILED + SKIPPED)."""
         if not self._active_path:
             return None
         g = self._active_path.pop()
         g.status = GoalStatus.FAILED
         g.attempts += 1
-        if self._active_path:
+        if g.attempts >= self._max_failures_per_goal:
+            g.status = GoalStatus.SKIPPED
+            logger = logging.getLogger(__name__)
+            logger.info("GoalStack: skipping %s after %d failures", g.name, g.attempts)
+            # Skip back to grandparent if parent is also exhausted
+            if self._active_path and self._active_path[-1].attempts >= self._max_failures_per_goal:
+                self._active_path.pop()
+        elif self._active_path:
             self._active_path[-1].attempts += 1
         return g
+
+    def check_progress(self, current_goal_name: str | None = None) -> bool:
+        """Return True if the agent is making progress on the current goal.
+        
+        Progress is defined as: the current goal name differs from the last
+        3 entries in ``_progress_history`` (not stuck repeating the same goal).
+        """
+        name = current_goal_name or (self.active.name if self.active else None)
+        if name is None:
+            return True
+        self._progress_history.append(name)
+        if len(self._progress_history) > 10:
+            self._progress_history.pop(0)
+        if len(self._progress_history) >= 4:
+            last_4 = self._progress_history[-4:]
+            if all(g == name for g in last_4):
+                return False  # stuck on same goal for 4+ frames
+        return True
 
     def mark_active(self) -> None:
         """Mark the current active goal as ACTIVE."""

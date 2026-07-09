@@ -89,7 +89,8 @@ class ObjectiveReduction:
         if not board_data:
             logger.debug("no board data, falling back to executive")
             return self._fallback_executive(context)
-        game_model = build_game_model(board_data)
+        attn = getattr(context, 'attention', None)
+        game_model = build_game_model(board_data, attention=attn)
         # Feed board_type and dynamics into hyperon facts BEFORE solver selection.
         try:
             if hasattr(context.hyperon, "facts"):

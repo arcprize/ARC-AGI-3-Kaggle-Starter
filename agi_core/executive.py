@@ -55,6 +55,7 @@ class Executive:
         context.goal_stack = self.goal_stack
         context.working_memory = self.working_memory
         context.chunk_library = self.chunk_library
+        context.attention = self.attention
         if wm is not None:
             wm.tick()
         if mc is not None:
@@ -212,27 +213,44 @@ class Executive:
         wm = self.working_memory
         mc = self.meta_cognition
         gs = self.goal_stack
+        em = self.episodic_memory
+        cl = self.chunk_library
+        action_name = decision.action_name
         if wm is not None:
             from agi_core.cognition import WMItem
             wm.push(WMItem(
                 key=f"action_{context.observation.step_index}",
-                content=decision.action_name,
+                content=action_name,
                 category="outcome",
             ))
         if mc is not None:
+            mc.note_visit(action_name)
             last_actions = context.memory.recent_actions()[-3:] if hasattr(context.memory, 'recent_actions') else []
             outcomes = []
             for a in last_actions:
-                if a == decision.action_name:
+                if a == action_name:
                     outcomes.append("progress")
             mc.note_outcome(outcomes[-1] if outcomes else "stalled")
         if gs is not None and decision.subgoal:
-            from agi_core.cognition import Goal
             sub = decision.subgoal
             found = gs.find(sub)
             if found is None:
                 gs.push(sub)
             gs.mark_active()
+            # Auto-backtrack if stuck on same goal
+            if not gs.check_progress(sub):
+                gs.backtrack()
+        # Per-frame forgetting curve
+        if em is not None and hasattr(em, 'apply_forgetting'):
+            if getattr(self, '_forget_counter', 0) % 60 == 0:
+                em.apply_forgetting()
+            self._forget_counter = getattr(self, '_forget_counter', 0) + 1
+        # Frame-level chunk extraction from recent action window
+        if cl is not None and hasattr(context.memory, 'recent_actions'):
+            recent = context.memory.recent_actions()[-10:]
+            if len(recent) >= 5:
+                dynamics = getattr(context.observation, 'derived_features', {}).get('primary_dynamics', 'unknown')
+                cl.extract_from_window(recent, dynamics, goal_count=0)
 
     def _all_legal_proposals_are_score_floor(
         self,

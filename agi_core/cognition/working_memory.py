@@ -73,15 +73,22 @@ class WorkingMemory:
         return self.capacity - len(self._items)
 
     def push(self, item: WMItem) -> None:
-        """Add or update an item.  Evict lowest-utility item if full."""
+        """Add or update an item.  Evict lowest-utility item if full.
+        Interference: if a similar key (same prefix) exists, the new item
+        competes with it (reduces its utility)."""
         if item.key in self._items:
             self._items[item.key] = item
             return
+        # Interference — similar keys compete
+        prefix = item.key.split("_")[0] if "_" in item.key else item.key[:8]
+        for existing in list(self._items.values()):
+            other_prefix = existing.key.split("_")[0] if "_" in existing.key else existing.key[:8]
+            if other_prefix == prefix and existing.key != item.key:
+                existing.utility *= 0.85  # interference penalty
         cat = item.category
         cat_items = {k: v for k, v in self._items.items() if v.category == cat}
         cat_max = self._category_max.get(cat, 3)
         if len(cat_items) >= cat_max:
-            # Evict lowest-utility in this category
             victim = min(cat_items, key=lambda k: cat_items[k].utility)
             self._items.pop(victim, None)
         if len(self._items) >= self.capacity:
@@ -100,14 +107,36 @@ class WorkingMemory:
         self._items.pop(key, None)
 
     def tick(self) -> None:
-        """Called every frame — decay all items, prune dead ones."""
+        """Called every frame — decay all items, prune dead ones.
+        Also consolidates old items into a gist summary."""
         dead_keys = []
+        oldest_time = float('inf')
+        oldest_key = None
         for key, item in self._items.items():
             item.decay(self._DECAY_RATE)
             if item.utility < 0.01:
                 dead_keys.append(key)
+            if item.created_at < oldest_time:
+                oldest_time = item.created_at
+                oldest_key = key
         for k in dead_keys:
             self._items.pop(k, None)
+        # Gist consolidation: every 50 ticks, compress oldest item into
+        # an abstract summary (if it's an action sequence).
+        self._consolidation_counter = getattr(self, '_consolidation_counter', 0) + 1
+        if self._consolidation_counter >= 50 and oldest_key is not None:
+            oldest = self._items.get(oldest_key)
+            if oldest is not None and oldest.category == "outcome":
+                from agi_core.cognition import WMItem
+                gist = WMItem(
+                    key=f"gist_{oldest_key}",
+                    content=f"summarised: {str(oldest.content)[:60]}",
+                    category="percept",
+                    utility=0.3,
+                )
+                self.remove(oldest_key)
+                self.push(gist)
+            self._consolidation_counter = 0
 
     def snapshot(self) -> dict[str, Any]:
         """Return a snapshot for hyperon facts / logging."""
