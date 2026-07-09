@@ -52,6 +52,9 @@ class Executive:
         # ── Cognition integration ──────────────────────────────────
         wm = self.working_memory
         mc = self.meta_cognition
+        context.goal_stack = self.goal_stack
+        context.working_memory = self.working_memory
+        context.chunk_library = self.chunk_library
         if wm is not None:
             wm.tick()
         if mc is not None:
@@ -97,20 +100,37 @@ class Executive:
         )
         replan_mode = self._should_enter_replan_mode(context)
         context.replan_mode = replan_mode
+
+        # ── Gate specialists by cognition strategy ────────────────
+        strat = getattr(context, 'cognition_strategy', 'exploit')
+        mc = self.meta_cognition
+        use_reactive = (
+            not replan_mode
+            and (mc is None or mc.should_use_specialist(mc._mode_history[-1] if mc._mode_history else None))
+        )
+        use_symbolic = mc is None or mc.should_use_specialist(mc._mode_history[-1] if mc._mode_history else None)
+
         reactive_proposals = []
         symbolic_proposals = []
         pool = ThreadPoolManager.executor()
-        reactive_task = pool.submit(self.reactive.propose, context) if not replan_mode else None
-        symbolic_task = pool.submit(self.symbolic.propose, context)
+        if use_reactive:
+            reactive_task = pool.submit(self.reactive.propose, context)
+        else:
+            reactive_task = None
+        if use_symbolic:
+            symbolic_task = pool.submit(self.symbolic.propose, context)
+        else:
+            symbolic_task = None
         if reactive_task is not None:
             try:
                 reactive_proposals = reactive_task.result(timeout=2.0)
             except Exception:
                 reactive_proposals = []
-        try:
-            symbolic_proposals = symbolic_task.result(timeout=2.0)
-        except Exception:
-            symbolic_proposals = []
+        if symbolic_task is not None:
+            try:
+                symbolic_proposals = symbolic_task.result(timeout=2.0)
+            except Exception:
+                symbolic_proposals = []
         proposals = list(reactive_proposals) + list(symbolic_proposals)
         score_floor_fallback_cooldown = context.memory.recent_score_floor_fallback(
             context.observation
@@ -179,11 +199,40 @@ class Executive:
                     proposals=rescored,
                 )
                 context.memory.note_decision(decision)
+                self._finalize_cognition(context, decision)
                 return decision
         fallback = self._memory_aware_fallback(context)
         fallback.proposals = rescored
         context.memory.note_decision(fallback)
+        self._finalize_cognition(context, fallback)
         return fallback
+
+    def _finalize_cognition(self, context, decision: ActionDecision) -> None:
+        """Update cognition modules after a decision is made."""
+        wm = self.working_memory
+        mc = self.meta_cognition
+        gs = self.goal_stack
+        if wm is not None:
+            from agi_core.cognition import WMItem
+            wm.push(WMItem(
+                key=f"action_{context.observation.step_index}",
+                content=decision.action_name,
+                category="outcome",
+            ))
+        if mc is not None:
+            last_actions = context.memory.recent_actions()[-3:] if hasattr(context.memory, 'recent_actions') else []
+            outcomes = []
+            for a in last_actions:
+                if a == decision.action_name:
+                    outcomes.append("progress")
+            mc.note_outcome(outcomes[-1] if outcomes else "stalled")
+        if gs is not None and decision.subgoal:
+            from agi_core.cognition import Goal
+            sub = decision.subgoal
+            found = gs.find(sub)
+            if found is None:
+                gs.push(sub)
+            gs.mark_active()
 
     def _all_legal_proposals_are_score_floor(
         self,

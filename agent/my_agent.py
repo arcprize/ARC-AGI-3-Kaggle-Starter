@@ -136,6 +136,23 @@ class MyAgent(Agent):
         if self._normalize_state_name(latest_frame.state) == self.runtime.config.win_state_name:
             self.runtime.bind_game(self.game_id)
             self.runtime.note_terminal_observation(frames, latest_frame)
+            # Record episode in consolidated memory / extract chunks
+            em = getattr(self, '_episodic_memory', None)
+            cl = getattr(self, '_chunk_library', None)
+            if em is not None:
+                actions = [getattr(f, 'action', '?') for f in frames[-50:]]
+                em.record(
+                    dynamics=getattr(self, '_last_dynamics', "unknown"),
+                    action_sequence=actions,
+                    outcome="win",
+                    goal_count=0,
+                    player_start=(0, 0),
+                    board_hash=hash(str(getattr(latest_frame, 'board', ''))[-256:]),
+                )
+                em.consolidate()
+            if cl is not None and em is not None and em._episodes:
+                last = em._episodes[-1]
+                cl.extract(last.action_sequence, last.dynamics, last.goal_count, "win")
             return True
         return False
 

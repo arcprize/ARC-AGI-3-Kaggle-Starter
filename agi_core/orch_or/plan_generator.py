@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from agi_core.orch_or.game_model import Plan
+from agi_core.orch_or.game_model import Plan, PlanStep
 from agi_core.orch_or.parallel import ThreadPoolManager
 from agi_core.orch_or.reducer import reduce, select_leaf
 from agi_core.orch_or.strategies import available_strategies, get_strategy
@@ -56,6 +56,25 @@ def generate_plan(
                 _apply_priority_boost(objective_tree, hinted_subgoal)
     leaf = select_leaf(objective_tree)
     primary_name = _STRATEGY_MAP.get(leaf.description, "generic")
+
+    # Check chunk library for cached action sequences
+    if context and context.get("chunk_library"):
+        cl = context["chunk_library"]
+        matched = cl.match(
+            dynamics=leaf.description,
+            goal_count=context.get("goal_count", 0),
+            action_window=[],
+        )
+        if matched:
+            best = matched[0]
+            steps = [PlanStep(action=a, params={}, source="chunk",
+                              preconditions=frozenset(), expected_effect=a)
+                     for a in best.actions]
+            if steps:
+                return Plan(objective_id=leaf.description, steps=steps,
+                            created_at_step=context.get("game_step", 0),
+                            confidence=min(0.9, best.reliability * 0.8))
+
     if parallel and leaf.description in _PARALLEL_TARGETS:
         return _generate_plan_parallel(leaf, game_model, context, primary_name, timeout)
     strategy_fn = get_strategy(primary_name)

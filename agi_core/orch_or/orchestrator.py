@@ -246,6 +246,7 @@ class ObjectiveReduction:
             "failed_directions": self._failed_directions.copy(),
             "stable_goal": self._stable_goal,
             "action_priors": hyperon_priors,
+            "chunk_library": getattr(context, 'chunk_library', None),
             "board_explore_bias": board_explore_bias,
             "board_interact_range": board_interact_range,
             "board_move_bias": board_move_bias,

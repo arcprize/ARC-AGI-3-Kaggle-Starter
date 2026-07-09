@@ -123,6 +123,9 @@ class ExecutiveContext:
     score_floor_proposals: list[Any] = field(default_factory=list)
     score_floor_debug: dict[str, Any] = field(default_factory=dict)
     cognition_strategy: str = "exploit"
+    goal_stack: Any = None
+    working_memory: Any = None
+    chunk_library: Any = None
 
 
 @runtime_checkable
