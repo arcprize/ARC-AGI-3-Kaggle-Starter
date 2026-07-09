@@ -22,6 +22,7 @@ class PushPullSolver(DynamicsSolver):
     def __init__(self, memory_db_path=None):
         super().__init__(memory_db_path)
         self._pushed_blocks: set[tuple[int, int, int, int]] = set()
+        self.reset_level()
 
     def reset_level(self):
         self._pushed_blocks.clear()

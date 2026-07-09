@@ -24,6 +24,7 @@ class InventorySolver(DynamicsSolver):
         super().__init__(memory_db_path)
         self._collected: set[tuple[int, int]] = set()
         self._visited: set[tuple[int, int]] = set()
+        self.reset_level()
 
     def reset_level(self):
         self._collected.clear()

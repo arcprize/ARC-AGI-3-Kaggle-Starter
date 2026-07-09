@@ -49,6 +49,7 @@ class BeamSolver(DynamicsSolver):
         self._cache_game_id: str = ""
         if self._memory_db_path:
             self._memory_db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.reset_level()
             initialize_puzzle_schema(self._memory_db_path)
 
     def reset_level(self) -> None:

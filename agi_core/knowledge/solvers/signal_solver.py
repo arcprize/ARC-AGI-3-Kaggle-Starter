@@ -24,6 +24,7 @@ class SignalSolver(DynamicsSolver):
         self._tried_interactions: set[tuple[int, int]] = set()
         self._last_board: list[list[int]] | None = None
         self._switch_effects: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        self.reset_level()
 
     def reset_level(self):
         self._tried_interactions.clear()

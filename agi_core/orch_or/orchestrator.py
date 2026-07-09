@@ -64,9 +64,15 @@ class ObjectiveReduction:
             logger.debug("no board data, falling back to executive")
             return self._fallback_executive(context)
         game_model = build_game_model(board_data)
-        # Debug: log player and goals for level transition detection
-        if context.observation.levels_completed > 0 and game_model.player_pos is not None:
-            pass  # logger.debug("L2 player: %s goals: %s mirrors: %s", ...)
+        # Feed board_type and dynamics into hyperon facts BEFORE solver selection.
+        try:
+            if hasattr(context.hyperon, "facts"):
+                ep = context.hyperon.facts.setdefault("episode", {})
+                ep["board_type"] = game_model.features.board_type
+                ep["primary_dynamics"] = game_model.features.primary_dynamics
+                ep["dynamics"] = list(game_model.features.dynamics)
+        except Exception:
+            pass
         # Try the hyperon memory-based solver system first (handles all 12 dynamics)
         solver_decision, sctx = self._try_solver_system(context, game_model)
         if solver_decision is not None:
@@ -81,15 +87,6 @@ class ObjectiveReduction:
                 self._switch_count = pctx["switch_attempted"]
             logger.debug("puzzle system primary decision: %s", puzzle_decision.action_name)
             return puzzle_decision
-        # Feed board_type into hyperon facts so game-action-priors can use it.
-        try:
-            if hasattr(context.hyperon, "facts"):
-                ep = context.hyperon.facts.setdefault("episode", {})
-                ep["board_type"] = game_model.features.board_type
-                ep["primary_dynamics"] = game_model.features.primary_dynamics
-                ep["dynamics"] = list(game_model.features.dynamics)
-        except Exception:
-            pass
         logger.debug(
             "game_model: player=%s goals=%s features=pd:%s gd:%s ptg:%s bt:%s",
             game_model.player_pos, game_model.goal_positions,

@@ -27,7 +27,6 @@ class DynamicsSolver(ABC):
 
     def __init__(self, memory_db_path: str | Path | None = None) -> None:
         self._memory_db_path = Path(memory_db_path) if memory_db_path else None
-        self.reset_level()
 
     @abstractmethod
     def should_activate(self, ctx: SolverContext) -> bool:
@@ -61,3 +60,21 @@ def get_solver(dynamics: str) -> type[DynamicsSolver] | None:
 
 def get_all_solvers() -> dict[str, type[DynamicsSolver]]:
     return dict(_SOLVER_REGISTRY)
+
+
+# Import all solver modules to trigger registration via register_solver().
+# Each solver's module-level register_solver call populates _SOLVER_REGISTRY.
+from agi_core.knowledge.solvers import (
+    noop_solver,
+    navigation_solver,
+    multi_agent_solver,
+    sliding_solver,
+    gravity_solver,
+    push_pull_solver,
+    signal_solver,
+    observe_solver,
+    inventory_solver,
+    beam_solver,
+    mirror_solver,
+    hybrid_solver,
+)

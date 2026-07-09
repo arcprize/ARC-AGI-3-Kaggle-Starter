@@ -27,6 +27,7 @@ class NavigationSolver(DynamicsSolver):
         self._stall_frames: int = 0
         self._last_dir: str = ""
         self._stal_dirs: list[str] = ["down", "right", "up", "left"]
+        self.reset_level()
 
     def reset_level(self) -> None:
         self._last_pos = None

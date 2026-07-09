@@ -18,6 +18,7 @@ class MultiAgentSolver(DynamicsSolver):
         super().__init__(memory_db_path)
         self._switch_count: int = 0
         self._last_entity_count: int = 0
+        self.reset_level()
 
     def reset_level(self):
         self._switch_count = 0

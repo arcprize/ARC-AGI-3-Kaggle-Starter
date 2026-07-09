@@ -25,6 +25,7 @@ class SlidingSolver(DynamicsSolver):
         self._slide_dx: int = 0
         self._slide_dy: int = 0
         self._slide_frames: int = 0
+        self.reset_level()
 
     def reset_level(self):
         self._last_pos = None

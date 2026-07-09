@@ -24,6 +24,7 @@ class GravitySolver(DynamicsSolver):
         self._last_pos: tuple[int, int] | None = None
         self._falling: bool = False
         self._jump_cooldown: int = 0
+        self.reset_level()
 
     def reset_level(self):
         self._last_pos = None

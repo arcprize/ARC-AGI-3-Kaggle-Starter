@@ -41,6 +41,7 @@ class MirrorSolver(DynamicsSolver):
         self._cached_mirror_gx: int = -1
         if self._memory_db_path:
             self._memory_db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.reset_level()
             initialize_puzzle_schema(self._memory_db_path)
 
     def reset_level(self) -> None:

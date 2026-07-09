@@ -23,6 +23,7 @@ class ObserveSolver(DynamicsSolver):
         self._board_history: list[list[list[int]]] = []
         self._probe_count: int = 0
         self._max_probes: int = 10
+        self.reset_level()
 
     def reset_level(self):
         self._board_history.clear()

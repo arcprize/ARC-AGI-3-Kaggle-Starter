@@ -59,6 +59,7 @@ class SolverSelector:
             result = self._hyperon.run_rules("solver-select")
             if result and "solver" in result[0]:
                 solver_name = str(result[0]["solver"])
+            logger.debug("SELECTOR: dynamics=%s hyperon_solver=%s", dynamics, solver_name)
         except Exception:
             pass
 
@@ -112,8 +113,8 @@ class SolverSelector:
         if self._active_solver is None:
             return
         try:
-            # Store board state to puzzle memory
             if self._memory_db_path is not None:
+                self._memory_db_path.parent.mkdir(parents=True, exist_ok=True)
                 player = game_model.player_pos
                 state = PuzzleBoardState(
                     game_id=context.observation.game_id,
@@ -129,7 +130,7 @@ class SolverSelector:
                 )
                 store_board_state(self._memory_db_path, state)
         except Exception:
-            logger.debug("solver record_outcome failed", exc_info=True)
+            pass
 
     def _query_memory_for_solver(self, game_model: GameModel) -> str | None:
         """Check memory for a solver that succeeded on similar boards."""
