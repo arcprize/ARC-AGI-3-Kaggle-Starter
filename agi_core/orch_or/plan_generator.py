@@ -56,14 +56,16 @@ def generate_plan(
                 _apply_priority_boost(objective_tree, hinted_subgoal)
     leaf = select_leaf(objective_tree)
     primary_name = _STRATEGY_MAP.get(leaf.description, "generic")
+    matched: list | None = None
 
     # Check chunk library for cached action sequences
     if context and context.get("chunk_library"):
         cl = context["chunk_library"]
+        recent = context.get("recent_actions", [])
         matched = cl.match(
             dynamics=leaf.description,
             goal_count=context.get("goal_count", 0),
-            action_window=[],
+            action_window=recent[-8:] if recent else [],
         )
         if matched:
             best = matched[0]
@@ -74,6 +76,28 @@ def generate_plan(
                 return Plan(objective_id=leaf.description, steps=steps,
                             created_at_step=context.get("game_step", 0),
                             confidence=min(0.9, best.reliability * 0.8))
+
+    # Fall back to episodic memory traces if no chunk matched
+    if not matched and context and context.get("episodic_memory"):
+        em = context["episodic_memory"]
+        if hasattr(em, 'analogical_retrieve'):
+            recent = context.get("recent_actions", [])
+            traces = em.analogical_retrieve(
+                dynamics=leaf.description,
+                action_sequence=recent[-5:] if recent else [],
+                top_k=1,
+            )
+            if traces:
+                best = traces[0]
+                typical = best.schema.get("typical_actions", [])
+                if typical:
+                    steps = [PlanStep(action=a, params={}, source="episodic",
+                                      preconditions=frozenset(), expected_effect=a)
+                             for a in typical]
+                    if steps:
+                        return Plan(objective_id=leaf.description, steps=steps,
+                                    created_at_step=context.get("game_step", 0),
+                                    confidence=min(0.7, best.strength * 0.6))
 
     if parallel and leaf.description in _PARALLEL_TARGETS:
         return _generate_plan_parallel(leaf, game_model, context, primary_name, timeout)

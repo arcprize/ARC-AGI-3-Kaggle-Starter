@@ -37,7 +37,7 @@ class SalienceMap:
         return self.get(x, y) >= self._threshold
 
     def is_relevant(self, x: int, y: int) -> bool:
-        """Returns True if the cell is salient enough to analyse at full resolution."""
+        """Alias for ``above_threshold`` — used by ``build_game_model``."""
         return self.above_threshold(x, y)
 
 
@@ -55,6 +55,7 @@ class AttentionFocus:
         self._visitation_counts: list[list[int]] = [
             [0] * width for _ in range(height)
         ]
+        self._last_player_pos: tuple[int, int] | None = None
 
     def compute(
         self,
@@ -73,28 +74,32 @@ class AttentionFocus:
           5. **Edge**: board edges (mirror reflection zone)    (weight 0.10)
         """
         h, w = self.salience.height, self.salience.width
-        pb = prev_board or self._prev_board
-        for y in range(h):
-            for x in range(w):
+        pb = prev_board if prev_board is not None else self._prev_board
+        # Auto-detect level change: if player pos jumps by >10 cells, reset
+        if player_pos is not None and self._last_player_pos is not None:
+            dx = abs(player_pos[0] - self._last_player_pos[0])
+            dy = abs(player_pos[1] - self._last_player_pos[1])
+            if dx > 10 or dy > 10:
+                self.reset_visitation()
+        self._last_player_pos = player_pos
+        for y in range(min(h, len(board))):
+            row = board[y]
+            prow = pb[y] if pb is not None and y < len(pb) else None
+            for x in range(min(w, len(row))):
                 s = 0.0
                 # 1. Motion
-                if pb is not None and y < len(pb) and x < len(pb[y]):
-                    if pb[y][x] != board[y][x]:
-                        s += 0.25
-                # 2. Player vicinity
+                if prow is not None and x < len(prow) and prow[x] != row[x]:
+                    s += 0.25
+                # 2. Player vicinity (Manhattan distance — grid-appropriate)
                 if player_pos is not None:
-                    dx = abs(x - player_pos[0])
-                    dy = abs(y - player_pos[1])
-                    dist = (dx * dx + dy * dy) ** 0.5
-                    if dist < 15:
-                        s += 0.30 * (1.0 - dist / 15.0)
-                # 3. Goal vicinity
+                    dist = abs(x - player_pos[0]) + abs(y - player_pos[1])
+                    if dist < 20:
+                        s += 0.30 * (1.0 - dist / 20.0)
+                # 3. Goal vicinity (Manhattan distance)
                 for gx, gy in goal_positions:
-                    dx = abs(x - gx)
-                    dy = abs(y - gy)
-                    dist = (dx * dx + dy * dy) ** 0.5
-                    if dist < 12:
-                        s += 0.20 * (1.0 - dist / 12.0)
+                    dist = abs(x - gx) + abs(y - gy)
+                    if dist < 16:
+                        s += 0.20 * (1.0 - dist / 16.0)
                         break
                 # 4. Novelty (inverse visitation)
                 vis = self._visitation_counts[y][x]
@@ -103,6 +108,10 @@ class AttentionFocus:
                 if x < 3 or x >= w - 3 or y < 3 or y >= h - 3:
                     s += 0.10
                 self.salience.data[y][x] = min(1.0, s)
+        # Zero out any cells not covered by this frame's board (smaller boards)
+        for y in range(len(board), h):
+            for x in range(w):
+                self.salience.data[y][x] = 0.0
         self._prev_board = board
         return self.salience
 
@@ -135,3 +144,4 @@ class AttentionFocus:
         h, w = self.salience.height, self.salience.width
         self._visitation_counts = [[0] * w for _ in range(h)]
         self._prev_board = None
+        self._last_player_pos = None

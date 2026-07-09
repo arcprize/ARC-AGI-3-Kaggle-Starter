@@ -48,7 +48,6 @@ class WorkingMemory:
       have a reserved slot so one category cannot crowd out all others.
     """
 
-    MAX_ITEMS: int = 7
     _DECAY_RATE: float = 0.92
 
     def __init__(self, capacity: int = 7) -> None:
@@ -58,8 +57,10 @@ class WorkingMemory:
             "goal": 2,
             "plan": 2,
             "outcome": 2,
-            "percept": capacity - 2,
+            "percept": max(1, capacity - 2),
         }
+        self._recent_actions: list[str] = []
+        self._consolidation_counter: int = 0
 
     # ── public API ────────────────────────────────────────────────────
 
@@ -75,26 +76,46 @@ class WorkingMemory:
     def push(self, item: WMItem) -> None:
         """Add or update an item.  Evict lowest-utility item if full.
         Interference: if a similar key (same prefix) exists, the new item
-        competes with it (reduces its utility)."""
+        competes with it — but only AFTER the item has been successfully added."""
+        # Update existing item in-place (preserves its category slot).
         if item.key in self._items:
-            self._items[item.key] = item
+            old = self._items[item.key]
+            old.content = item.content
+            old.utility = max(old.utility, item.utility)
+            old.access()
+            # Apply interference — only when fewer than 3 slots remain
+            if self.available_capacity < 3:
+                penalty = 1.0 - 0.15 * self.load
+                prefix = item.key.split("_")[0] if "_" in item.key else item.key[:8]
+                for existing in list(self._items.values()):
+                    if existing.key == item.key:
+                        continue
+                    other_prefix = existing.key.split("_")[0] if "_" in existing.key else existing.key[:8]
+                    if other_prefix == prefix:
+                        existing.utility *= penalty
             return
-        # Interference — similar keys compete
-        prefix = item.key.split("_")[0] if "_" in item.key else item.key[:8]
-        for existing in list(self._items.values()):
-            other_prefix = existing.key.split("_")[0] if "_" in existing.key else existing.key[:8]
-            if other_prefix == prefix and existing.key != item.key:
-                existing.utility *= 0.85  # interference penalty
         cat = item.category
         cat_items = {k: v for k, v in self._items.items() if v.category == cat}
-        cat_max = self._category_max.get(cat, 3)
+        cat_max = self._category_max.get(cat, 3)  # unknown categories default to 3
         if len(cat_items) >= cat_max:
             victim = min(cat_items, key=lambda k: cat_items[k].utility)
             self._items.pop(victim, None)
         if len(self._items) >= self.capacity:
             victim = min(self._items, key=lambda k: self._items[k].utility)
             self._items.pop(victim, None)
+        # Insert the item before applying interference (so we don't penalise
+        # items that were evicted making room).
         self._items[item.key] = item
+        # Interference — similar keys compete (only when pressure is high)
+        if self.available_capacity < 3:
+            penalty = 1.0 - 0.15 * self.load  # 0.955 at 30% load, 0.85 at 100%
+            prefix = item.key.split("_")[0] if "_" in item.key else item.key[:8]
+            for existing in list(self._items.values()):
+                if existing.key == item.key:
+                    continue
+                other_prefix = existing.key.split("_")[0] if "_" in existing.key else existing.key[:8]
+                if other_prefix == prefix:
+                    existing.utility *= penalty
 
     def get(self, key: str) -> WMItem | None:
         """Retrieve an item (boosts its utility)."""
@@ -123,20 +144,33 @@ class WorkingMemory:
             self._items.pop(k, None)
         # Gist consolidation: every 50 ticks, compress oldest item into
         # an abstract summary (if it's an action sequence).
-        self._consolidation_counter = getattr(self, '_consolidation_counter', 0) + 1
+        self._consolidation_counter += 1
         if self._consolidation_counter >= 50 and oldest_key is not None:
-            oldest = self._items.get(oldest_key)
+            # If the oldest key was removed as dead, find the next oldest
+            if oldest_key not in self._items:
+                oldest_key = min(self._items, key=lambda k: self._items[k].created_at) if self._items else None
+            oldest = self._items.get(oldest_key) if oldest_key is not None else None
             if oldest is not None and oldest.category == "outcome":
-                from agi_core.cognition import WMItem
                 gist = WMItem(
                     key=f"gist_{oldest_key}",
                     content=f"summarised: {str(oldest.content)[:60]}",
                     category="percept",
                     utility=0.3,
                 )
-                self.remove(oldest_key)
-                self.push(gist)
-            self._consolidation_counter = 0
+                # Only remove the original if the gist can actually be stored
+                # (i.e., there's room in the percept category).  If percept
+                # slots are full, the gist would be immediately evicted.
+                gist_fits = (
+                    self._category_max.get('percept', 3) > 1
+                    or len([v for v in self._items.values() if v.category == 'percept']) < self._category_max.get('percept', 3)
+                )
+                if gist_fits:
+                    self.remove(oldest_key)
+                    self.push(gist)
+                else:
+                    logger = __import__('logging').getLogger(__name__)
+                    logger.debug("WM: skipping gist consolidation — percept slots full")
+            self._consolidation_counter = 0  # reset regardless (prevents counter creep)
 
     def snapshot(self) -> dict[str, Any]:
         """Return a snapshot for hyperon facts / logging."""
@@ -159,3 +193,17 @@ class WorkingMemory:
 
     def clear(self) -> None:
         self._items.clear()
+        self._recent_actions.clear()
+        self._consolidation_counter = 0
+
+    def record_action(self, action_name: str) -> None:
+        """Append an action to the recent-actions buffer (last 20 kept)."""
+        self._recent_actions.append(action_name)
+        if len(self._recent_actions) > 20:
+            self._recent_actions.pop(0)
+
+    def recent_actions(self, n: int = 10) -> list[str]:
+        """Return the last ``n`` recorded actions (empty list if ``n <= 0``)."""
+        if n <= 0 or not self._recent_actions:
+            return []
+        return self._recent_actions[-n:]

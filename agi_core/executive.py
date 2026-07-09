@@ -43,6 +43,11 @@ class Executive:
         self.chunk_library = chunk_library
 
     def decide(self, context: ExecutiveContext) -> ActionDecision:
+        # Update attention visitation BEFORE hyperon/orchestrator computes salience
+        if self.attention is not None:
+            player_pos = getattr(context.observation, 'player_position', None)
+            if player_pos is not None:
+                self.attention.mark_visited(player_pos)
         context.hyperon.sync(context.observation, context.memory, context.goals)
         context.memory_bundle = context.hyperon.current_memory_bundle()
         context.llm_memory_bundle = context.memory_bundle
@@ -59,22 +64,29 @@ class Executive:
         if wm is not None:
             wm.tick()
         if mc is not None:
-            stagnation = context.memory.most_recent_action() is not None
-            confidence = 0.5
-            if wm is not None:
-                hfw = context.memory.recent_actions()[-3:] if hasattr(context.memory, 'recent_actions') else []
-                plan_steps = []
-                confidence = mc.estimate_confidence(
-                    plan_steps=plan_steps,
-                    goal_stack_depth=len(getattr(self.goal_stack, 'active_path', []) if self.goal_stack else []),
-                    working_memory_load=wm.load if wm is not None else 0.0,
-                    stagnation_steps=context.memory.most_recent_action() is not None if hasattr(context.memory, 'most_recent_action') else 0,
-                    recent_outcomes=[],
-                )
+            stagnation_steps = int(getattr(context.memory, '_stagnation_steps', 0))
+            recent_raw = wm.recent_actions(5) if wm is not None else []
+            outcomes = []
+            for a in recent_raw:
+                outcomes.append("progress" if a not in ("RESET", "ACTION6") else "stalled")
+            wm_load = wm.load if wm is not None else 0.0
+            plan = getattr(context.memory, '_active_plan', None) or getattr(context, '_active_plan', None)
+            has_plan = plan is not None
+            confidence = mc.estimate_confidence(
+                plan_steps=list(getattr(plan, 'steps', []) if plan is not None else []),
+                goal_stack_depth=len(getattr(self.goal_stack, 'active_path', []) if self.goal_stack else []),
+                working_memory_load=wm_load,
+                stagnation_steps=stagnation_steps,
+                recent_outcomes=outcomes,
+                consecutive_failures=getattr(mc, '_consecutive_failures', 0),
+            )
+            goal_progress = getattr(self.goal_stack, 'progress_ratio', 0.0) if self.goal_stack else 0.0
             strategy = mc.select_strategy(
                 confidence=confidence,
-                stagnation_steps=int(getattr(context.memory, '_stagnation_steps', 0)),
-                has_plan=bool(getattr(context, '_active_plan', None)),
+                stagnation_steps=stagnation_steps,
+                has_plan=has_plan,
+                working_memory_load=wm_load,
+                goal_progress=goal_progress,
             )
             context.cognition_strategy = strategy.value
         pending_reopen = context.memory.pending_score_floor_reopen(context.observation)
@@ -103,13 +115,12 @@ class Executive:
         context.replan_mode = replan_mode
 
         # ── Gate specialists by cognition strategy ────────────────
-        strat = getattr(context, 'cognition_strategy', 'exploit')
         mc = self.meta_cognition
-        use_reactive = (
-            not replan_mode
-            and (mc is None or mc.should_use_specialist(mc._mode_history[-1] if mc._mode_history else None))
-        )
-        use_symbolic = mc is None or mc.should_use_specialist(mc._mode_history[-1] if mc._mode_history else None)
+        cur_strategy = None
+        if mc is not None and hasattr(mc, '_mode_history') and mc._mode_history:
+            cur_strategy = mc._mode_history[-1]
+        use_reactive = not replan_mode and (mc is None or mc.should_use_specialist(cur_strategy))
+        use_symbolic = mc is None or mc.should_use_specialist(cur_strategy)
 
         reactive_proposals = []
         symbolic_proposals = []
@@ -209,48 +220,103 @@ class Executive:
         return fallback
 
     def _finalize_cognition(self, context, decision: ActionDecision) -> None:
-        """Update cognition modules after a decision is made."""
+        """Update cognition modules after a decision is made.
+        
+        Guarded by ``_last_cog_frame`` — only fires once per decision."""
+        step = context.observation.step_index
+        if getattr(self, '_last_cog_frame', -1) == step:
+            return
+        self._last_cog_frame = step
         wm = self.working_memory
         mc = self.meta_cognition
         gs = self.goal_stack
         em = self.episodic_memory
         cl = self.chunk_library
         action_name = decision.action_name
+        # Capture previous actions BEFORE recording the current one, so
+        # the outcome override loop below doesn't see the same action.
+        prev_actions = wm.recent_actions(3) if wm is not None else []
         if wm is not None:
-            from agi_core.cognition import WMItem
+            from agi_core.cognition.working_memory import WMItem
             wm.push(WMItem(
                 key=f"action_{context.observation.step_index}",
                 content=action_name,
                 category="outcome",
             ))
+            wm.record_action(action_name)
+        if self.attention is not None:
+            player_pos = getattr(context.observation, 'player_position', None)
+            if player_pos is not None:
+                self.attention.mark_visited(player_pos)
         if mc is not None:
             mc.note_visit(action_name)
-            last_actions = context.memory.recent_actions()[-3:] if hasattr(context.memory, 'recent_actions') else []
-            outcomes = []
-            for a in last_actions:
-                if a == action_name:
-                    outcomes.append("progress")
-            mc.note_outcome(outcomes[-1] if outcomes else "stalled")
+            # Single outcome determination (most specific wins):
+            #   1. Same action repeated → "failed"
+            #   2. Fallback decision → "stalled"
+            #   3. Otherwise → "progress"
+            repeats = any(a == action_name for a in prev_actions)
+            had_reset = any(a == "RESET" for a in prev_actions)
+            if repeats or had_reset:
+                outcome = "failed"
+            elif decision.source == "fallback" or getattr(decision, 'used_fallback', False):
+                outcome = "stalled"
+            else:
+                outcome = "progress"
+            mc.note_outcome(outcome)
         if gs is not None and decision.subgoal:
             sub = decision.subgoal
             found = gs.find(sub)
             if found is None:
                 gs.push(sub)
             gs.mark_active()
-            # Auto-backtrack if stuck on same goal
-            if not gs.check_progress(sub):
-                gs.backtrack()
-        # Per-frame forgetting curve
-        if em is not None and hasattr(em, 'apply_forgetting'):
-            if getattr(self, '_forget_counter', 0) % 60 == 0:
-                em.apply_forgetting()
-            self._forget_counter = getattr(self, '_forget_counter', 0) + 1
+            # Auto-backtrack if stuck on same goal (only if goal is ACTIVE/PENDING
+            # and there are at least 2 goals on the path — don't backtrack root).
+            if found is not None and found.status.name in ("PENDING", "ACTIVE") and gs.depth > 1:
+                if not gs.check_progress(sub):
+                    gs.backtrack()
+        # Forgetting is handled automatically within EpisodicMemory.record()
+        # every 10 episodes — no need for a separate frame-level trigger.
+        # Periodic episodic consolidation + mid-game recording (every 50 frames)
+        self._episodic_consolidation_counter = getattr(self, '_episodic_consolidation_counter', 0) + 1
+        if em is not None and self._episodic_consolidation_counter >= 50:
+            # Record a mid-game episode snapshot for consolidation
+            recent = wm.recent_actions(15) if wm is not None else []
+            if len(recent) >= 5:
+                dyn = getattr(context.observation, 'derived_features', {}).get('primary_dynamics', 'unknown')
+                gc = len(getattr(context.observation, 'goal_positions', []) or [])
+                board_hash = hash(str(getattr(context.observation, 'image_input', None)))
+                player_start = getattr(context.observation, 'player_position', (0, 0)) or (0, 0)
+                em.record(dyn, recent, 'progress', gc, player_start, board_hash)
+            em.consolidate()
+            self._episodic_consolidation_counter = 0
         # Frame-level chunk extraction from recent action window
-        if cl is not None and hasattr(context.memory, 'recent_actions'):
-            recent = context.memory.recent_actions()[-10:]
+        if cl is not None and wm is not None:
+            recent = wm.recent_actions(10)
             if len(recent) >= 5:
                 dynamics = getattr(context.observation, 'derived_features', {}).get('primary_dynamics', 'unknown')
-                cl.extract_from_window(recent, dynamics, goal_count=0)
+                gc = len(getattr(context.observation, 'goal_positions', []) or [])
+                cl.extract_from_window(recent, dynamics, goal_count=gc)
+        # Stale chunk decay every 100 frames
+        self._decay_counter = getattr(self, '_decay_counter', 0) + 1
+        if cl is not None and self._decay_counter >= 100:
+            cl.decay_stale()
+            self._decay_counter = 0
+        # MetaCognition visit decay every 150 frames
+        self._mc_decay_counter = getattr(self, '_mc_decay_counter', 0) + 1
+        if mc is not None and hasattr(mc, 'decay_visits') and self._mc_decay_counter >= 150:
+            mc.decay_visits()
+            self._mc_decay_counter = 0
+        # Log cognition state every 50 frames for debugging
+        if getattr(self, '_cog_log_counter', 0) % 50 == 0:
+            attrs = []
+            if wm is not None: attrs.append(f'wm_load={wm.load:.2f}')
+            if mc is not None: attrs.append(f'consec={mc._consecutive_failures}')
+            if gs is not None: attrs.append(f'gs_depth={gs.depth}')
+            if cl is not None: attrs.append(f'chunks={cl.count}')
+            if em is not None: attrs.append(f'traces={len(em._traces)}')
+            logger = __import__('logging').getLogger(__name__)
+            logger.debug('Cognition: %s', ' | '.join(a for a in attrs if a))
+        self._cog_log_counter = getattr(self, '_cog_log_counter', 0) + 1
 
     def _all_legal_proposals_are_score_floor(
         self,

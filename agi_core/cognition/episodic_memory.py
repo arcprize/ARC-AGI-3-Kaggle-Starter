@@ -59,6 +59,7 @@ class ConsolidatedMemory:
         self._next_id: int = 0
         self._max_episodes = max_episodes
         self._consolidation_counter: int = 0
+        self._last_forgetting_time: float = time.monotonic()
 
     # ── recording ─────────────────────────────────────────────────────
 
@@ -71,7 +72,10 @@ class ConsolidatedMemory:
         player_start: tuple[int, int],
         board_hash: int,
     ) -> None:
-        """Store an episode summary (bounded by ``max_episodes``)."""
+        """Store an episode summary (bounded by ``max_episodes``).
+        Silently ignores records with empty dynamics or action sequences."""
+        if not dynamics or not action_sequence:
+            return
         ep = EpisodeSummary(
             episode_id=self._next_id,
             dynamics=dynamics,
@@ -86,6 +90,13 @@ class ConsolidatedMemory:
         if len(self._episodes) > self._max_episodes:
             self._episodes.pop(0)
         self._consolidation_counter += 1
+        # Auto-forgetting: every 10 records OR every 60 seconds
+        now = time.monotonic()
+        elapsed = now - self._last_forgetting_time
+        if self._consolidation_counter >= 10 or elapsed >= 60.0:
+            self.apply_forgetting()
+            self._consolidation_counter = 0
+            self._last_forgetting_time = now
 
     # ── consolidation ─────────────────────────────────────────────────
 
@@ -101,7 +112,7 @@ class ConsolidatedMemory:
         # Simple clustering: group by dynamics + outcome
         clusters: dict[tuple[str, str], list[EpisodeSummary]] = defaultdict(list)
         for ep in self._episodes:
-            clusters[(ep.dynamics, ep.outcome)].append(ep)
+            clusters[(ep.dynamics.lower(), ep.outcome)].append(ep)
         for (dynamics, outcome), eps in clusters.items():
             if len(eps) < 2:
                 continue
@@ -118,7 +129,15 @@ class ConsolidatedMemory:
                 ),
             }
             trace_id = f"trace_{dynamics}_{outcome}_{len(self._traces)}"
-            if trace_id not in self._traces:
+            exists = self._traces.get(trace_id)
+            if exists is not None:
+                # Re-consolidation: merge new episode IDs and update schema
+                old_ep_ids = set(exists.episodes)
+                new_ids = [e.episode_id for e in eps if e.episode_id not in old_ep_ids]
+                if new_ids:
+                    exists.episodes.extend(new_ids)
+                    exists.schema.update(schema)  # refresh typical_actions/avg_length
+            else:
                 self._traces[trace_id] = MemoryTrace(
                     trace_id=trace_id,
                     schema=schema,
@@ -161,7 +180,7 @@ class ConsolidatedMemory:
         """Return the ``top_k`` most structurally similar memory traces."""
         scored: list[tuple[float, MemoryTrace]] = []
         for trace in self._traces.values():
-            if trace.schema.get("dynamics") != dynamics:
+            if trace.schema.get("dynamics") and trace.schema["dynamics"].lower() != dynamics.lower():
                 continue
             sim = self._structural_similarity(
                 action_sequence,
@@ -181,14 +200,31 @@ class ConsolidatedMemory:
         seq_a: list[str],
         seq_b: list[str],
     ) -> float:
-        """Jaccard-like similarity on action n-grams (structural, not sequential)."""
+        """Hybrid similarity: Jaccard (set overlap) × sequential n-gram overlap.
+        
+        Returns 0.0 if either sequence is empty.  The final score is the
+        geometric mean of the Jaccard score and the n-gram overlap score,
+        so that both set composition AND action order matter.
+        """
         if not seq_a or not seq_b:
             return 0.0
+        # Jaccard (set-based)
         set_a = set(seq_a)
         set_b = set(seq_b)
         intersection = set_a & set_b
         union = set_a | set_b
-        return len(intersection) / len(union) if union else 0.0
+        jaccard = len(intersection) / len(union) if union else 0.0
+        # Bigram overlap (sequential)
+        bigrams_a = set(zip(seq_a, seq_a[1:]))
+        bigrams_b = set(zip(seq_b, seq_b[1:]))
+        if not bigrams_a or not bigrams_b:
+            bigram_score = jaccard  # fall back to jaccard for short sequences
+        else:
+            bg_intersection = bigrams_a & bigrams_b
+            bg_union = bigrams_a | bigrams_b
+            bigram_score = len(bg_intersection) / len(bg_union) if bg_union else 0.0
+        # Geometric mean of the two scores
+        return (jaccard * bigram_score) ** 0.5
 
     @staticmethod
     def _longest_common_prefix(sequences: list[list[str]]) -> list[str]:

@@ -248,6 +248,9 @@ class ObjectiveReduction:
             "stable_goal": self._stable_goal,
             "action_priors": hyperon_priors,
             "chunk_library": getattr(context, 'chunk_library', None),
+            "episodic_memory": getattr(context, 'episodic_memory', None),
+            "recent_actions": list(getattr(context.memory, '_recent_actions', []) or []),
+            "goal_count": len(game_model.goal_positions) if game_model else 0,
             "board_explore_bias": board_explore_bias,
             "board_interact_range": board_interact_range,
             "board_move_bias": board_move_bias,
@@ -461,6 +464,9 @@ class ObjectiveReduction:
             "beam_cells": beam_cells_pctx,
             "mirror_axis": game_model.features.mirror_axis,
             "memory_db_path": getattr(context.config, "memory_db_path", None),
+            "recent_actions": list(getattr(context.memory, '_recent_actions', []) or []),
+            "goal_count": len(game_model.goal_positions) if game_model else 0,
+            "episodic_memory": getattr(context, 'episodic_memory', None),
         }
         try:
             gh = context.hyperon.run_rules("game-goal-hints")

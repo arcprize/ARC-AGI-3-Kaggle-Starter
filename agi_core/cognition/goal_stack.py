@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import time
+import logging
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class GoalStatus(Enum):
@@ -79,6 +83,21 @@ class GoalStack:
     def depth(self) -> int:
         return len(self._active_path)
 
+    @property
+    def progress_ratio(self) -> float:
+        """Fraction of all goals in the tree that are COMPLETED."""
+        if self._root is None:
+            return 0.0
+        total = 0
+        completed = 0
+        queue: deque[Goal] = deque([self._root])
+        while queue:
+            g = queue.popleft()
+            if g.status == GoalStatus.COMPLETED:
+                completed += 1
+            queue.extend(g.children)
+        return completed / total if total > 0 else 0.0
+
     # ── construction ───────────────────────────────────────────────────
 
     def set_root(self, name: str, **meta: Any) -> Goal:
@@ -89,11 +108,14 @@ class GoalStack:
         return g
 
     def push(self, name: str, **meta: Any) -> Goal:
-        """Push a subgoal under the current active goal."""
+        """Push a subgoal under the current active goal.
+        
+        If the stack is empty, the goal is set as the root instead."""
         parent = self.active
+        if parent is None:
+            return self.set_root(name, **meta)
         g = Goal(name=name, parent=parent, metadata=meta)
-        if parent is not None:
-            parent.children.append(g)
+        parent.children.append(g)
         self._active_path.append(g)
         return g
 
@@ -108,19 +130,28 @@ class GoalStack:
     def backtrack(self) -> Goal | None:
         """Mark the current active goal as FAILED and return to its parent.
         If a goal has failed more than ``_max_failures_per_goal`` times,
-        skip it entirely (FAILED + SKIPPED)."""
+        skip it entirely (FAILED + SKIPPED).
+        Also clears progress history to prevent cascading false backtracks."""
         if not self._active_path:
             return None
+        self._progress_history.clear()
         g = self._active_path.pop()
         g.status = GoalStatus.FAILED
         g.attempts += 1
         if g.attempts >= self._max_failures_per_goal:
             g.status = GoalStatus.SKIPPED
-            logger = logging.getLogger(__name__)
             logger.info("GoalStack: skipping %s after %d failures", g.name, g.attempts)
-            # Skip back to grandparent if parent is also exhausted
+            # Mark parent as failed once (increments its attempts counter)
+            if self._active_path:
+                self._active_path[-1].attempts += 1
+            # Skip back to grandparent if parent is now also exhausted
             if self._active_path and self._active_path[-1].attempts >= self._max_failures_per_goal:
-                self._active_path.pop()
+                gp = self._active_path.pop()
+                gp.status = GoalStatus.FAILED
+                gp.attempts += 1
+                gp.status = GoalStatus.SKIPPED
+                gp.children.clear()
+                logger.info("GoalStack: skipping parent %s after %d failures", gp.name, gp.attempts)
         elif self._active_path:
             self._active_path[-1].attempts += 1
         return g
@@ -155,9 +186,9 @@ class GoalStack:
         """Find a goal by name anywhere in the tree (BFS)."""
         if self._root is None:
             return None
-        queue: list[Goal] = [self._root]
+        queue: deque[Goal] = deque([self._root])
         while queue:
-            g = queue.pop(0)
+            g = queue.popleft()
             if g.name == name:
                 return g
             queue.extend(g.children)
@@ -166,6 +197,7 @@ class GoalStack:
     def reset(self) -> None:
         self._root = None
         self._active_path = []
+        self._progress_history.clear()
 
     def snapshot(self) -> dict[str, Any]:
         """Build a dict for logging / hyperon facts."""
