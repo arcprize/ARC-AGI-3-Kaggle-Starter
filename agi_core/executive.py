@@ -23,12 +23,24 @@ class Executive:
         symbolic,
         llm,
         critic,
+        attention=None,
+        working_memory=None,
+        goal_stack=None,
+        episodic_memory=None,
+        meta_cognition=None,
+        chunk_library=None,
     ) -> None:
         self.config = config
         self.reactive = reactive
         self.symbolic = symbolic
         self.llm = llm
         self.critic = critic
+        self.attention = attention
+        self.working_memory = working_memory
+        self.goal_stack = goal_stack
+        self.episodic_memory = episodic_memory
+        self.meta_cognition = meta_cognition
+        self.chunk_library = chunk_library
 
     def decide(self, context: ExecutiveContext) -> ActionDecision:
         context.hyperon.sync(context.observation, context.memory, context.goals)
@@ -36,6 +48,31 @@ class Executive:
         context.llm_memory_bundle = context.memory_bundle
         context.llm_subgoal_hint = None
         context.contextual_memory_bundles = {}
+
+        # ── Cognition integration ──────────────────────────────────
+        wm = self.working_memory
+        mc = self.meta_cognition
+        if wm is not None:
+            wm.tick()
+        if mc is not None:
+            stagnation = context.memory.most_recent_action() is not None
+            confidence = 0.5
+            if wm is not None:
+                hfw = context.memory.recent_actions()[-3:] if hasattr(context.memory, 'recent_actions') else []
+                plan_steps = []
+                confidence = mc.estimate_confidence(
+                    plan_steps=plan_steps,
+                    goal_stack_depth=len(getattr(self.goal_stack, 'active_path', []) if self.goal_stack else []),
+                    working_memory_load=wm.load if wm is not None else 0.0,
+                    stagnation_steps=context.memory.most_recent_action() is not None if hasattr(context.memory, 'most_recent_action') else 0,
+                    recent_outcomes=[],
+                )
+            strategy = mc.select_strategy(
+                confidence=confidence,
+                stagnation_steps=int(getattr(context.memory, '_stagnation_steps', 0)),
+                has_plan=bool(getattr(context, '_active_plan', None)),
+            )
+            context.cognition_strategy = strategy.value
         pending_reopen = context.memory.pending_score_floor_reopen(context.observation)
         if pending_reopen is not None and "RESET" in context.observation.legal_actions:
             context.score_floor_debug = dict(pending_reopen.get("score_floor_debug") or {})

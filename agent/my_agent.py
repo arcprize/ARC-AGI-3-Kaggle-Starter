@@ -85,12 +85,32 @@ class MyAgent(Agent):
             ProcessPoolManager.executor()
         except Exception:
             pass
+        # Human-like cognition modules
+        from agi_core.cognition import (
+            AttentionFocus, ChunkLibrary, ConsolidatedMemory,
+            GoalStack, MetaCognition, WorkingMemory,
+        )
+        self._attention = AttentionFocus()
+        self._working_memory = WorkingMemory()
+        self._goal_stack = GoalStack()
+        self._episodic_memory = ConsolidatedMemory()
+        self._meta_cognition = MetaCognition()
+        self._chunk_library = ChunkLibrary()
+        # Also wire into hyperon bridge for rule processing
+        hyperon.meta_cognition = self._meta_cognition  # type: ignore[attr-defined]
+
         base_executive = Executive(
             config=config,
             reactive=ReactiveSpecialist(),
             symbolic=SymbolicSpecialist(),
             llm=LLMSpecialist() if config.llm_enabled else None,
             critic=ProposalCritic(),
+            attention=self._attention,
+            working_memory=self._working_memory,
+            goal_stack=self._goal_stack,
+            episodic_memory=self._episodic_memory,
+            meta_cognition=self._meta_cognition,
+            chunk_library=self._chunk_library,
         )
         executive = (
             ObjectiveReduction(executive=base_executive, config=config)

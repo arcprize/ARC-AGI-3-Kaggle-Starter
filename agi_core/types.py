@@ -122,6 +122,7 @@ class ExecutiveContext:
     probe_dead_end_replan: bool = False
     score_floor_proposals: list[Any] = field(default_factory=list)
     score_floor_debug: dict[str, Any] = field(default_factory=dict)
+    cognition_strategy: str = "exploit"
 
 
 @runtime_checkable
