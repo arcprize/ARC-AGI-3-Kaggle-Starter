@@ -111,10 +111,12 @@ class MirrorSolver(DynamicsSolver):
                 return None
             mirror_gx = votes.most_common(1)[0][0] // (2 * gs)
 
-        # Cache mirror position
-        if self._cached_mirror_gx < 0:
+        # Cache mirror position for stability. Update cache when mirror moves
+        # (player_at_mirror means the live mirror_gx tracks the moving mirror).
+        player_at_mirror = abs(px // gs - mirror_gx) <= 1
+        if self._cached_mirror_gx < 0 or player_at_mirror:
             self._cached_mirror_gx = mirror_gx
-        if abs(px // gs - mirror_gx) > 1:
+        if not player_at_mirror:
             mirror_gx = self._cached_mirror_gx
 
         player_gx = px // gs
@@ -147,18 +149,21 @@ class MirrorSolver(DynamicsSolver):
         min_ggy = min_gpy // gs
 
         # Determine if player IS the mirror by checking:
-        # 1. Player grid x is near mirror grid x, OR
-        # 2. Player is at a color-0 cell at the mirror's position
+        # 1. Player grid x is near mirror grid x (from live mirror components), OR
+        # 2. Player is at a color-0 cell at the mirror's position (interface writes
+        #    color 0 at player sprite centers; for Level 2 the mirror IS the player)
         player_is_mirror = abs(player_gx - mirror_gx) <= 1
-        if not player_is_mirror:
-            mirror_px = mirror_gx * gs + 1
+        if not player_is_mirror and mirr_xs:
+            live_mirror_px = sum(mirr_xs) // len(mirr_xs)
             for c in gm.components:
                 if c.dominant_color == 0 and not c.touches_border and 1 <= c.size <= 30:
                     cx, _ = _component_center(c)
-                    if abs(cx - mirror_px) <= gs:
+                    if abs(cx - live_mirror_px) <= gs:
                         player_is_mirror = True
                         px = cx
                         player_gx = px // gs
+                        # Also update mirror_gx to the live mirror position
+                        mirror_gx = live_mirror_px // gs
                         break
 
 

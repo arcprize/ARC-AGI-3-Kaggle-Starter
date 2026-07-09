@@ -257,6 +257,8 @@ def _find_goals(
             score += 2.0
         else:
             score -= 2.0
+        if c.dominant_color in (11,):
+            score += 3.0
         if 3 <= c.size <= 20:
             score += 1.5
         elif c.size <= 60:
