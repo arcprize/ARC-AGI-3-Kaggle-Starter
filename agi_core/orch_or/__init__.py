@@ -15,7 +15,7 @@ from agi_core.orch_or.game_model import (
     deserialize_plan,
     serialize_plan,
 )
-from agi_core.orch_or.parallel import ThreadPoolManager
+from agi_core.orch_or.parallel import ProcessPoolManager, ThreadPoolManager, sync_pool_worker_counts
 
 __all__ = (
     "ADVANCE",
@@ -28,10 +28,12 @@ __all__ = (
     "ObjectiveReduction",
     "Plan",
     "PlanStep",
+    "ProcessPoolManager",
     "REPLAN",
     "RETRY",
     "SpriteInfo",
     "ThreadPoolManager",
     "deserialize_plan",
     "serialize_plan",
+    "sync_pool_worker_counts",
 )

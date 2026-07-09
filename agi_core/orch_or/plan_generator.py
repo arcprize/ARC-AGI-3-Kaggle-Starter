@@ -110,13 +110,8 @@ def _generate_plan_parallel(
     timeout: float | None,
 ) -> Plan | None:
     all_strategies = available_strategies()
-    targets = [primary_name]
-    if primary_name == "movement":
-        targets.append("interaction")
-    elif primary_name == "interaction":
-        targets.append("movement")
-    targets = [s for s in all_strategies if s in targets or s in ("exploration", "generic")]
-    targets = list(dict.fromkeys(targets))
+    # Run ALL strategies in parallel (puzzle is handled by solver system).
+    targets = [s for s in all_strategies if s != "puzzle"]
     tasks = [
         (lambda fn=get_strategy(s): fn(game_model, context) if fn else [], s)
         for s in targets

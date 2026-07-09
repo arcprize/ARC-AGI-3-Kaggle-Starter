@@ -74,6 +74,18 @@ class SolverSelector:
             from agi_core.knowledge.solvers.navigation_solver import NavigationSolver
             solver_cls = NavigationSolver
 
+        # Reuse existing solver of the same type to preserve state across frames
+        if self._active_solver is not None and type(self._active_solver) is solver_cls:
+            self._active_name = solver_name
+            return self._active_solver
+        # Don't switch a MirrorSolver away mid-level — dynamics can oscillate
+        # between "puzzle", "sliding", "beam" etc. within the same level.
+        if self._active_solver is not None:
+            from agi_core.knowledge.solvers.mirror_solver import MirrorSolver
+            from agi_core.knowledge.solvers.navigation_solver import NavigationSolver
+            if isinstance(self._active_solver, (MirrorSolver, NavigationSolver)):
+                self._active_name = solver_name
+                return self._active_solver
         self._active_solver = solver_cls(memory_db_path=self._memory_db_path)
         self._active_name = solver_name
         return self._active_solver

@@ -5,6 +5,25 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable
 
+from agi_core.storage.memory_cache import get_cache
+
+_MEM_CACHE: dict[str, object] = {}
+
+
+def _refresh_cache(path: str | Path) -> None:
+    cache = get_cache(str(Path(path).resolve()))
+    if cache is not None:
+        cache.refresh()
+
+
+def _connect(path: str | Path, *, write: bool = False) -> sqlite3.Connection:
+    resolved = str(Path(path).resolve())
+    cache = _MEM_CACHE.get(resolved) or get_cache(resolved)
+    if cache is not None:
+        _MEM_CACHE[resolved] = cache
+        return cache.connect(write=write)
+    return sqlite3.connect(str(path))
+
 
 def game_id_aliases(game_id: str) -> list[str]:
     normalized = str(game_id or "").strip()
@@ -20,7 +39,7 @@ def game_id_aliases(game_id: str) -> list[str]:
 def initialize_schema(db_path: str | Path) -> None:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as connection:
+    with closing(_connect(path, write=True)) as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS metadata (
@@ -103,12 +122,15 @@ def initialize_schema(db_path: str | Path) -> None:
             """
         )
         connection.commit()
+    cache = get_cache(str(path))
+    if cache is not None:
+        cache.refresh()
 
 
 def upsert_metadata(db_path: str | Path, values: dict[str, str]) -> None:
     if not values:
         return
-    with closing(sqlite3.connect(Path(db_path))) as connection:
+    with closing(_connect(db_path, write=True)) as connection:
         connection.executemany(
             """
             INSERT INTO metadata(key, value)
@@ -144,7 +166,7 @@ def upsert_training_counts(db_path: str | Path, rows: Iterable[dict[str, Any]]) 
             subgoal_rows.append(
                 (game_id, str(row.get("subgoal", "")), action_name, count)
             )
-    with closing(sqlite3.connect(Path(db_path))) as connection:
+    with closing(_connect(db_path, write=True)) as connection:
         if game_rows:
             connection.executemany(
                 """
@@ -186,6 +208,7 @@ def upsert_training_counts(db_path: str | Path, rows: Iterable[dict[str, Any]]) 
                 subgoal_rows,
             )
         connection.commit()
+    _refresh_cache(db_path)
 
 
 def load_best_prior_bucket(
@@ -200,7 +223,7 @@ def load_best_prior_bucket(
     if not path.exists() or not legal_actions:
         return {}
     aliases = [alias for alias in game_id_aliases(game_id) if alias]
-    with closing(sqlite3.connect(path)) as connection:
+    with closing(_connect(path)) as connection:
         merged_bucket: dict[str, int] = {}
         if subgoal:
             for alias in aliases:
@@ -258,7 +281,7 @@ def load_game_summary(db_path: str | Path, game_id: str) -> dict[str, Any]:
     path = Path(db_path)
     if not path.exists():
         return {"actions": {}, "states": {}, "frame_signatures": {}, "subgoals": {}}
-    with closing(sqlite3.connect(path)) as connection:
+    with closing(_connect(path)) as connection:
         summary = {
             "actions": _query_pairs(
                 connection,
@@ -338,7 +361,7 @@ def upsert_board_policy_params(
 ) -> None:
     if not rows:
         return
-    with closing(sqlite3.connect(Path(db_path))) as connection:
+    with closing(_connect(db_path, write=True)) as connection:
         connection.executemany(
             """
             INSERT INTO board_policy_params(board_type, param_name, param_value, confidence, sample_count)
@@ -361,6 +384,7 @@ def upsert_board_policy_params(
             ],
         )
         connection.commit()
+    _refresh_cache(db_path)
 
 
 def load_board_policy_params(
@@ -370,7 +394,7 @@ def load_board_policy_params(
     path = Path(db_path)
     if not path.exists():
         return {}
-    with closing(sqlite3.connect(path)) as connection:
+    with closing(_connect(path)) as connection:
         rows = connection.execute(
             """
             SELECT param_name, param_value

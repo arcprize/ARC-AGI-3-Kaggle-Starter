@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agi_core.image_input import board_context_match_score, extract_board_motif_tags
+from agi_core.storage.memory_cache import get_cache
 from agi_core.storage.priors_sqlite import (
     game_id_aliases,
     initialize_schema,
@@ -18,11 +19,45 @@ DEFAULT_RECENT_RECORD_LIMIT = 24
 DEFAULT_BOARD_CONTEXT_HISTORY_LIMIT = 16
 DEFAULT_EPISODE_SUMMARY_LIMIT = 8
 
+# -- In-memory cache helper ---------------------------------------------
+
+_MEM_CACHE: dict[str, object] = {}
+
+
+def _refresh_cache(path: str | Path) -> None:
+    """Refresh the in-memory cache after a disk write."""
+    cache = get_cache(str(Path(path).resolve()))
+    if cache is not None:
+        cache.refresh()
+
+
+def _connect(path: str | Path, *, write: bool = False) -> sqlite3.Connection:
+    """Return an SQLite connection.
+
+    *write=True*  → direct disk connection (cache bypassed, no auto-refresh).
+    *write=False* → in-memory cache connection (sub-ms reads).
+
+    After any write operation callers should refresh the cache via
+    ``get_cache(path).refresh()`` so subsequent reads see the new data.
+    """
+    if write:
+        return sqlite3.connect(str(path))
+    resolved = str(Path(path).resolve())
+    cache = _MEM_CACHE.get(resolved) or get_cache(resolved)
+    if cache is not None:
+        _MEM_CACHE[resolved] = cache
+        return cache.connect(write=False)
+    return sqlite3.connect(str(path))
+
 
 def initialize_memory_schema(db_path: str | Path) -> None:
     path = Path(db_path)
     initialize_schema(path)
-    with closing(sqlite3.connect(path)) as connection:
+    # Refresh in-memory cache so subsequent reads see the created tables.
+    cache = get_cache(str(path))
+    if cache is not None:
+        cache.refresh()
+    with closing(_connect(path, write=True)) as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS live_episode_records (
@@ -422,7 +457,7 @@ def import_legacy_learning_json(db_path: str | Path, json_path: str | Path) -> N
     if not path.exists():
         return
     initialize_memory_schema(db)
-    with closing(sqlite3.connect(db)) as connection:
+    with closing(_connect(db, write=True)) as connection:
         if _metadata_value(connection, "legacy_import_completed") == "1":
             return
     try:
@@ -432,7 +467,7 @@ def import_legacy_learning_json(db_path: str | Path, json_path: str | Path) -> N
     games = payload.get("games", {}) if isinstance(payload, dict) else {}
     if not isinstance(games, dict):
         return
-    with closing(sqlite3.connect(db)) as connection:
+    with closing(_connect(db, write=True)) as connection:
         for game_id, game_entry in sorted(games.items()):
             if not isinstance(game_entry, dict):
                 continue
@@ -493,9 +528,10 @@ def import_legacy_learning_json(db_path: str | Path, json_path: str | Path) -> N
 def record_transition(db_path: str | Path, record: EpisodeRecord) -> None:
     db = Path(db_path)
     initialize_memory_schema(db)
-    with closing(sqlite3.connect(db)) as connection:
+    with closing(_connect(db, write=True)) as connection:
         _record_transition_with_connection(connection, record)
         connection.commit()
+    _refresh_cache(db)
 
 
 def record_transitions(db_path: str | Path, records: list[EpisodeRecord]) -> None:
@@ -503,10 +539,11 @@ def record_transitions(db_path: str | Path, records: list[EpisodeRecord]) -> Non
         return
     db = Path(db_path)
     initialize_memory_schema(db)
-    with closing(sqlite3.connect(db)) as connection:
+    with closing(_connect(db, write=True)) as connection:
         for record in records:
             _record_transition_with_connection(connection, record)
         connection.commit()
+    _refresh_cache(db)
 
 
 def upsert_abstract_memory_rows(
@@ -517,10 +554,11 @@ def upsert_abstract_memory_rows(
         return
     db = Path(db_path)
     initialize_memory_schema(db)
-    with closing(sqlite3.connect(db)) as connection:
+    with closing(_connect(db, write=True)) as connection:
         for row in rows:
             _upsert_abstract_memory_row(connection, row)
         connection.commit()
+    _refresh_cache(db)
 
 
 def _record_transition_with_connection(
@@ -641,7 +679,7 @@ def load_basin_status(
             "is_exhausted": False,
             "action_outcomes": {},
         }
-    with closing(sqlite3.connect(path)) as connection:
+    with closing(_connect(path)) as connection:
         lookup_game_id = _resolve_memory_lookup_game_id(connection, game_id)
         basin_frame_signature = frame_signature
         row = _load_basin_row(connection, lookup_game_id, state, basin_frame_signature)
@@ -710,7 +748,7 @@ def load_memory_bundle(
         bundle = _empty_bundle()
         bundle["board_context_summary"] = _normalized_board_context(board_context)
         return bundle
-    with closing(sqlite3.connect(path)) as connection:
+    with closing(_connect(path)) as connection:
         lookup_game_id = _resolve_memory_lookup_game_id(connection, game_id)
         action_stats = _query_action_stats(
             connection,
@@ -1061,30 +1099,20 @@ def load_memory_bundle_from_stores(
     retrieval_step: int | None = None,
 ) -> dict[str, Any]:
     include_retrieval_metadata = bool(touch_retrieved)
-    hot_bundle, hot_error = _safe_load_memory_bundle(
-        hot_db_path,
-        game_id=game_id,
-        state=state,
-        frame_signature=frame_signature,
-        subgoal=subgoal,
-        legal_actions=legal_actions,
-        board_context=board_context,
-        board_motif_tags=board_motif_tags,
+    _hot_kw = dict(
+        game_id=game_id, state=state, frame_signature=frame_signature,
+        subgoal=subgoal, legal_actions=legal_actions,
+        board_context=board_context, board_motif_tags=board_motif_tags,
         last_action=last_action,
         touch_retrieved=False if include_retrieval_metadata else touch_retrieved,
         retrieval_step=retrieval_step,
         include_retrieval_metadata=include_retrieval_metadata,
         retrieval_store="hot",
     )
-    archive_bundle, archive_error = _safe_load_memory_bundle(
-        archive_db_path,
-        game_id=game_id,
-        state=state,
-        frame_signature=frame_signature,
-        subgoal=subgoal,
-        legal_actions=legal_actions,
-        board_context=board_context,
-        board_motif_tags=board_motif_tags,
+    _archive_kw = dict(
+        game_id=game_id, state=state, frame_signature=frame_signature,
+        subgoal=subgoal, legal_actions=legal_actions,
+        board_context=board_context, board_motif_tags=board_motif_tags,
         last_action=last_action,
         allow_same_as=hot_db_path,
         touch_retrieved=False if include_retrieval_metadata else touch_retrieved,
@@ -1092,15 +1120,10 @@ def load_memory_bundle_from_stores(
         include_retrieval_metadata=include_retrieval_metadata,
         retrieval_store="archive",
     )
-    trained_bundle, trained_error = _safe_load_memory_bundle(
-        trained_db_path,
-        game_id=game_id,
-        state=state,
-        frame_signature=frame_signature,
-        subgoal=subgoal,
-        legal_actions=legal_actions,
-        board_context=board_context,
-        board_motif_tags=board_motif_tags,
+    _trained_kw = dict(
+        game_id=game_id, state=state, frame_signature=frame_signature,
+        subgoal=subgoal, legal_actions=legal_actions,
+        board_context=board_context, board_motif_tags=board_motif_tags,
         last_action=last_action,
         allow_same_as=hot_db_path,
         touch_retrieved=False,
@@ -1108,6 +1131,30 @@ def load_memory_bundle_from_stores(
         include_retrieval_metadata=False,
         retrieval_store="trained",
     )
+    try:
+        from agi_core.orch_or.parallel import ThreadPoolManager
+        _futures = {
+            ThreadPoolManager.submit(
+                _safe_load_memory_bundle, hot_db_path, **_hot_kw,
+            ): "hot",
+            ThreadPoolManager.submit(
+                _safe_load_memory_bundle, archive_db_path, **_archive_kw,
+            ): "archive",
+            ThreadPoolManager.submit(
+                _safe_load_memory_bundle, trained_db_path, **_trained_kw,
+            ): "trained",
+        }
+        _results: dict[str, tuple] = {}
+        from concurrent.futures import as_completed
+        for _f in as_completed(_futures):
+            _results[_futures[_f]] = _f.result()
+        hot_bundle, hot_error = _results.get("hot", (None, None))
+        archive_bundle, archive_error = _results.get("archive", (None, None))
+        trained_bundle, trained_error = _results.get("trained", (None, None))
+    except Exception:
+        hot_bundle, hot_error = _safe_load_memory_bundle(hot_db_path, **_hot_kw)
+        archive_bundle, archive_error = _safe_load_memory_bundle(archive_db_path, **_archive_kw)
+        trained_bundle, trained_error = _safe_load_memory_bundle(trained_db_path, **_trained_kw)
     if hot_bundle is None and archive_bundle is None and trained_bundle is None:
         if hot_error is not None:
             raise hot_error
@@ -1365,7 +1412,7 @@ def _touch_bundle_memory_rows(
     path = Path(db_path)
     if not path.exists():
         return
-    with closing(sqlite3.connect(path)) as connection:
+    with closing(_connect(path, write=True)) as connection:
         _touch_retrieved_memory_rows(
             connection,
             semantic_memories=semantic_memories,

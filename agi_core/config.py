@@ -64,7 +64,7 @@ class RuntimeConfig:
     planner_max_actions: int = 80
     planner_explore_probes: int = 3
     planner_parallel: bool = True
-    planner_workers: int = 4
+    planner_workers: int = 0  # 0 = auto: thread pool = min(4, cpu), process pool = min(8, cpu)
     planner_parallel_timeout: float | None = None
 
     @classmethod
@@ -172,7 +172,7 @@ class RuntimeConfig:
             planner_explore_probes=int(env.get("AGI_PLANNER_EXPLORE_PROBES", "3")),
             planner_parallel=env.get("AGI_PLANNER_PARALLEL", "1").strip().lower()
             in {"1", "true", "yes", "on"},
-            planner_workers=int(env.get("AGI_PLANNER_WORKERS", "4")),
+            planner_workers=int(env.get("AGI_PLANNER_WORKERS", "0")),
             planner_parallel_timeout=(
                 float(env.get("AGI_PLANNER_PARALLEL_TIMEOUT", ""))
                 if env.get("AGI_PLANNER_PARALLEL_TIMEOUT", "").strip()

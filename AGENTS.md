@@ -56,6 +56,7 @@ ARC-AGI-3 Kaggle competition starter kit. The agent system uses ORCH-OR (Orchest
   - `llm_enabled: bool = False` (env `AGI_LLM_ENABLE`, default `"0"`) — when False, LLM components are not created
   - `planner_enabled: bool = True` (env `AGI_PLANNER_ENABLE`, default `"1"`)
   - `planner_parallel: bool = True` (env `AGI_PLANNER_PARALLEL`, default `"1"`) — parallel strategy execution
+  - `planner_workers: int = 0` (env `AGI_PLANNER_WORKERS`, default `"0"`) — `0` = auto (`cpu_count`, capped at 32)
   - `source_bias` — `{"reactive": 0.25, "symbolic": 0.15}` (LLM removed)
 - **LLM disabled by default**: ORCH-OR is the primary backend. When ORCH-OR fails to plan, the Executive fallback uses reactive + symbolic specialists + critic only (no LLM).
 - **Re-enable LLM**: set `AGI_LLM_ENABLE=1` (and optionally `AGI_LLM_MAX_CALLS=2`).

@@ -32,6 +32,7 @@ from agi_core.storage.memory_sqlite import (
     _derive_recommended_actions,
     _derive_suppressed_actions,
 )
+from agi_core.orch_or.parallel import ThreadPoolManager
 from agi_core.types import ActionProposal, EpisodeRecord, GoalState, MemoryBundle, Observation
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,8 @@ class HyperonBridge:
         self._memory_store_available = False
         self._memory_write_available = False
         self._unpersisted_records: dict[tuple[Any, ...], EpisodeRecord] = {}
+        self._unpersisted_count: int = 0
+        self._unpersisted_flush_threshold: int = 30
         self._last_observation_step_by_game: dict[str, int] = {}
         self._last_observation_state_by_game: dict[str, str] = {}
         self._current_memory_bundle = MemoryBundle()
@@ -319,6 +322,16 @@ class HyperonBridge:
             "trained_prior_bucket": dict(bundle.get("trained_prior_bucket", {})),
             "proposals": [],
         }
+        # Flush pending records to disk (buffered, only when threshold hit
+        # or game is completing).  The in-memory cache keeps reads fast —
+        # disk writes are for crash safety / persistence.
+        if self._unpersisted_records:
+            state = str(observation.game_state or "")
+            if state in self._reset_state_names or state == self._win_state_name:
+                try:
+                    self._flush_unpersisted_records()
+                except Exception:
+                    pass
         self._refresh_runtime()
 
     def current_memory_bundle(self) -> MemoryBundle:
@@ -346,13 +359,15 @@ class HyperonBridge:
         self._unpersisted_records[record_key] = record
         if not self._ensure_memory_write_available():
             return
-        try:
-            self._flush_unpersisted_records()
-            self._memory_error = None
-        except Exception as exc:
-            self._memory_store_available = True
-            self._memory_write_available = False
-            self._memory_error = repr(exc)
+        self._unpersisted_count += 1
+        if self._unpersisted_count >= self._unpersisted_flush_threshold:
+            try:
+                self._flush_unpersisted_records()
+                self._memory_error = None
+            except Exception as exc:
+                self._memory_store_available = True
+                self._memory_write_available = False
+                self._memory_error = repr(exc)
 
     def _flush_unpersisted_records(self) -> None:
         if self.memory_db_path is None and self.trained_priors_db_path is None:
@@ -367,6 +382,7 @@ class HyperonBridge:
                 except Exception:
                     logger.debug("failed to persist to trained DB", exc_info=True)
             self._unpersisted_records.pop(pending_key, None)
+        self._unpersisted_count = 0
 
     def update_proposals(self, proposals: list[ActionProposal]) -> None:
         self.facts["proposals"] = [
@@ -1694,14 +1710,25 @@ class HyperonBridge:
         legal_actions: list[str],
         memory: Any | None,
     ) -> dict[str, Any]:
-        records = self._fallback_memory_records(memory)
-        trained_prior_bucket = self._load_trained_prior_bucket(
-            observation,
-            subgoal=subgoal,
-        )
-        learned = self._summarize_learned_knowledge(observation.game_id)
+        # Parallel: load memory records + trained priors (independent resources)
+        try:
+            _rec_future = ThreadPoolManager.submit(self._fallback_memory_records, memory)
+            _trained_future = ThreadPoolManager.submit(
+                self._load_trained_prior_bucket, observation,
+                subgoal=subgoal,
+            )
+            records = _rec_future.result()
+            trained_prior_bucket = _trained_future.result()
+        except Exception:
+            records = self._fallback_memory_records(memory)
+            trained_prior_bucket = self._load_trained_prior_bucket(
+                observation,
+                subgoal=subgoal,
+            )
         if memory is not None:
             self._ingest_episode_records(records)
+            learned = self._summarize_learned_knowledge(observation.game_id)
+        else:
             learned = self._summarize_learned_knowledge(observation.game_id)
         frame_signature = str(
             observation.derived_features.get("frame_signature", "") or ""

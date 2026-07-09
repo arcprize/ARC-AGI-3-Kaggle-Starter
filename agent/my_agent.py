@@ -72,8 +72,19 @@ class MyAgent(Agent):
             probe_timeout_seconds=config.hyperon_probe_timeout_seconds,
         )
         llm_backend = build_llm_backend(config) if config.llm_enabled else None
-        if config.planner_enabled and config.planner_parallel:
-            ThreadPoolManager.set_max_workers(config.planner_workers)
+        from agi_core.orch_or.parallel import ProcessPoolManager, ThreadPoolManager, sync_pool_worker_counts
+        sync_pool_worker_counts(config.planner_workers)
+        # Pre-warm the in-memory SQLite cache so all subsequent reads hit RAM.
+        from agi_core.storage.memory_cache import get_cache
+        for _db in (config.memory_db_path, config.archive_memory_db_path, config.trained_priors_db_path):
+            if _db:
+                get_cache(_db)
+        # Pre-warm both pools so worker threads/processes exist before first frame.
+        ThreadPoolManager.executor()
+        try:
+            ProcessPoolManager.executor()
+        except Exception:
+            pass
         base_executive = Executive(
             config=config,
             reactive=ReactiveSpecialist(),

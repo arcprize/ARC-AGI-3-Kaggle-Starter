@@ -12,32 +12,62 @@ def build_game_model(board: list[list[int]]) -> GameModel:
     height = len(board)
     width = len(board[0]) if height > 0 else 0
     bg_color = _detect_background_color(board, width, height)
-    # Parallelize: grid scale detection runs concurrently with component detection
+    # Phase 1: parallel detection — components, grid scale, color frequencies all independent
     try:
         from agi_core.orch_or.parallel import ThreadPoolManager
         pool = ThreadPoolManager.executor()
         comp_future = pool.submit(_find_components, board, width, height, bg_color)
         scale_future = pool.submit(_detect_grid_scale, board, width, height)
+        freq_future = pool.submit(_compute_color_frequencies, board, bg_color)
         raw_components = comp_future.result()
         grid_scale = scale_future.result()
+        color_freq = freq_future.result()
     except Exception:
         raw_components = _find_components(board, width, height, bg_color)
         grid_scale = _detect_grid_scale(board, width, height)
+        color_freq = _compute_color_frequencies(board, bg_color)
+
     components = _merge_nearby_same_color(raw_components)
-    color_freq = _compute_color_frequencies(board, bg_color)
     player_pos = _find_player(components, height, color_freq)
     goal_positions = _find_goals(components, player_pos, board, color_freq)
     obstacles = _find_obstacles(components, player_pos, goal_positions)
-    walkable = _find_walkable(board, width, height, bg_color, obstacles, player_pos, goal_positions, components)
+
+    # Phase 2: walkable + sprites + tile_size are independent — run in parallel
+    try:
+        pool = ThreadPoolManager.executor()
+        walk_future = pool.submit(
+            _find_walkable, board, width, height, bg_color, obstacles,
+            player_pos, goal_positions, components,
+        )
+        if grid_scale > 1:
+            sprite_future = pool.submit(
+                _detect_sprites, board, grid_scale, bg_color,
+                player_pos, goal_positions, components, width, height,
+            )
+            sprites = sprite_future.result()
+        else:
+            sprites = []
+        tile_future = pool.submit(
+            _detect_tile_size, board, width, height, bg_color,
+        )
+        walkable = walk_future.result()
+        tile_size = tile_future.result()
+    except Exception:
+        walkable = _find_walkable(board, width, height, bg_color, obstacles,
+                                  player_pos, goal_positions, components)
+        if grid_scale > 1:
+            sprites = _detect_sprites(board, grid_scale, bg_color,
+                                      player_pos, goal_positions, components, width, height)
+        else:
+            sprites = []
+        tile_size = _detect_tile_size(board, width, height, bg_color)
+
     features = _extract_features(board, width, height, bg_color, components, player_pos, goal_positions, walkable)
-    # Sprite detection: grid scale and entity identification
+    features.tile_size = tile_size
     features.grid_scale = grid_scale
     if grid_scale > 1:
         features.grid_width = width // grid_scale
         features.grid_height = height // grid_scale
-        sprites = _detect_sprites(board, grid_scale, bg_color, player_pos, goal_positions, components, width, height)
-    else:
-        sprites = []
     return GameModel(
         board=board,
         height=height,
@@ -396,28 +426,42 @@ def _detect_beam(
         return (False, -1, [], 0, float('inf'), -1)
 
     # Distinguish real beam cells from mirror-reflection artifacts.
-    # In some games, mirror reflections are rendered as color-4 cells, making them
-    # indistinguishable from real beams. Check: if there's a mirror (color 10) and
-    # ALL color-4 cells are on the opposite side of the mirror from the player,
-    # they are reflection artifacts, not a real beam.
+    # Mirror reflections are rendered as color-4 cells. Check if ALL color-4
+    # cells are reflections by testing mirror axis:
+    #   - Vertical mirror (tall>wide): reflect X → beam cells on opposite X side
+    #   - Horizontal mirror (wide>tall): reflect Y → beam cells on opposite Y side
     if player_pos is not None:
         mirror_comp = next((c for c in components if c.dominant_color == 10), None)
         if mirror_comp is not None and len(beam_cells) > 0:
-            mirror_px = sum(cx for cx, _ in mirror_comp.cells) // len(mirror_comp.cells)
+            mx1, my1, mx2, my2 = mirror_comp.bbox
+            horiz = (mx2 - mx1) > (my2 - my1)
             px, py = player_pos
-            sides = set()
-            for bx, by in beam_cells:
-                if bx < mirror_px:
-                    sides.add("left")
-                elif bx > mirror_px:
-                    sides.add("right")
-            # If all beam cells are on only one side of mirror, and player is on
-            # the opposite side, these are reflection artifacts (no real beam).
-            if len(sides) == 1:
-                beam_side = next(iter(sides))
-                player_side = "left" if px < mirror_px else "right"
-                if beam_side != player_side:
-                    return (False, -1, [], 0, float('inf'), -1)
+            if horiz:
+                mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
+                y_sides = set()
+                for bx, by in beam_cells:
+                    if by < mirror_py:
+                        y_sides.add("above")
+                    elif by > mirror_py:
+                        y_sides.add("below")
+                if len(y_sides) == 1:
+                    beam_side = next(iter(y_sides))
+                    player_side = "above" if py < mirror_py else "below"
+                    if beam_side != player_side:
+                        return (False, -1, [], 0, float('inf'), -1)
+            else:
+                mirror_px = sum(cx for cx, _ in mirror_comp.cells) // len(mirror_comp.cells)
+                x_sides = set()
+                for bx, by in beam_cells:
+                    if bx < mirror_px:
+                        x_sides.add("left")
+                    elif bx > mirror_px:
+                        x_sides.add("right")
+                if len(x_sides) == 1:
+                    beam_side = next(iter(x_sides))
+                    player_side = "left" if px < mirror_px else "right"
+                    if beam_side != player_side:
+                        return (False, -1, [], 0, float('inf'), -1)
 
     beam_cells_set = set(beam_cells)
     goals_lit = sum(1 for gx, gy in goal_positions if (gx, gy) in beam_cells_set)
@@ -635,16 +679,28 @@ def _detect_dynamics(
     if player_pos is not None and goal_positions:
         mirror_comp = next((c for c in components if c.dominant_color == 10), None)
         if mirror_comp is not None:
-            mirror_px = sum(cx for cx, _ in mirror_comp.cells) // len(mirror_comp.cells) if mirror_comp.cells else 0
+            mirr_cells = list(mirror_comp.cells)
+            mirror_px = sum(cx for cx, _ in mirr_cells) // len(mirr_cells) if mirr_cells else 0
+            mirror_py = sum(cy for _, cy in mirr_cells) // len(mirr_cells) if mirr_cells else 0
             px, py = player_pos
-            goal_xs = [gx for gx, _ in goal_positions]
-            min_gx, max_gx = min(goal_xs), max(goal_xs)
-            if (px < mirror_px < min_gx) or (px > mirror_px > max_gx):
-                detected.append("puzzle")
-            # Also detect as puzzle when player IS at the mirror (player entity
-            # IS the mirror on some levels like AR25 L2 where yvifanjrcyu = mirror).
-            elif abs(px - mirror_px) <= 6 and goal_xs:
-                detected.append("puzzle")
+            # Detect axis: horizontal mirror (wide > tall) vs vertical (tall > wide)
+            mx1, my1, mx2, my2 = mirror_comp.bbox
+            horiz = (mx2 - mx1) > (my2 - my1)
+            if horiz:
+                # For horizontal mirrors, detect puzzle if goals exist and
+                # the player is on the board (not off-screen). The mirror
+                # reflects vertically; the shape piece can be on either side.
+                goal_ys = [gy for _, gy in goal_positions]
+                if goal_ys and player_pos is not None:
+                    detected.append("puzzle")
+            else:
+                goal_xs = [gx for gx, _ in goal_positions]
+                if not goal_xs:
+                    pass
+                elif (px < mirror_px < min(goal_xs)) or (px > mirror_px > max(goal_xs)):
+                    detected.append("puzzle")
+                elif abs(px - mirror_px) <= 6 and goal_xs:
+                    detected.append("puzzle")
 
     # Push/Pull: manipulable components adjacent to player
     if player_pos is not None:

@@ -54,6 +54,33 @@ class ObjectiveReduction:
         self._goal_history: list[list[tuple[int, int]]] = []
         self._solver_selector = None
 
+    def _background_precompute(self, game_model: GameModel) -> None:
+        """Pre-compute A* paths for next frame via background thread + process pool.
+        astar() finds them transparently via search.path_cache."""
+        from agi_core.orch_or.parallel import ThreadPoolManager
+        snap = (
+            game_model.player_pos,
+            list(game_model.goal_positions or []),
+            game_model.walkable,
+            game_model.width,
+            game_model.height,
+        )
+        ThreadPoolManager.submit(self._do_background_precompute, snap)
+
+    def _do_background_precompute(self, snap: tuple) -> None:
+        """Runs in a thread: submits A* to process pool for each goal."""
+        from agi_core.orch_or.parallel import ProcessPoolManager
+        from agi_core.orch_or.search import path_cache, _astar_impl
+        player, goals, walkable, width, height = snap
+        if player is None or not goals or not walkable:
+            return
+        for g in goals:
+            key = (player, g)
+            f = ProcessPoolManager.submit(
+                _astar_impl, player, g, set(walkable), width, height,
+            )
+            path_cache[key] = f
+
     def decide(self, context: ExecutiveContext) -> ActionDecision:
         context.hyperon.sync(context.observation, context.memory, context.goals)
         context.memory_bundle = context.hyperon.current_memory_bundle()
@@ -72,12 +99,39 @@ class ObjectiveReduction:
                 ep["dynamics"] = list(game_model.features.dynamics)
         except Exception:
             pass
+        # Level-change detection (must run before solver call).
+        last_action = context.memory.most_recent_action()
+        if last_action in ("RESET", None):
+            self._failed_directions.clear()
+        if self._previous_model is not None and self._previous_model.player_pos is not None and game_model.player_pos is not None:
+            prev_p = self._previous_model.player_pos
+            curr_p = game_model.player_pos
+            player_jumped = abs(curr_p[0] - prev_p[0]) + abs(curr_p[1] - prev_p[1]) > _LEVEL_JUMP_THRESHOLD
+            if player_jumped:
+                self._non_beam_controllers.clear()
+                self._switch_count = 0
+                self._failed_directions.clear()
+                self._stable_goal = None
+                try:
+                    if self._solver_selector is not None and self._solver_selector.active_solver is not None:
+                        self._solver_selector.active_solver.reset_level()
+                except Exception:
+                    pass
+        elif self._previous_model is None:
+            self._non_beam_controllers.clear()
+            self._switch_count = 0
+            self._failed_directions.clear()
+            self._stable_goal = None
+
         # Try the hyperon memory-based solver system first (handles all 12 dynamics)
         solver_decision, sctx = self._try_solver_system(context, game_model)
         if solver_decision is not None:
             if sctx and sctx.get("switch_attempted", 0) > self._switch_count:
                 self._switch_count = sctx["switch_attempted"]
             logger.debug("solver system primary decision: %s", solver_decision.action_name)
+            context.memory.note_decision(solver_decision)
+            self._previous_model = game_model
+            self._background_precompute(game_model)
             return solver_decision
 
         logger.debug(
@@ -89,33 +143,6 @@ class ObjectiveReduction:
             game_model.features.board_type,
         )
 
-        # Clear per-level state when a new level starts (player jumps far)
-        last_action = context.memory.most_recent_action()
-        if last_action in ("RESET", None):
-            self._failed_directions.clear()
-        if self._previous_model is not None and self._previous_model.player_pos is not None and game_model.player_pos is not None:
-            prev_p = self._previous_model.player_pos
-            curr_p = game_model.player_pos
-            player_jumped = abs(curr_p[0] - prev_p[0]) + abs(curr_p[1] - prev_p[1]) > _LEVEL_JUMP_THRESHOLD
-            # Don't clear switch state on entity switches (ACTION5 jumps between entities)
-            if player_jumped and last_action != "ACTION5":
-                self._non_beam_controllers.clear()
-                self._switch_count = 0
-                self._failed_directions.clear()
-                self._stable_goal = None
-                # Reset puzzle system per-level state so stale state from
-                # the previous level doesn't carry over (e.g. _impassable_cells,
-                # _beam_puzzle_completed, _last_pos, etc.).
-                try:
-                    if self._solver_selector is not None and self._solver_selector.active_solver is not None:
-                        self._solver_selector.active_solver.reset_level()
-                except Exception:
-                    pass
-        elif self._previous_model is None:
-            self._non_beam_controllers.clear()
-            self._switch_count = 0
-            self._failed_directions.clear()
-            self._stable_goal = None
         if game_model.features.goal_detectable and game_model.goal_positions and game_model.player_pos is not None:
             px, py = game_model.player_pos
             nearest = min(game_model.goal_positions, key=lambda g: abs(g[0] - px) + abs(g[1] - py))
@@ -139,7 +166,8 @@ class ObjectiveReduction:
         # --- Hyperon integration: query rules for decision support ---
         hyperon_priors: dict[str, float] = {}
         subgoal_from_hints: str | None = None
-        # Query game-agnostic board-level rules.
+        # Query game-agnostic board-level rules sequentially (sub-ms each;
+        # thread overhead exceeds benefit for microsecond-fast shadow rules).
         board_explore_bias: list[dict[str, Any]] = []
         board_interact_range: list[dict[str, Any]] = []
         board_move_bias: list[dict[str, Any]] = []
@@ -290,6 +318,8 @@ class ObjectiveReduction:
                     game_model.features.goals_lit_by_beam > 0 and
                     game_model.features.player_color not in self._non_beam_controllers):
                 logger.debug("beam aligned, skipping fallback")
+                self._previous_model = game_model
+                self._background_precompute(game_model)
                 return ActionDecision(
                     action_name=context.config.deterministic_fallback_action,
                     source="orch_or:beam_aligned",
@@ -349,12 +379,11 @@ class ObjectiveReduction:
         )
         context.memory.note_decision(decision)
         self._persist_plan(context)
-        # Feed the proposals back to hyperon so the MeTTa runtime can learn
-        # about the actions ORCH-OR considered.
         try:
             context.hyperon.update_proposals(decision.proposals)
         except Exception:
             pass
+        self._background_precompute(game_model)
         return decision
 
     def _check_previous_action(
@@ -593,7 +622,7 @@ class ObjectiveReduction:
                     decision = solver.decide(ctx)
                     if decision is not None:
                         self._solver_selector.record_outcome(context, game_model, decision, pctx)
-                        logger.debug("solver %s decision: %s", solver.dynamics, decision.action_name)
+                        logger.info("solver %s decision: %s", solver.dynamics, decision.action_name)
                         return (decision, pctx)
         except Exception:
             logger.debug("solver system failed", exc_info=True)
