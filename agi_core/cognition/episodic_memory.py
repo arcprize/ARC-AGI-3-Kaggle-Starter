@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -61,6 +64,14 @@ class ConsolidatedMemory:
         self._consolidation_counter: int = 0
         self._last_forgetting_time: float = time.monotonic()
 
+    def last_episode(self) -> EpisodeSummary | None:
+        """Return the most recent episode, or None."""
+        return self._episodes[-1] if self._episodes else None
+
+    @property
+    def episode_count(self) -> int:
+        return len(self._episodes)
+
     # ── recording ─────────────────────────────────────────────────────
 
     def record(
@@ -109,17 +120,21 @@ class ConsolidatedMemory:
         if len(self._episodes) < 2:
             return 0
         created = 0
-        # Simple clustering: group by dynamics + outcome
-        clusters: dict[tuple[str, str], list[EpisodeSummary]] = defaultdict(list)
+        # Simple clustering: group by board_hash + dynamics + outcome
+        # (prevents mixing episodes from different boards/games)
+        clusters: dict[tuple[int, str, str], list[EpisodeSummary]] = defaultdict(list)
         for ep in self._episodes:
-            clusters[(ep.dynamics.lower(), ep.outcome)].append(ep)
-        for (dynamics, outcome), eps in clusters.items():
+            clusters[(ep.board_hash, ep.dynamics.lower(), ep.outcome)].append(ep)
+        for (board_hash, dynamics, outcome), eps in clusters.items():
             if len(eps) < 2:
                 continue
             # Build a compressed schema
             common_prefix = self._longest_common_prefix(
                 [e.action_sequence for e in eps]
             )
+            # Skip clusters where episodes share no common prefix
+            if not common_prefix:
+                continue
             schema = {
                 "dynamics": dynamics,
                 "outcome": outcome,
@@ -128,7 +143,7 @@ class ConsolidatedMemory:
                     sum(len(e.action_sequence) for e in eps) / len(eps), 1
                 ),
             }
-            trace_id = f"trace_{dynamics}_{outcome}_{len(self._traces)}"
+            trace_id = f"trace_{board_hash}_{dynamics}_{outcome}"
             exists = self._traces.get(trace_id)
             if exists is not None:
                 # Re-consolidation: merge new episode IDs and update schema
@@ -157,7 +172,8 @@ class ConsolidatedMemory:
 
     def apply_forgetting(self) -> None:
         """Decay all trace strengths by the power law since last access.
-        Prunes traces below a minimum strength threshold."""
+        Prunes traces below a minimum strength threshold.
+        At least one trace is always kept (to avoid total wipeout)."""
         now = time.monotonic()
         dead = []
         for trace in self._traces.values():
@@ -166,6 +182,12 @@ class ConsolidatedMemory:
             trace.strength = min(1.0, trace.strength + 0.05 * math.log1p(trace.access_count))
             if trace.strength < 0.02:
                 dead.append(trace.trace_id)
+        # Keep at least one trace — reconsolidate the strongest dying trace
+        survivors = len(self._traces) - len(dead)
+        if survivors == 0 and dead:
+            strongest = max(dead, key=lambda tid: self._traces[tid].strength)
+            self._traces[strongest].strength = 0.5  # reconsolidate to half strength
+            dead.remove(strongest)
         for tid in dead:
             self._traces.pop(tid, None)
 

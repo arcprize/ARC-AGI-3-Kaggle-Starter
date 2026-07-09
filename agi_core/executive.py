@@ -13,6 +13,9 @@ from agi_core.memory import EpisodicMemory
 from agi_core.types import ActionDecision, ExecutiveContext, GoalState, MemoryBundle
 from agi_core.orch_or.parallel import ThreadPoolManager
 from concurrent.futures import TimeoutError
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Executive:
@@ -61,14 +64,19 @@ class Executive:
         context.working_memory = self.working_memory
         context.chunk_library = self.chunk_library
         context.attention = self.attention
+        context.episodic_memory = self.episodic_memory
         if wm is not None:
             wm.tick()
         if mc is not None:
             stagnation_steps = int(getattr(context.memory, '_stagnation_steps', 0))
             recent_raw = wm.recent_actions(5) if wm is not None else []
             outcomes = []
+            consec = getattr(mc, '_consecutive_failures', 0)
             for a in recent_raw:
-                outcomes.append("progress" if a not in ("RESET", "ACTION6") else "stalled")
+                if consec > 0:
+                    outcomes.append("failed")
+                else:
+                    outcomes.append("progress" if a not in ("RESET", "ACTION6") else "stalled")
             wm_load = wm.load if wm is not None else 0.0
             plan = getattr(context.memory, '_active_plan', None) or getattr(context, '_active_plan', None)
             has_plan = plan is not None
@@ -102,6 +110,7 @@ class Executive:
                 used_fallback=True,
             )
             context.memory.note_decision(decision)
+            self._finalize_cognition(context, decision)
             return decision
         context.probe_dead_end_replan = (
             self._should_force_probe_dead_end_llm_replan(context)
@@ -175,11 +184,13 @@ class Executive:
             fallback = self._score_floor_fallback(context, rescored)
             fallback.proposals = rescored
             context.memory.note_decision(fallback)
+            self._finalize_cognition(context, fallback)
             return fallback
         probe_dead_end_escape = self._probe_dead_end_escape(context, rescored)
         if probe_dead_end_escape is not None:
             probe_dead_end_escape.proposals = rescored
             context.memory.note_decision(probe_dead_end_escape)
+            self._finalize_cognition(context, probe_dead_end_escape)
             return probe_dead_end_escape
         probe_dead_end_followup_escape = self._probe_dead_end_followup_escape(
             context,
@@ -188,6 +199,7 @@ class Executive:
         if probe_dead_end_followup_escape is not None:
             probe_dead_end_followup_escape.proposals = rescored
             context.memory.note_decision(probe_dead_end_followup_escape)
+            self._finalize_cognition(context, probe_dead_end_followup_escape)
             return probe_dead_end_followup_escape
         for proposal in rescored:
             if proposal.legal:
@@ -311,10 +323,11 @@ class Executive:
             attrs = []
             if wm is not None: attrs.append(f'wm_load={wm.load:.2f}')
             if mc is not None: attrs.append(f'consec={mc._consecutive_failures}')
+            strat = getattr(context, 'cognition_strategy', '')
+            if strat: attrs.append(f'strat={strat}')
             if gs is not None: attrs.append(f'gs_depth={gs.depth}')
             if cl is not None: attrs.append(f'chunks={cl.count}')
             if em is not None: attrs.append(f'traces={len(em._traces)}')
-            logger = __import__('logging').getLogger(__name__)
             logger.debug('Cognition: %s', ' | '.join(a for a in attrs if a))
         self._cog_log_counter = getattr(self, '_cog_log_counter', 0) + 1
 

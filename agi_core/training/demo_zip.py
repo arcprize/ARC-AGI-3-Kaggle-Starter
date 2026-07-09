@@ -1,7 +1,19 @@
+"""Offline training pipeline for ARC-AGI-3.
+
+Processes human-demo recording ZIP archives into SQLite training artifacts:
+action-count priors (4 scopes), episodic memory records, abstract memories,
+and board-policy parameters.  Designed for ``scripts/train_offline_from_zip.py``.
+
+Key functions:
+    ``build_action_prior_artifact()`` — main entry point.
+    ``iter_recordings()`` / ``iter_steps()`` — low-level ZIP traversal.
+    ``normalize_action_name()`` / ``normalize_action_id()`` — action ID normalization.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import zipfile
@@ -13,25 +25,35 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
+logger = logging.getLogger(__name__)
+
 from agi_core.config import RuntimeConfig
 from agi_core.image_input import (
     BoardImageInput,
     board_image_input_from_source,
-    compute_board_signature,
     default_click_target,
     extract_board_motif_tags,
     extract_board_image_input,
-    normalize_visible_board,
 )
 from agi_core.storage import (
     initialize_memory_schema,
     record_transitions,
     upsert_abstract_memory_rows,
     upsert_board_policy_params,
+    upsert_chunk,
+    upsert_cognition_traces,
     upsert_metadata,
     upsert_training_counts,
 )
 from agi_core.types import EpisodeRecord
+from agi_core.cognition import (
+    AttentionFocus,
+    ChunkLibrary,
+    ConsolidatedMemory,
+    GoalStack,
+    MetaCognition,
+    WorkingMemory,
+)
 
 @dataclass(slots=True)
 class RecordingMeta:
@@ -158,9 +180,11 @@ def iter_steps(zip_path: str | Path, recording_name: str) -> Iterator[TrainingSt
                 action_input = data.get("action_input", {})
                 if not isinstance(action_input, dict):
                     continue
-                action_id = normalize_action_id(action_input.get("id"))
                 action_name = normalize_action_name(action_input.get("id"))
-                if action_id is None or action_name is None:
+                if action_name is None:
+                    continue
+                action_id = normalize_action_id(action_name)
+                if action_id is None:
                     continue
                 available_actions = [
                     action_name
@@ -249,14 +273,39 @@ def build_action_prior_artifact(
                 "schema_version": "2",
                 "source_zip": str(archive_path),
                 "build_timestamp": datetime.now(timezone.utc).isoformat(),
-                "recordings_seen": str(artifact["recordings_seen"]),
-                "steps_seen": str(artifact["steps_seen"]),
-                "steps_used": str(artifact["steps_used"]),
-                "offline_memory_records": str(len(memory_records)),
-                "abstract_memory_rows": str(len(abstract_rows)),
+                "recordings_seen": artifact["recordings_seen"],
+                "steps_seen": artifact["steps_seen"],
+                "steps_used": artifact["steps_used"],
+                "offline_memory_records": len(memory_records),
+                "abstract_memory_rows": len(abstract_rows),
             },
         )
     artifact["abstract_memory_rows"] = len(abstract_rows)
+
+    # ── Post-hoc cognition pass (sequential) ──────────────────────
+    if output_path is not None:
+        traces, chunks_by_name = _post_hoc_cognition_pass(
+            archive_path, selected_recordings,
+        )
+        if traces:
+            upsert_cognition_traces(destination, traces)
+        if chunks_by_name:
+            for name, data in chunks_by_name.items():
+                upsert_chunk(destination, name, data)
+        artifact["cognition_traces_count"] = len(traces)
+        artifact["chunk_count"] = len(chunks_by_name)
+        if traces or chunks_by_name:
+            existing_meta = {}
+            with closing(sqlite3.connect(Path(destination))) as conn:
+                try:
+                    rows = conn.execute("SELECT key, value FROM metadata").fetchall()
+                    existing_meta = {str(r[0]): str(r[1]) for r in rows}
+                except Exception:
+                    pass
+            existing_meta["cognition_traces_count"] = str(len(traces))
+            existing_meta["chunk_count"] = str(len(chunks_by_name))
+            upsert_metadata(destination, existing_meta)
+
     return artifact
 
 
@@ -274,36 +323,29 @@ def _assert_safe_output_database(output_path: str | Path) -> None:
 
 
 def _reset_output_database(db_path: str | Path) -> None:
+    """Drop all data rows (preserves schema) via per-table DELETE."""
+    _TABLES_TO_CLEAR = [
+        "game_action_priors", "state_action_priors", "frame_action_priors", "subgoal_action_priors",
+        "live_episode_records", "live_action_stats", "live_state_action_stats",
+        "live_frame_action_stats", "live_subgoal_action_stats", "live_basin_stats",
+        "live_episode_summaries", "live_pattern_stats", "live_sequence_stats",
+        "live_board_cluster_stats", "live_semantic_memory", "live_procedural_memory",
+        "abstract_memories", "cognition_traces", "chunks", "metadata",
+    ]
     with closing(sqlite3.connect(Path(db_path))) as connection:
-        connection.execute("DELETE FROM game_action_priors")
-        connection.execute("DELETE FROM state_action_priors")
-        connection.execute("DELETE FROM frame_action_priors")
-        connection.execute("DELETE FROM subgoal_action_priors")
-        connection.execute("DELETE FROM live_episode_records")
-        connection.execute("DELETE FROM live_action_stats")
-        connection.execute("DELETE FROM live_state_action_stats")
-        connection.execute("DELETE FROM live_frame_action_stats")
-        connection.execute("DELETE FROM live_subgoal_action_stats")
-        connection.execute("DELETE FROM live_basin_stats")
-        connection.execute("DELETE FROM live_episode_summaries")
-        connection.execute("DELETE FROM live_pattern_stats")
-        connection.execute("DELETE FROM live_sequence_stats")
-        connection.execute("DELETE FROM live_board_cluster_stats")
-        connection.execute("DELETE FROM live_semantic_memory")
-        connection.execute("DELETE FROM live_procedural_memory")
-        connection.execute("DELETE FROM abstract_memories")
-        connection.execute("DELETE FROM metadata")
+        for table in _TABLES_TO_CLEAR:
+            connection.execute(f"DELETE FROM {table}")
         connection.commit()
 
 
 def _increment_count(bucket: dict[str, int], action_name: str) -> None:
-    bucket[action_name] = int(bucket.get(action_name, 0) or 0) + 1
+    bucket[action_name] = _safe_int(bucket.get(action_name)) + 1
 
 
 def _increment_count_by(bucket: dict[str, int], action_name: str, amount: int) -> None:
     if amount <= 0:
         return
-    bucket[action_name] = int(bucket.get(action_name, 0) or 0) + amount
+    bucket[action_name] = _safe_int(bucket.get(action_name)) + amount
 
 
 def _new_game_entry() -> dict[str, Any]:
@@ -324,15 +366,46 @@ def _select_recordings(
     wanted_games: set[str],
     limit_recordings: int | None,
 ) -> list[RecordingMeta]:
-    selected: list[RecordingMeta] = []
+    """Select recordings, distributing ``limit_recordings`` evenly across games."""
+    all_recordings: dict[str, list[RecordingMeta]] = {}
     for recording in iter_recordings(zip_path):
         short_game_id = recording.game_id.split("-")[0]
         if wanted_games and short_game_id not in wanted_games:
             continue
-        if limit_recordings is not None and len(selected) >= limit_recordings:
+        all_recordings.setdefault(short_game_id, []).append(recording)
+    if limit_recordings is None or not all_recordings:
+        return [rec for recs in all_recordings.values() for rec in recs]
+    per_game = max(1, limit_recordings // len(all_recordings))
+    selected: list[RecordingMeta] = []
+    for game_id in sorted(all_recordings):
+        selected.extend(all_recordings[game_id][:per_game])
+        if len(selected) >= limit_recordings:
             break
-        selected.append(recording)
-    return selected
+    return selected[:limit_recordings]
+
+
+def _apply_step_counts(
+    game_entry: dict[str, Any],
+    action_name: str,
+    weight: int,
+    step: TrainingStep,
+    decision_subgoal: str | None,
+    seen: dict[str, set],
+) -> None:
+    """Record weighted action counts at game, state, subgoal, and frame levels."""
+    _increment_count_by(game_entry["actions"], action_name, weight)
+    _increment_support_once(game_entry["action_supports"], seen["game"], action_name)
+    state_entry = game_entry["states"].setdefault(step.state, {"actions": {}, "action_supports": {}})
+    _increment_count_by(state_entry["actions"], action_name, weight)
+    _increment_support_once(state_entry["action_supports"], seen["state"], (step.state, action_name))
+    if decision_subgoal:
+        sg_entry = game_entry["subgoals"].setdefault(decision_subgoal, {"actions": {}, "action_supports": {}})
+        _increment_count_by(sg_entry["actions"], action_name, weight)
+        _increment_support_once(sg_entry["action_supports"], seen["subgoal"], (decision_subgoal, action_name))
+    if step.frame_signature:
+        fs_entry = game_entry["frame_signatures"].setdefault(step.frame_signature, {"actions": {}, "action_supports": {}})
+        _increment_count_by(fs_entry["actions"], action_name, weight)
+        _increment_support_once(fs_entry["action_supports"], seen["frame"], (step.frame_signature, action_name))
 
 
 def _process_recording(
@@ -354,10 +427,7 @@ def _process_recording(
     recording_bonus = _recording_quality_bonus(steps)
     recording_penalty = _recording_drag_penalty(steps)
     seen_context_actions: dict[tuple[str, str | None, str], int] = {}
-    seen_game_actions: set[str] = set()
-    seen_state_actions: set[tuple[str, str]] = set()
-    seen_subgoal_actions: set[tuple[str, str]] = set()
-    seen_frame_actions: set[tuple[str, str]] = set()
+    seen: dict[str, set] = {"game": set(), "state": set(), "subgoal": set(), "frame": set()}
     for index, step in enumerate(steps):
         previous_step = steps[index - 1] if index > 0 else None
         next_step = steps[index + 1] if index + 1 < len(steps) else None
@@ -376,9 +446,7 @@ def _process_recording(
             action_name=action_name,
         )
         weight = _training_weight(
-            step,
-            previous_step,
-            next_step,
+            step, previous_step, next_step,
             future_steps=future_steps,
             repetition_count=repetition_count,
             recording_bonus=recording_bonus,
@@ -388,65 +456,24 @@ def _process_recording(
         if weight <= 0:
             continue
         decision_subgoal = _infer_training_subgoal(
-            step=step,
-            next_step=next_step,
-            future_steps=future_steps,
+            step=step, next_step=next_step, future_steps=future_steps,
             outcome=_infer_step_outcome(step, next_step),
             stall_streak=stall_streak,
         )
         payload["steps_used"] += 1
         game_entry["steps_used"] += 1
         payload["memory_records"].append(
-            _build_memory_record(
-                step=step,
-                next_step=next_step,
-                future_steps=future_steps,
-                stall_streak=stall_streak,
-                decision_subgoal=decision_subgoal,
-            )
+            _build_memory_record(step=step, next_step=next_step, future_steps=future_steps,
+                                 stall_streak=stall_streak, decision_subgoal=decision_subgoal)
         )
         abstract_row = _build_abstract_memory_row(
-            short_game_id=short_game_id,
-            steps=steps,
-            index=index,
-            step=step,
-            next_step=next_step,
-            future_steps=future_steps,
+            short_game_id=short_game_id, steps=steps, index=index,
+            step=step, next_step=next_step, future_steps=future_steps,
             decision_subgoal=decision_subgoal,
         )
         if abstract_row is not None:
             payload["abstract_rows"].append(abstract_row)
-        _increment_count_by(game_entry["actions"], action_name, weight)
-        _increment_support_once(game_entry["action_supports"], seen_game_actions, action_name)
-        state_entry = game_entry["states"].setdefault(step.state, {"actions": {}})
-        state_entry.setdefault("action_supports", {})
-        _increment_count_by(state_entry["actions"], action_name, weight)
-        _increment_support_once(
-            state_entry["action_supports"],
-            seen_state_actions,
-            (step.state, action_name),
-        )
-        if decision_subgoal:
-            subgoal_entry = game_entry["subgoals"].setdefault(decision_subgoal, {"actions": {}})
-            subgoal_entry.setdefault("action_supports", {})
-            _increment_count_by(subgoal_entry["actions"], action_name, weight)
-            _increment_support_once(
-                subgoal_entry["action_supports"],
-                seen_subgoal_actions,
-                (decision_subgoal, action_name),
-            )
-        if step.frame_signature:
-            frame_entry = game_entry["frame_signatures"].setdefault(
-                step.frame_signature,
-                {"actions": {}},
-            )
-            frame_entry.setdefault("action_supports", {})
-            _increment_count_by(frame_entry["actions"], action_name, weight)
-            _increment_support_once(
-                frame_entry["action_supports"],
-                seen_frame_actions,
-                (step.frame_signature, action_name),
-            )
+        _apply_step_counts(game_entry, action_name, weight, step, decision_subgoal, seen)
     return payload
 
 
@@ -476,6 +503,32 @@ def default_worker_count() -> int:
     return max(1, (os.cpu_count() or 1) - 1)
 
 
+def _compute_training_bonuses(
+    step: TrainingStep,
+    previous_step: TrainingStep | None,
+    next_step: TrainingStep | None,
+    future_steps: list[TrainingStep],
+    stall_streak: int,
+    outcome: str,
+    future_progress_delta: int,
+) -> dict[str, Any]:
+    """Compute all per-step bonuses and penalties for training weight calculation."""
+    future_failure_distance = _lookahead_failure_distance(step, future_steps)
+    return {
+        "branching_bonus": _branching_difficulty_bonus(step),
+        "fragility_penalty": _fragile_progress_penalty(future_failure_distance),
+        "endgame_bonus": _endgame_conversion_bonus(step, next_step, future_steps),
+        "momentum_bonus": _progress_momentum_bonus(step, next_step, future_steps),
+        "stability_bonus": _progress_stability_bonus(step, next_step, future_steps),
+        "regression_penalty": _progress_regression_penalty(step, next_step, future_steps),
+        "pre_win_setup_bonus": _pre_win_setup_bonus(next_step, future_steps),
+        "win_bonus": _terminal_win_bonus(next_step, future_steps),
+        "break_stall_bonus": _break_stall_bonus(stall_streak, outcome, future_progress_delta),
+        "recovery_bonus": _post_reset_recovery_bonus(previous_step, outcome, future_progress_delta),
+        "future_failure_distance": future_failure_distance,
+    }
+
+
 def _training_weight(
     step: TrainingStep,
     previous_step: TrainingStep | None,
@@ -490,17 +543,7 @@ def _training_weight(
     future_steps = future_steps or []
     outcome = _infer_step_outcome(step, next_step)
     future_progress_delta, progress_distance = _lookahead_progress(step, future_steps)
-    future_failure_distance = _lookahead_failure_distance(step, future_steps)
-    branching_bonus = _branching_difficulty_bonus(step)
-    fragility_penalty = _fragile_progress_penalty(future_failure_distance)
-    endgame_bonus = _endgame_conversion_bonus(step, next_step, future_steps)
-    momentum_bonus = _progress_momentum_bonus(step, next_step, future_steps)
-    stability_bonus = _progress_stability_bonus(step, next_step, future_steps)
-    regression_penalty = _progress_regression_penalty(step, next_step, future_steps)
-    pre_win_setup_bonus = _pre_win_setup_bonus(next_step, future_steps)
-    win_bonus = _terminal_win_bonus(next_step, future_steps)
-    break_stall_bonus = _break_stall_bonus(stall_streak, outcome, future_progress_delta)
-    recovery_bonus = _post_reset_recovery_bonus(previous_step, outcome, future_progress_delta)
+    b = _compute_training_bonuses(step, previous_step, next_step, future_steps, stall_streak, outcome, future_progress_delta)
     if step.action_name == "RESET":
         if not _is_meaningful_reset(step):
             return 0
@@ -514,36 +557,23 @@ def _training_weight(
         return max(
             1,
             (base_weight - repetition_count)
-            + recording_bonus
-            - recording_penalty
-            + branching_bonus
-            + endgame_bonus
-            + momentum_bonus
-            + stability_bonus
-            + win_bonus
-            + break_stall_bonus
-            + recovery_bonus
-            - fragility_penalty
-            - regression_penalty,
+            + recording_bonus - recording_penalty
+            + b["branching_bonus"] + b["endgame_bonus"] + b["momentum_bonus"]
+            + b["stability_bonus"] + b["win_bonus"] + b["break_stall_bonus"]
+            + b["recovery_bonus"] - b["fragility_penalty"] - b["regression_penalty"],
         )
     if future_progress_delta > 0 and (
-        future_failure_distance is None or progress_distance <= future_failure_distance
+        b["future_failure_distance"] is None or progress_distance <= b["future_failure_distance"]
     ):
         base_weight = 2 + min(2, future_progress_delta)
         distance_penalty = max(0, progress_distance - 1)
         return max(
             1,
             (base_weight - repetition_count - distance_penalty)
-            + recording_bonus
-            - recording_penalty
-            + branching_bonus
-            + endgame_bonus
-            + momentum_bonus
-            + pre_win_setup_bonus
-            + win_bonus
-            + break_stall_bonus
-            + recovery_bonus
-            - fragility_penalty,
+            + recording_bonus - recording_penalty
+            + b["branching_bonus"] + b["endgame_bonus"] + b["momentum_bonus"]
+            + b["pre_win_setup_bonus"] + b["win_bonus"] + b["break_stall_bonus"]
+            + b["recovery_bonus"] - b["fragility_penalty"],
         )
     if _is_noop_transition(step, next_step):
         return 0
@@ -557,8 +587,8 @@ def _recording_quality_bonus(steps: list[TrainingStep]) -> int:
         return 0
     if any(_is_win_state(step.state) for step in steps):
         return 2
-    best_levels_completed = max(int(step.levels_completed or 0) for step in steps)
-    max_win_levels = max(int(step.win_levels or 0) for step in steps)
+    best_levels_completed = max(_safe_int(step.levels_completed) for step in steps)
+    max_win_levels = max(_safe_int(step.win_levels) for step in steps)
     if best_levels_completed <= 0 or max_win_levels <= 0:
         return 0
     progress_ratio = best_levels_completed / max_win_levels
@@ -572,7 +602,7 @@ def _recording_quality_bonus(steps: list[TrainingStep]) -> int:
 def _recording_drag_penalty(steps: list[TrainingStep]) -> int:
     if len(steps) < 6:
         return 0
-    best_levels_completed = max(int(step.levels_completed or 0) for step in steps) if steps else 0
+    best_levels_completed = max(_safe_int(step.levels_completed) for step in steps) if steps else 0
     if any(_is_win_state(step.state) for step in steps):
         return 0
     if best_levels_completed <= 0:
@@ -599,6 +629,11 @@ def _fragile_progress_penalty(future_failure_distance: int | None) -> int:
     return 0
 
 
+def _candidate_steps(next_step: TrainingStep | None, future_steps: list[TrainingStep]) -> list[TrainingStep]:
+    """Build list of non-None candidates from next_step + future_steps."""
+    return [c for c in ([next_step] + future_steps) if c is not None]
+
+
 def _endgame_conversion_bonus(
     step: TrainingStep,
     next_step: TrainingStep | None,
@@ -606,12 +641,12 @@ def _endgame_conversion_bonus(
 ) -> int:
     if step.win_levels <= 0:
         return 0
-    candidate_steps = [candidate for candidate in [next_step, *future_steps] if candidate is not None]
+    candidate_steps = _candidate_steps(next_step, future_steps)
     if any(_is_win_state(candidate.state) for candidate in candidate_steps):
         return 2
     best_future_levels = max(
-        [int(step.levels_completed or 0)]
-        + [int(candidate.levels_completed or 0) for candidate in candidate_steps]
+        [_safe_int(step.levels_completed)]
+        + [_safe_int(c.levels_completed) for c in candidate_steps]
     )
     if best_future_levels >= max(1, step.win_levels - 1):
         return 1
@@ -623,11 +658,11 @@ def _progress_momentum_bonus(
     next_step: TrainingStep | None,
     future_steps: list[TrainingStep],
 ) -> int:
-    candidate_steps = [candidate for candidate in [next_step, *future_steps] if candidate is not None]
+    candidate_steps = _candidate_steps(next_step, future_steps)
     progress_hits = 0
-    best_seen = int(step.levels_completed or 0)
+    best_seen = _safe_int(step.levels_completed)
     for candidate in candidate_steps:
-        levels_completed = int(candidate.levels_completed or 0)
+        levels_completed = _safe_int(candidate.levels_completed)
         if _is_win_state(candidate.state) or levels_completed > best_seen:
             progress_hits += 1
             best_seen = max(best_seen, levels_completed)
@@ -643,12 +678,12 @@ def _progress_stability_bonus(
 ) -> int:
     if next_step is None or _step_progress_delta(step, next_step) <= 0:
         return 0
-    sustained_level = int(next_step.levels_completed or 0)
+    sustained_level = _safe_int(next_step.levels_completed)
     stable_follow_ups = 0
     for candidate in future_steps:
-        if _is_reset_state(candidate.state) or candidate.full_reset:
+        if _is_terminal_step(candidate):
             break
-        if int(candidate.levels_completed or 0) < sustained_level:
+        if _safe_int(candidate.levels_completed) < sustained_level:
             break
         stable_follow_ups += 1
     if stable_follow_ups >= 2:
@@ -663,13 +698,11 @@ def _progress_regression_penalty(
 ) -> int:
     if next_step is None or _step_progress_delta(step, next_step) <= 0:
         return 0
-    gained_level = int(next_step.levels_completed or 0)
+    gained_level = _safe_int(next_step.levels_completed)
     for distance, candidate in enumerate(future_steps, start=1):
-        if _is_win_state(candidate.state):
+        if _is_terminal_step(candidate):
             return 0
-        if _is_reset_state(candidate.state) or candidate.full_reset:
-            return 0
-        if int(candidate.levels_completed or 0) < gained_level:
+        if _safe_int(candidate.levels_completed) < gained_level:
             if distance <= 2:
                 return 2
             return 1
@@ -694,7 +727,7 @@ def _terminal_win_bonus(
     next_step: TrainingStep | None,
     future_steps: list[TrainingStep],
 ) -> int:
-    candidate_steps = [candidate for candidate in [next_step, *future_steps] if candidate is not None]
+    candidate_steps = _candidate_steps(next_step, future_steps)
     if any(_is_win_state(candidate.state) for candidate in candidate_steps):
         return 1
     return 0
@@ -725,9 +758,9 @@ def _preceding_stall_streak(
     cursor = index - 1
     while cursor >= 0:
         previous = steps[cursor]
-        if _is_win_state(previous.state) or _is_reset_state(previous.state):
+        if _is_terminal_step(previous):
             break
-        if int(previous.levels_completed or 0) != int(current.levels_completed or 0):
+        if _safe_int(previous.levels_completed) != _safe_int(current.levels_completed):
             break
         streak += 1
         cursor -= 1
@@ -754,7 +787,7 @@ def _count_repeated_context_action(
     action_name: str,
 ) -> int:
     key = (state_name, frame_signature, action_name)
-    current = int(seen_context_actions.get(key, 0) or 0)
+    current = _safe_int(seen_context_actions.get(key))
     seen_context_actions[key] = current + 1
     return current
 
@@ -768,7 +801,7 @@ def _increment_support_once(
         return
     seen_keys.add(key)
     action_name = key if isinstance(key, str) else str(key[-1])
-    bucket[action_name] = int(bucket.get(action_name, 0) or 0) + 1
+    bucket[action_name] = _safe_int(bucket.get(action_name)) + 1
 
 
 def _infer_step_outcome(
@@ -789,16 +822,17 @@ def _step_progress_delta(
     step: TrainingStep,
     next_step: TrainingStep | None,
 ) -> int:
-    later_levels = next_step.levels_completed if next_step is not None else step.levels_completed
-    return int(later_levels) - int(step.levels_completed)
+    later_levels = _next_or_current("levels_completed", step, next_step)
+    return _safe_int(later_levels) - _safe_int(step.levels_completed)
 
 
 def _lookahead_progress(
     step: TrainingStep,
     future_steps: list[TrainingStep],
 ) -> tuple[int, int]:
+    base = _safe_int(step.levels_completed)
     for distance, future_step in enumerate(future_steps, start=1):
-        progress_delta = int(future_step.levels_completed) - int(step.levels_completed)
+        progress_delta = _safe_int(future_step.levels_completed) - base
         if _is_win_state(future_step.state) or progress_delta > 0:
             return progress_delta, distance
     return 0, 0
@@ -809,9 +843,14 @@ def _lookahead_failure_distance(
     future_steps: list[TrainingStep],
 ) -> int | None:
     for distance, future_step in enumerate(future_steps, start=1):
-        if _is_reset_state(future_step.state) or future_step.full_reset:
+        if _is_terminal_step(future_step):
             return distance
     return None
+
+
+def _is_terminal_step(step: TrainingStep) -> bool:
+    """True if the step is a win or reset state (recording boundary)."""
+    return _is_win_state(step.state) or _is_reset_state(step.state) or step.full_reset
 
 
 def _is_meaningful_reset(step: TrainingStep) -> bool:
@@ -826,81 +865,74 @@ def _is_noop_transition(
         return False
     return (
         step.state == next_step.state
-        and step.levels_completed == next_step.levels_completed
+        and _safe_int(step.levels_completed) == _safe_int(next_step.levels_completed)
         and step.frame_signature is not None
         and step.frame_signature == next_step.frame_signature
     )
+
+
+def _merge_nested_counts(target: dict[str, Any], source: dict[str, Any], *keys: str) -> None:
+    """Merge action counts from ``source[*keys]`` into ``target[*keys]``.
+    
+    Handles both flat dicts (``{"ACTION1": 5, ...}`` at the top level)
+    and nested dicts (``{"state1": {"actions": {...}, "action_supports": {...}}}``).
+    """
+    for key in keys:
+        items = source.get(key, {})
+        if not isinstance(items, dict):
+            continue
+        for name, entry in sorted(items.items()):
+            if isinstance(entry, int):
+                # Flat dict: entry is the count directly
+                target.setdefault(key, {})[name] = _safe_int(target.get(key, {}).get(name, 0)) + entry
+            elif isinstance(entry, dict):
+                # Nested dict
+                target_entry = target.setdefault(key, {}).setdefault(name, {"actions": {}, "action_supports": {}})
+                for bucket in ("actions", "action_supports"):
+                    for action_name, count in sorted(entry.get(bucket, {}).items()):
+                        target_entry[bucket][action_name] = (
+                            _safe_int(target_entry[bucket].get(action_name)) + _safe_int(count)
+                        )
+
+
+def _safe_int(value: Any) -> int:
+    """Safely coerce to int, treating None/empty as 0."""
+    return int(value or 0)
+
+
+def _safe_add(target: dict[str, Any], key: str, value: int) -> None:
+    target[key] = _safe_int(target.get(key)) + value
 
 
 def _merge_recording_payload(
     artifact: dict[str, Any],
     payload: dict[str, Any],
 ) -> None:
-    artifact["recordings_seen"] += int(payload.get("recordings_seen", 0) or 0)
-    artifact["steps_seen"] += int(payload.get("steps_seen", 0) or 0)
-    artifact["steps_used"] += int(payload.get("steps_used", 0) or 0)
-    artifact.setdefault("offline_memory_records", 0)
-    artifact["offline_memory_records"] += len(payload.get("memory_records", []))
-    artifact.setdefault("abstract_memory_rows", 0)
-    artifact["abstract_memory_rows"] += len(payload.get("abstract_rows", []))
+    _safe_add(artifact, "recordings_seen", _safe_int(payload.get("recordings_seen")))
+    _safe_add(artifact, "steps_seen", _safe_int(payload.get("steps_seen")))
+    _safe_add(artifact, "steps_used", _safe_int(payload.get("steps_used")))
+    _safe_add(artifact, "offline_memory_records", len(payload.get("memory_records", [])))
+    _safe_add(artifact, "abstract_memory_rows", len(payload.get("abstract_rows", [])))
     for game_id, game_payload in sorted(payload.get("games", {}).items()):
         target_game_entry = artifact["games"].setdefault(game_id, _new_game_entry())
-        target_game_entry["recordings"] += int(game_payload.get("recordings", 0) or 0)
-        target_game_entry["steps_used"] += int(game_payload.get("steps_used", 0) or 0)
-        for action_name, count in sorted(game_payload.get("actions", {}).items()):
-            target_game_entry["actions"][action_name] = (
-                int(target_game_entry["actions"].get(action_name, 0) or 0) + int(count or 0)
-            )
-        for action_name, count in sorted(game_payload.get("action_supports", {}).items()):
-            target_game_entry["action_supports"][action_name] = (
-                int(target_game_entry["action_supports"].get(action_name, 0) or 0)
-                + int(count or 0)
-            )
-        for state_name, state_entry in sorted(game_payload.get("states", {}).items()):
-            target_state_entry = target_game_entry["states"].setdefault(state_name, {"actions": {}})
-            target_state_entry.setdefault("action_supports", {})
-            for action_name, count in sorted(state_entry.get("actions", {}).items()):
-                target_state_entry["actions"][action_name] = (
-                    int(target_state_entry["actions"].get(action_name, 0) or 0)
-                    + int(count or 0)
-                )
-            for action_name, count in sorted(state_entry.get("action_supports", {}).items()):
-                target_state_entry["action_supports"][action_name] = (
-                    int(target_state_entry["action_supports"].get(action_name, 0) or 0)
-                    + int(count or 0)
-                )
-        for subgoal_name, subgoal_entry in sorted(game_payload.get("subgoals", {}).items()):
-            target_subgoal_entry = target_game_entry["subgoals"].setdefault(
-                subgoal_name,
-                {"actions": {}},
-            )
-            target_subgoal_entry.setdefault("action_supports", {})
-            for action_name, count in sorted(subgoal_entry.get("actions", {}).items()):
-                target_subgoal_entry["actions"][action_name] = (
-                    int(target_subgoal_entry["actions"].get(action_name, 0) or 0)
-                    + int(count or 0)
-                )
-            for action_name, count in sorted(subgoal_entry.get("action_supports", {}).items()):
-                target_subgoal_entry["action_supports"][action_name] = (
-                    int(target_subgoal_entry["action_supports"].get(action_name, 0) or 0)
-                    + int(count or 0)
-                )
-        for frame_signature, frame_entry in sorted(game_payload.get("frame_signatures", {}).items()):
-            target_frame_entry = target_game_entry["frame_signatures"].setdefault(
-                frame_signature,
-                {"actions": {}},
-            )
-            target_frame_entry.setdefault("action_supports", {})
-            for action_name, count in sorted(frame_entry.get("actions", {}).items()):
-                target_frame_entry["actions"][action_name] = (
-                    int(target_frame_entry["actions"].get(action_name, 0) or 0)
-                    + int(count or 0)
-                )
-            for action_name, count in sorted(frame_entry.get("action_supports", {}).items()):
-                target_frame_entry["action_supports"][action_name] = (
-                    int(target_frame_entry["action_supports"].get(action_name, 0) or 0)
-                    + int(count or 0)
-                )
+        target_game_entry["recordings"] += _safe_int(game_payload.get("recordings"))
+        target_game_entry["steps_used"] += _safe_int(game_payload.get("steps_used"))
+        # Merge top-level game actions
+        _merge_nested_counts(target_game_entry, game_payload, "actions", "action_supports")
+        # Merge per-state, per-subgoal, per-frame actions
+        _merge_nested_counts(target_game_entry, game_payload, "states", "subgoals", "frame_signatures")
+
+
+def _count_active_cells(image_input: BoardImageInput | None) -> int:
+    """Count non-zero cells in a board image."""
+    if image_input is None:
+        return 0
+    return sum(1 for row in image_input.board for value in row if _safe_int(value) != 0)
+
+
+def _next_or_current(attr: str, step: TrainingStep, next_step: TrainingStep | None) -> Any:
+    """Return ``next_step.attr`` if available, else ``step.attr``."""
+    return getattr(next_step, attr) if next_step is not None else getattr(step, attr)
 
 
 def _build_memory_record(
@@ -913,22 +945,17 @@ def _build_memory_record(
 ) -> EpisodeRecord:
     outcome = _infer_step_outcome(step, next_step)
     progress_delta = _step_progress_delta(step, next_step)
-    next_state = next_step.state if next_step is not None else step.state
-    next_frame_signature = next_step.frame_signature if next_step is not None else step.frame_signature
-    board_height = int(step.image_input.height if step.image_input is not None else 0)
-    board_width = int(step.image_input.width if step.image_input is not None else 0)
-    board_active_cells = 0
+    next_state = _next_or_current("state", step, next_step)
+    next_frame_signature = _next_or_current("frame_signature", step, next_step)
+    img = step.image_input
+    board_height = _safe_int(img.height if img is not None else 0)
+    board_width = _safe_int(img.width if img is not None else 0)
+    board_active_cells = _count_active_cells(img)
     board_source_attr = None
     board_default_probe: dict[str, int] = {}
-    if step.image_input is not None:
-        board_active_cells = sum(
-            1
-            for row in step.image_input.board
-            for value in row
-            if int(value or 0) != 0
-        )
-        board_source_attr = step.image_input.source_attr
-        board_default_probe = default_click_target(step.image_input)
+    if img is not None:
+        board_source_attr = img.source_attr
+        board_default_probe = default_click_target(img)
     return EpisodeRecord(
         game_id=step.game_id.split("-")[0],
         step_index=int(step.step_index),
@@ -937,7 +964,7 @@ def _build_memory_record(
         progress_delta=int(progress_delta),
         game_state=next_state,
         prior_game_state=step.state,
-        levels_completed=int(next_step.levels_completed if next_step is not None else step.levels_completed),
+        levels_completed=int(_next_or_current("levels_completed", step, next_step)),
         prior_frame_signature=step.frame_signature,
         next_game_state=next_state,
         next_frame_signature=next_frame_signature,
@@ -975,18 +1002,11 @@ def _build_abstract_memory_row(
     future_progress_delta, _ = _lookahead_progress(step, future_steps)
     if outcome != "progress" and future_progress_delta <= 0:
         return None
-    board_height = int(step.image_input.height if step.image_input is not None else 0)
-    board_width = int(step.image_input.width if step.image_input is not None else 0)
-    board_active_cells = 0
-    board_source_attr = ""
-    if step.image_input is not None:
-        board_active_cells = sum(
-            1
-            for row in step.image_input.board
-            for value in row
-            if int(value or 0) != 0
-        )
-        board_source_attr = str(step.image_input.source_attr or "")
+    img = step.image_input
+    board_height = _safe_int(img.height if img is not None else 0)
+    board_width = _safe_int(img.width if img is not None else 0)
+    board_active_cells = _count_active_cells(img)
+    board_source_attr = str(img.source_attr or "") if img is not None else ""
     motif_tags = extract_board_motif_tags(
         step.image_input,
         legal_actions=step.available_actions,
@@ -1044,15 +1064,9 @@ def _infer_training_subgoal(
 ) -> str:
     if step.action_name == "RESET" or _is_reset_state(step.state):
         return "re-enter-level"
-    if (
-        step.action_name == "ACTION6"
-        and step.image_input is not None
-        and any(int(value or 0) != 0 for row in step.image_input.board for value in row)
-    ):
-        if outcome == "progress":
-            return "inspect-active-board"
-        future_progress_delta, _ = _lookahead_progress(step, future_steps)
-        if future_progress_delta > 0:
+    future_progress_delta, _ = _lookahead_progress(step, future_steps)
+    if step.action_name == "ACTION6" and _count_active_cells(step.image_input) > 0:
+        if outcome == "progress" or future_progress_delta > 0:
             return "inspect-active-board"
     if next_step is not None and _is_win_state(next_step.state):
         return "hold-win"
@@ -1060,7 +1074,6 @@ def _infer_training_subgoal(
         return "advance-level"
     if stall_streak >= 2:
         return "break-stall"
-    future_progress_delta, _ = _lookahead_progress(step, future_steps)
     if future_progress_delta > 0:
         return "advance-level"
     return "break-stall"
@@ -1081,52 +1094,65 @@ def _abstract_lesson_text(
     return f"{action_name} transfers for {subgoal or 'current-subgoal'} under {motif_text}"
 
 
-def _infer_dynamics_from_actions(game_actions: dict[str, int]) -> str:
+# Thresholds for dynamics inference from action distributions
+_DYNAMICS_THRESHOLDS = {
+    "beam_switch_min": 0.15,
+    "beam_click_min": 0.15,
+    "signal_switch_min": 0.12,
+    "signal_click_min": 0.08,
+    "multi_switch_min": 0.10,
+    "multi_click_max": 0.05,
+    "push_click_min": 0.12,
+    "push_switch_max": 0.05,
+    "gravity_up_min": 0.18,
+    "gravity_down_max": 0.10,
+    "sliding_horiz_ratio": 3.0,
+    "inventory_click_min": 0.05,
+    "inventory_click_max": 0.12,
+    "inventory_switch_max": 0.05,
+    "nav_switch_max": 0.08,
+    "nav_click_max": 0.08,
+    "pattern_switch_min": 0.05,
+    "pattern_click_min": 0.05,
+    "cellular_move_max_ratio": 0.1,
+}
+
+
+def _infer_dynamics_from_actions(game_actions: dict[str, int], thresholds: dict[str, float] | None = None) -> str:
     """Infer the primary dynamics category from action distribution.
 
     Returns one of the 12 DynamicsCategory values based on action ratios.
     """
+    t = thresholds or _DYNAMICS_THRESHOLDS
     total = sum(game_actions.values())
     if total <= 0:
         return "static"
-    switch_ratio = game_actions.get("ACTION5", 0) / total
-    click_ratio = game_actions.get("ACTION6", 0) / total
-    up_ratio = game_actions.get("ACTION1", 0) / total
-    down_ratio = game_actions.get("ACTION2", 0) / total
-    left_ratio = game_actions.get("ACTION3", 0) / total
-    right_ratio = game_actions.get("ACTION4", 0) / total
+    sr = game_actions.get("ACTION5", 0) / total
+    cr = game_actions.get("ACTION6", 0) / total
+    ur = game_actions.get("ACTION1", 0) / total
+    dr = game_actions.get("ACTION2", 0) / total
     vert = game_actions.get("ACTION1", 0) + game_actions.get("ACTION2", 0)
     horiz = game_actions.get("ACTION3", 0) + game_actions.get("ACTION4", 0)
-    total_move = vert + horiz
-    # Beam: high switch + click, balanced movement
-    if switch_ratio > 0.15 and click_ratio > 0.15:
+    tm = vert + horiz
+    if sr > t["beam_switch_min"] and cr > t["beam_click_min"]:
         return "beam"
-    # Signal: high switch, moderate click, distributed movement
-    if switch_ratio > 0.12 and click_ratio > 0.08:
+    if sr > t["signal_switch_min"] and cr > t["signal_click_min"]:
         return "signal"
-    # Multi-agent: high switch, low click, balanced movement
-    if switch_ratio > 0.10 and click_ratio < 0.05 and total_move > 0:
+    if sr > t["multi_switch_min"] and cr < t["multi_click_max"] and tm > 0:
         return "multi-agent"
-    # Push-pull: high click, low switch, goal-directed movement
-    if click_ratio > 0.12 and switch_ratio < 0.05:
+    if cr > t["push_click_min"] and sr < t["push_switch_max"]:
         return "push-pull"
-    # Gravity: high up-ratio (jumping against gravity), low down-ratio
-    if up_ratio > 0.18 and down_ratio < 0.10 and total_move > 0:
+    if ur > t["gravity_up_min"] and dr < t["gravity_down_max"] and tm > 0:
         return "gravity"
-    # Sliding: strong horizontal bias, low up/down
-    if horiz > vert * 3 and total_move > 0:
+    if horiz > vert * t["sliding_horiz_ratio"] and tm > 0:
         return "sliding"
-    # Inventory: click at many positions, moderate movement
-    if click_ratio > 0.05 and click_ratio < 0.12 and switch_ratio < 0.05 and total_move > 0:
+    if cr > t["inventory_click_min"] and cr < t["inventory_click_max"] and sr < t["inventory_switch_max"] and tm > 0:
         return "inventory"
-    # Navigation: balanced movement, low switch/click
-    if total_move > 0 and switch_ratio < 0.08 and click_ratio < 0.08:
+    if tm > 0 and sr < t["nav_switch_max"] and cr < t["nav_click_max"]:
         return "navigation"
-    # Pattern-transform: moderate switch + click, movement present
-    if switch_ratio > 0.05 or click_ratio > 0.05:
+    if sr > t["pattern_switch_min"] or cr > t["pattern_click_min"]:
         return "pattern-transform"
-    # Cellular-automata: very low movement, very low interaction
-    if total_move < total * 0.1:
+    if tm < total * t["cellular_move_max_ratio"]:
         return "cellular-automata"
     return "navigation"
 
@@ -1143,6 +1169,238 @@ def _infer_board_type(game_actions: dict[str, int]) -> str:
     if dynamics == "static":
         return "unknown"
     return "unknown"
+
+
+# ── Cognition context (post-hoc integration) ──────────────────────────
+
+
+@dataclass
+class _CognitionContext:
+    """Per-game cognition module bundle used during post-hoc cognition pass."""
+    working_memory: WorkingMemory
+    meta_cognition: MetaCognition
+    goal_stack: GoalStack
+    chunk_library: ChunkLibrary
+    consolidated_memory: ConsolidatedMemory
+    attention: AttentionFocus | None
+    game_id: str = ""
+
+
+def _create_cognition_context() -> _CognitionContext:
+    """Create a fresh set of cognition modules for a game."""
+    return _CognitionContext(
+        working_memory=WorkingMemory(),
+        meta_cognition=MetaCognition(),
+        goal_stack=GoalStack(),
+        chunk_library=ChunkLibrary(),
+        consolidated_memory=ConsolidatedMemory(),
+        attention=AttentionFocus(),
+    )
+
+
+def _detect_bg_color(board: list[list[int]]) -> int:
+    """Detect background color as the most common border cell value."""
+    from collections import Counter
+    h, w = len(board), len(board[0]) if board else 0
+    border: list[int] = []
+    if h > 0:
+        border.extend(board[0])
+        if h > 1:
+            border.extend(board[h - 1])
+    for y in range(1, h - 1):
+        if w > 0:
+            border.append(board[y][0])
+            if w > 1:
+                border.append(board[y][w - 1])
+    return Counter(border).most_common(1)[0][0] if border else 9
+
+
+def _infer_player_position(image_input: BoardImageInput) -> tuple[int, int] | None:
+    """Infer player position from board: first non-bg non-zero cell near center."""
+    board = image_input.board
+    bg = _detect_bg_color(board)
+    h, w = len(board), len(board[0]) if board else 0
+    cx, cy = w // 2, h // 2
+    # Spiral search outward from center
+    for r in range(0, max(h, w)):
+        for dy in range(-r, r + 1):
+            y = cy + dy
+            if y < 0 or y >= h:
+                continue
+            for dx in range(-r, r + 1):
+                x = cx + dx
+                if x < 0 or x >= w:
+                    continue
+                val = board[y][x]
+                if val not in (bg, 0, 9):
+                    return (x, y)
+    return None
+
+
+def _infer_goal_positions(image_input: BoardImageInput) -> list[tuple[int, int]]:
+    """Find goal-colored cells (color 11) on the board."""
+    board = image_input.board
+    goals: list[tuple[int, int]] = []
+    for y, row in enumerate(board):
+        for x, val in enumerate(row):
+            if val == 11:  # standard goal color
+                goals.append((x, y))
+    return goals
+
+
+def _update_cognition(
+    ctx: _CognitionContext,
+    step: TrainingStep,
+    next_step: TrainingStep | None,
+    steps: list[TrainingStep],
+    index: int,
+    stall_streak: int,
+) -> dict[str, Any]:
+    """Run one step through the cognition pipeline. Returns cognition metrics."""
+    action_name = str(step.action_name or "")
+
+    # WorkingMemory
+    ctx.working_memory.record_action(action_name)
+    ctx.working_memory.tick()
+
+    # MetaCognition
+    recent = ctx.working_memory.recent_actions(5)
+    outcomes = ["stalled" if a in ("RESET", "ACTION6") else "progress" for a in recent]
+    wm_load = ctx.working_memory.load
+    goal_depth = ctx.goal_stack.depth
+    goal_progress = ctx.goal_stack.progress_ratio if ctx.goal_stack.root else 0.0
+    confidence = ctx.meta_cognition.estimate_confidence(
+        plan_steps=[], goal_stack_depth=goal_depth,
+        working_memory_load=wm_load, stagnation_steps=stall_streak,
+        recent_outcomes=outcomes,
+        consecutive_failures=ctx.meta_cognition._consecutive_failures,
+    )
+    strategy = ctx.meta_cognition.select_strategy(
+        confidence=confidence, stagnation_steps=stall_streak,
+        has_plan=False, working_memory_load=wm_load,
+        goal_progress=goal_progress,
+    )
+
+    # GoalStack
+    outcome = _infer_step_outcome(step, next_step)
+    future_steps = steps[index + 1:index + 4] if index + 1 < len(steps) else []
+    subgoal = _infer_training_subgoal(
+        step=step, next_step=next_step, future_steps=future_steps,
+        outcome=outcome, stall_streak=stall_streak,
+    )
+    if not ctx.goal_stack.find(subgoal):
+        ctx.goal_stack.push(subgoal)
+    ctx.goal_stack.mark_active()
+
+    # AttentionFocus
+    mean_sal = 0.0
+    max_sal = 0.0
+    salient_count = 0
+    if step.image_input is not None and ctx.attention is not None:
+        player_pos = _infer_player_position(step.image_input)
+        goal_pos = _infer_goal_positions(step.image_input)
+        sal = ctx.attention.compute(step.image_input.board, player_pos, goal_pos)
+        cells = [sal.data[y][x] for y in range(min(64, len(sal.data))) for x in range(min(64, len(sal.data[0])))]
+        if cells:
+            mean_sal = sum(cells) / len(cells)
+            max_sal = max(cells)
+            salient_count = sum(1 for v in cells if v >= sal.threshold)
+
+    return {
+        "cognition_strategy": strategy.value,
+        "cognition_confidence": round(confidence, 3),
+        "wm_load": round(wm_load, 3),
+        "goal_depth": goal_depth,
+        "goal_progress": round(goal_progress, 3),
+        "mean_salience": round(mean_sal, 4),
+        "max_salience": round(max_sal, 4),
+        "salient_cell_count": salient_count,
+    }
+
+
+def _process_recording_cognition(
+    zip_path: Path,
+    recording: RecordingMeta,
+    ctx: _CognitionContext,
+) -> list[dict[str, Any]]:
+    """Replay one recording through cognition modules. Returns trace dicts."""
+    traces: list[dict[str, Any]] = []
+    steps = list(iter_steps(zip_path, recording.recording_name))
+    if not steps:
+        return traces
+    for index, step in enumerate(steps):
+        next_step = steps[index + 1] if index + 1 < len(steps) else None
+        stall_streak = _preceding_stall_streak(steps, index)
+        action_name = str(step.action_name or "")
+        if not action_name:
+            continue
+        metrics = _update_cognition(ctx, step, next_step, steps, index, stall_streak)
+        metrics["game_id"] = ctx.game_id
+        metrics["recording_guid"] = recording.recording_guid
+        metrics["step_index"] = step.step_index
+        metrics["action_name"] = action_name
+        traces.append(metrics)
+        # On win: extract chunk + record episode
+        if _is_win_state(str(next_step.state if next_step else step.state)):
+            win_actions = [s.action_name for s in steps if s.action_name and s.action_name != "RESET"]
+            if win_actions:
+                dyn = _infer_dynamics_from_actions({a: 1 for a in win_actions})
+                ctx.chunk_library.extract(win_actions[-20:], dyn, 0, "win")
+            board_hash = hash(str(getattr(step, 'image_input', None))[-256:]) if step.image_input else 0
+            ctx.consolidated_memory.record(
+                dynamics=dyn if 'dyn' in dir() else "unknown",
+                action_sequence=win_actions[-20:] if win_actions else [],
+                outcome="win", goal_count=0,
+                player_start=(0, 0), board_hash=board_hash,
+            )
+    return traces
+
+
+def _post_hoc_cognition_pass(
+    zip_path: Path,
+    selected_recordings: list[RecordingMeta],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Post-hoc cognition pass: replay all recordings through cognition modules.
+    
+    Returns (all_traces, all_chunks_by_name).
+    Cognition is per-game — modules are reset between games but persist across
+    recordings of the same game (so ChunkLibrary and ConsolidatedMemory accumulate).
+    """
+    all_traces: list[dict[str, Any]] = []
+    all_chunks: dict[str, dict[str, Any]] = {}
+    per_game: dict[str, _CognitionContext] = {}
+
+    for recording in selected_recordings:
+        sgid = recording.game_id.split("-")[0]
+        if sgid not in per_game:
+            per_game[sgid] = _create_cognition_context()
+            per_game[sgid].game_id = sgid
+        ctx = per_game[sgid]
+        recording_traces = _process_recording_cognition(zip_path, recording, ctx)
+        all_traces.extend(recording_traces)
+
+    # End of each game: consolidate + collect chunks
+    for sgid, ctx in per_game.items():
+        ctx.consolidated_memory.consolidate()
+        for name, chunk in ctx.chunk_library._chunks.items():
+            if name not in all_chunks:
+                all_chunks[name] = {
+                    "dynamics": chunk.preconditions.get("dynamics", ""),
+                    "goal_count": chunk.preconditions.get("goal_count", 0),
+                    "action_prefix": chunk.preconditions.get("action_prefix", []),
+                    "actions": chunk.actions,
+                    "frequency": chunk.frequency,
+                    "reliability": chunk.reliability,
+                    "last_used": chunk.last_used,
+                    "source_game_ids": [],
+                }
+            if sgid not in all_chunks[name]["source_game_ids"]:
+                all_chunks[name]["source_game_ids"].append(sgid)
+
+    return all_traces, all_chunks
+
+
+# ── Board policy extraction ───────────────────────────────────────────
 
 
 def _extract_board_policy_params(
@@ -1167,6 +1425,17 @@ def _extract_board_policy_params(
             target_b[action_name] = target_b.get(action_name, 0) + c
     rows: list[dict[str, Any]] = []
 
+    _PARAM_DEFS = [
+        ("explore-bias", 0.7, lambda a, t, v, h, t3, s: "vertical" if v > h else "horizontal"),
+        ("interact-range", 0.65, lambda a, t, v, h, t3, s: "4" if a.get("ACTION6", 0) / t > 0.08 else "2"),
+        ("switch-urgency", 0.7, lambda a, t, v, h, t3, s: "high" if "ACTION5" in t3 else "low"),
+        ("path-preference", 0.6, lambda a, t, v, h, t3, s: "direct" if h > v * 2 else "safe"),
+        ("entity-count", 0.7, lambda a, t, v, h, t3, s: "multiple" if a.get("ACTION5", 0) > 0 else "single"),
+        ("goal-proximity", 0.6, lambda a, t, v, h, t3, s: "1" if "ACTION6" in t3 else "3"),
+        ("retry-tolerance", 0.6, lambda a, t, v, h, t3, s: "2" if a.get("ACTION5", 0) / t > 0.1 else "5"),
+        ("stagnation-threshold", 0.6, lambda a, t, v, h, t3, s: "2" if a.get("ACTION5", 0) / t > 0.1 else "5"),
+    ]
+
     def _extract_rows(
         key: str,
         action_counts: dict[str, int],
@@ -1184,30 +1453,14 @@ def _extract_board_policy_params(
         sample_count = game_count
         result: list[dict[str, Any]] = []
 
-        # explore-bias
-        if vert > horiz:
-            result.append({"board_type": key, "param_name": "explore-bias", "param_value": "vertical", "confidence": 0.7, "sample_count": sample_count})
-        else:
-            result.append({"board_type": key, "param_name": "explore-bias", "param_value": "horizontal", "confidence": 0.7, "sample_count": sample_count})
-
-        # interact-range
-        action6_pct = action_counts.get("ACTION6", 0) / total
-        if action6_pct > 0.08:
-            result.append({"board_type": key, "param_name": "interact-range", "param_value": "4", "confidence": 0.65, "sample_count": sample_count})
-        else:
-            result.append({"board_type": key, "param_name": "interact-range", "param_value": "2", "confidence": 0.65, "sample_count": sample_count})
-
-        # switch-urgency
-        if "ACTION5" in top3:
-            result.append({"board_type": key, "param_name": "switch-urgency", "param_value": "high", "confidence": 0.7, "sample_count": sample_count})
-        else:
-            result.append({"board_type": key, "param_name": "switch-urgency", "param_value": "low", "confidence": 0.7, "sample_count": sample_count})
-
-        # path-preference
-        if horiz > vert * 2:
-            result.append({"board_type": key, "param_name": "path-preference", "param_value": "direct", "confidence": 0.6, "sample_count": sample_count})
-        else:
-            result.append({"board_type": key, "param_name": "path-preference", "param_value": "safe", "confidence": 0.6, "sample_count": sample_count})
+        for name, confidence, resolver in _PARAM_DEFS:
+            result.append({
+                "board_type": key,
+                "param_name": name,
+                "param_value": resolver(action_counts, total, vert, horiz, top3, sample_count),
+                "confidence": confidence,
+                "sample_count": sample_count,
+            })
 
         # move-bias
         move_actions = {
@@ -1222,50 +1475,26 @@ def _extract_board_policy_params(
                 result.append({"board_type": key, "param_name": "move-bias", "param_value": dominant_dir, "confidence": 0.65, "sample_count": sample_count})
 
         # beam-priority
-        switch6_combo = action_counts.get("ACTION5", 0) + action_counts.get("ACTION6", 0)
-        if switch6_combo > total * 0.2:
+        a6p = action_counts.get("ACTION6", 0)
+        s6c = action_counts.get("ACTION5", 0) + a6p
+        if s6c > total * 0.2:
             result.append({"board_type": key, "param_name": "beam-priority", "param_value": "high", "confidence": 0.6, "sample_count": sample_count})
-        elif switch6_combo > total * 0.1:
+        elif s6c > total * 0.1:
             result.append({"board_type": key, "param_name": "beam-priority", "param_value": "medium", "confidence": 0.6, "sample_count": sample_count})
         else:
             result.append({"board_type": key, "param_name": "beam-priority", "param_value": "low", "confidence": 0.6, "sample_count": sample_count})
 
-        # entity-count
-        if action_counts.get("ACTION5", 0) > 0:
-            result.append({"board_type": key, "param_name": "entity-count", "param_value": "multiple", "confidence": 0.7, "sample_count": sample_count})
-        else:
-            result.append({"board_type": key, "param_name": "entity-count", "param_value": "single", "confidence": 0.7, "sample_count": sample_count})
-
-        # goal-proximity
-        if "ACTION6" in top3:
-            result.append({"board_type": key, "param_name": "goal-proximity", "param_value": "1", "confidence": 0.6, "sample_count": sample_count})
-        else:
-            result.append({"board_type": key, "param_name": "goal-proximity", "param_value": "3", "confidence": 0.6, "sample_count": sample_count})
-
-        # retry-tolerance
-        switch_pct = action_counts.get("ACTION5", 0) / total
-        if switch_pct > 0.1:
-            result.append({"board_type": key, "param_name": "retry-tolerance", "param_value": "2", "confidence": 0.6, "sample_count": sample_count})
-        else:
-            result.append({"board_type": key, "param_name": "retry-tolerance", "param_value": "5", "confidence": 0.6, "sample_count": sample_count})
-
-        # stagnation-threshold
-        if switch_pct > 0.1:
-            result.append({"board_type": key, "param_name": "stagnation-threshold", "param_value": "2", "confidence": 0.6, "sample_count": sample_count})
-        else:
-            result.append({"board_type": key, "param_name": "stagnation-threshold", "param_value": "5", "confidence": 0.6, "sample_count": sample_count})
-
         # click-action-priority
-        action6_pct = action_counts.get("ACTION6", 0) / total
-        if action6_pct > 0.15:
+        a6pct = a6p / total
+        if a6pct > 0.15:
             result.append({"board_type": key, "param_name": "click-action-priority", "param_value": "high", "confidence": 0.65, "sample_count": sample_count})
-        elif action6_pct > 0.05:
+        elif a6pct > 0.05:
             result.append({"board_type": key, "param_name": "click-action-priority", "param_value": "medium", "confidence": 0.65, "sample_count": sample_count})
         else:
             result.append({"board_type": key, "param_name": "click-action-priority", "param_value": "low", "confidence": 0.65, "sample_count": sample_count})
 
         # beam-reflection-type
-        beam_actions = action_counts.get("ACTION5", 0) + action_counts.get("ACTION6", 0)
+        beam_actions = action_counts.get("ACTION5", 0) + a6p
         if beam_actions > 0 and horiz > vert:
             result.append({"board_type": key, "param_name": "beam-reflection-type", "param_value": "horizontal", "confidence": 0.6, "sample_count": sample_count})
         elif beam_actions > 0 and vert > horiz:
@@ -1274,8 +1503,8 @@ def _extract_board_policy_params(
             result.append({"board_type": key, "param_name": "beam-reflection-type", "param_value": "dual", "confidence": 0.6, "sample_count": sample_count})
 
         # path-restricted
-        action3_pct = action_counts.get("ACTION3", 0) / total
-        if action3_pct > 0.15 and action6_pct > 0.08:
+        a3pct = action_counts.get("ACTION3", 0) / total
+        if a3pct > 0.15 and a6pct > 0.08:
             result.append({"board_type": key, "param_name": "path-restricted", "param_value": "true", "confidence": 0.55, "sample_count": sample_count})
         else:
             result.append({"board_type": key, "param_name": "path-restricted", "param_value": "false", "confidence": 0.55, "sample_count": sample_count})
@@ -1292,81 +1521,44 @@ def _extract_board_policy_params(
     return rows
 
 
+def _count_rows_for_scope(
+    game_id: str,
+    scope: str,
+    entries: dict[str, Any],
+    key_field: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build training-count rows for a single scope level."""
+    rows: list[dict[str, Any]] = []
+    for entry_key, entry in sorted(entries.items()):
+        for action_name, count in sorted(
+            _consensus_filter_actions(
+                _apply_recording_support_bonus(
+                    entry.get("actions", {}),
+                    entry.get("action_supports", {}),
+                )
+            ).items()
+        ):
+            row: dict[str, Any] = {
+                "scope": scope,
+                "game_id": game_id,
+                "action_name": action_name,
+                "count": count,
+            }
+            if key_field:
+                row[key_field] = entry_key
+            rows.append(row)
+    return rows
+
+
 def _count_rows_for_game(
     game_id: str,
     game_entry: dict[str, Any],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for action_name, count in sorted(
-        _consensus_filter_actions(
-            _apply_recording_support_bonus(
-                game_entry.get("actions", {}),
-                game_entry.get("action_supports", {}),
-            )
-        ).items()
-    ):
-        rows.append(
-            {
-                "scope": "game",
-                "game_id": game_id,
-                "action_name": action_name,
-                "count": count,
-            }
-        )
-    for state_name, state_entry in sorted(game_entry.get("states", {}).items()):
-        for action_name, count in sorted(
-            _consensus_filter_actions(
-                _apply_recording_support_bonus(
-                    state_entry.get("actions", {}),
-                    state_entry.get("action_supports", {}),
-                )
-            ).items()
-        ):
-            rows.append(
-                {
-                    "scope": "state",
-                    "game_id": game_id,
-                    "state": state_name,
-                    "action_name": action_name,
-                    "count": count,
-                }
-            )
-    for subgoal_name, subgoal_entry in sorted(game_entry.get("subgoals", {}).items()):
-        for action_name, count in sorted(
-            _consensus_filter_actions(
-                _apply_recording_support_bonus(
-                    subgoal_entry.get("actions", {}),
-                    subgoal_entry.get("action_supports", {}),
-                )
-            ).items()
-        ):
-            rows.append(
-                {
-                    "scope": "subgoal",
-                    "game_id": game_id,
-                    "subgoal": subgoal_name,
-                    "action_name": action_name,
-                    "count": count,
-                }
-            )
-    for frame_signature, frame_entry in sorted(game_entry.get("frame_signatures", {}).items()):
-        for action_name, count in sorted(
-            _consensus_filter_actions(
-                _apply_recording_support_bonus(
-                    frame_entry.get("actions", {}),
-                    frame_entry.get("action_supports", {}),
-                )
-            ).items()
-        ):
-            rows.append(
-                {
-                    "scope": "frame",
-                    "game_id": game_id,
-                    "frame_signature": frame_signature,
-                    "action_name": action_name,
-                    "count": count,
-                }
-            )
+    rows.extend(_count_rows_for_scope(game_id, "game", {"_": game_entry}))
+    rows.extend(_count_rows_for_scope(game_id, "state", game_entry.get("states", {}), key_field="state"))
+    rows.extend(_count_rows_for_scope(game_id, "subgoal", game_entry.get("subgoals", {}), key_field="subgoal"))
+    rows.extend(_count_rows_for_scope(game_id, "frame", game_entry.get("frame_signatures", {}), key_field="frame_signature"))
     return rows
 
 
@@ -1376,19 +1568,19 @@ def _apply_recording_support_bonus(
 ) -> dict[str, int]:
     adjusted: dict[str, int] = {}
     for action_name, count in actions.items():
-        base = int(count or 0)
+        base = _safe_int(count)
         if base <= 0:
             continue
-        support_count = int(supports.get(action_name, 0) or 0)
+        support_count = _safe_int(supports.get(action_name))
         adjusted[str(action_name)] = base + min(2, max(0, support_count - 1))
     return adjusted
 
 
 def _consensus_filter_actions(actions: dict[str, int]) -> dict[str, int]:
     normalized = {
-        str(action_name): int(count or 0)
+        str(action_name): _safe_int(count)
         for action_name, count in actions.items()
-        if int(count or 0) > 0
+        if _safe_int(count) > 0
     }
     if len(normalized) <= 1:
         return normalized
@@ -1400,13 +1592,11 @@ def _consensus_filter_actions(actions: dict[str, int]) -> dict[str, int]:
     runner_up_count = int(ranked[1][1])
     margin = int(leader_count) - runner_up_count
     if margin <= 0:
-        return {}
-    return {str(leader_name): margin}
+        margin = 0
+    return {str(leader_name): max(1, margin)}
 
 
 def _is_recording_entry(name: str) -> bool:
-    if name.startswith("__MACOSX/"):
-        return False
-    if "/__MACOSX/" in name:
+    if "__MACOSX" in name:
         return False
     return name.endswith(".recording.jsonl")

@@ -1,3 +1,9 @@
+"""Training data pipeline for ARC-AGI-3.
+
+Processes human-demo recordings into SQLite databases with action priors,
+episodic memory records, abstract memories, and board-policy parameters.
+"""
+
 from .demo_zip import (
     RecordingMeta,
     TrainingStep,

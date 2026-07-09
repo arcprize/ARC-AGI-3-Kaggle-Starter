@@ -67,6 +67,12 @@ class EpisodeRecord:
     prior_board_active_cells: int = 0
     prior_board_source_attr: str | None = None
     prior_board_default_probe: dict[str, int] = field(default_factory=dict)
+    recording_guid: str = ""
+    cognition_strategy: str = ""
+    cognition_confidence: float = 0.0
+    wm_load: float = 0.0
+    goal_depth: int = 0
+    goal_progress: float = 0.0
 
 
 @dataclass(slots=True)
@@ -127,6 +133,7 @@ class ExecutiveContext:
     working_memory: Any = None
     chunk_library: Any = None
     attention: Any = None
+    episodic_memory: Any = None
 
 
 @runtime_checkable

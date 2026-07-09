@@ -141,18 +141,22 @@ class MyAgent(Agent):
             cl = getattr(self, '_chunk_library', None)
             if em is not None:
                 actions = [getattr(f, 'action', '?') for f in frames[-50:]]
+                board = getattr(latest_frame, 'board', None) or []
+                goal_count = len(getattr(latest_frame, 'goal_positions', []) or [])
+                player_start = getattr(latest_frame, 'player_position', (0, 0)) or (0, 0)
                 em.record(
                     dynamics=getattr(self, '_last_dynamics', "unknown"),
                     action_sequence=actions,
                     outcome="win",
-                    goal_count=0,
-                    player_start=(0, 0),
-                    board_hash=hash(str(getattr(latest_frame, 'board', ''))[-256:]),
+                    goal_count=goal_count,
+                    player_start=player_start,
+                    board_hash=hash(str(board)[-256:]),
                 )
                 em.consolidate()
-            if cl is not None and em is not None and em._episodes:
-                last = em._episodes[-1]
-                cl.extract(last.action_sequence, last.dynamics, last.goal_count, "win")
+            if cl is not None and em is not None:
+                last = em.last_episode()
+                if last is not None:
+                    cl.extract(last.action_sequence, last.dynamics, last.goal_count, "win")
             return True
         return False
 

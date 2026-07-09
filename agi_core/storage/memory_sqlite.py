@@ -448,6 +448,49 @@ def initialize_memory_schema(db_path: str | Path) -> None:
             ON abstract_memories(subgoal, state, board_height, board_width, board_active_cells)
             """
         )
+        # Cognition traces table (post-hoc cognition pass during training)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cognition_traces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id TEXT NOT NULL,
+                recording_guid TEXT NOT NULL DEFAULT '',
+                step_index INTEGER NOT NULL,
+                action_name TEXT NOT NULL DEFAULT '',
+                cognition_strategy TEXT NOT NULL DEFAULT '',
+                cognition_confidence REAL NOT NULL DEFAULT 0.0,
+                wm_load REAL NOT NULL DEFAULT 0.0,
+                goal_depth INTEGER NOT NULL DEFAULT 0,
+                goal_progress REAL NOT NULL DEFAULT 0.0,
+                mean_salience REAL NOT NULL DEFAULT 0.0,
+                max_salience REAL NOT NULL DEFAULT 0.0,
+                salient_cell_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cognition_traces_lookup
+            ON cognition_traces(game_id, recording_guid, step_index)
+            """
+        )
+        # Chunks table (persisted ChunkLibrary chunks from cognition pass)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                dynamics TEXT NOT NULL DEFAULT '',
+                goal_count INTEGER NOT NULL DEFAULT 0,
+                action_prefix_json TEXT NOT NULL DEFAULT '[]',
+                actions_json TEXT NOT NULL DEFAULT '[]',
+                frequency INTEGER NOT NULL DEFAULT 1,
+                reliability REAL NOT NULL DEFAULT 1.0,
+                last_used REAL NOT NULL DEFAULT 0.0,
+                source_game_ids_json TEXT NOT NULL DEFAULT '[]'
+            )
+            """
+        )
         connection.commit()
 
 
@@ -557,6 +600,78 @@ def upsert_abstract_memory_rows(
     with closing(_connect(db, write=True)) as connection:
         for row in rows:
             _upsert_abstract_memory_row(connection, row)
+        connection.commit()
+    _refresh_cache(db)
+
+
+def upsert_cognition_traces(db_path: str | Path, traces: list[dict[str, Any]]) -> None:
+    """Batch insert cognition traces into ``cognition_traces`` table."""
+    if not traces:
+        return
+    db = Path(db_path)
+    initialize_memory_schema(db)
+    with closing(_connect(db, write=True)) as connection:
+        for trace in traces:
+            connection.execute(
+                """
+                INSERT INTO cognition_traces(
+                    game_id, recording_guid, step_index, action_name,
+                    cognition_strategy, cognition_confidence,
+                    wm_load, goal_depth, goal_progress,
+                    mean_salience, max_salience, salient_cell_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    str(trace.get("game_id", "")),
+                    str(trace.get("recording_guid", "")),
+                    int(trace.get("step_index", 0)),
+                    str(trace.get("action_name", "")),
+                    str(trace.get("cognition_strategy", "")),
+                    float(trace.get("cognition_confidence", 0.0)),
+                    float(trace.get("wm_load", 0.0)),
+                    int(trace.get("goal_depth", 0)),
+                    float(trace.get("goal_progress", 0.0)),
+                    float(trace.get("mean_salience", 0.0)),
+                    float(trace.get("max_salience", 0.0)),
+                    int(trace.get("salient_cell_count", 0)),
+                ],
+            )
+        connection.commit()
+    _refresh_cache(db)
+
+
+def upsert_chunk(db_path: str | Path, chunk_name: str, chunk_data: dict[str, Any]) -> None:
+    """Insert or update a chunk row in the ``chunks`` table."""
+    db = Path(db_path)
+    initialize_memory_schema(db)
+    with closing(_connect(db, write=True)) as connection:
+        connection.execute(
+            """
+            INSERT INTO chunks (name, dynamics, goal_count, action_prefix_json, actions_json,
+                                frequency, reliability, last_used, source_game_ids_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                frequency = excluded.frequency,
+                actions_json = excluded.actions_json,
+                reliability = CASE
+                    WHEN chunks.actions_json = excluded.actions_json
+                    THEN MIN(1.0, chunks.reliability + 0.05)
+                    ELSE MAX(0.0, chunks.reliability - 0.1)
+                END,
+                last_used = MAX(chunks.last_used, excluded.last_used)
+            """,
+            [
+                chunk_name,
+                str(chunk_data.get("dynamics", "")),
+                int(chunk_data.get("goal_count", 0)),
+                json.dumps(chunk_data.get("action_prefix", [])),
+                json.dumps(chunk_data.get("actions", [])),
+                int(chunk_data.get("frequency", 1)),
+                float(chunk_data.get("reliability", 1.0)),
+                float(chunk_data.get("last_used", 0.0)),
+                json.dumps(chunk_data.get("source_game_ids", [])),
+            ],
+        )
         connection.commit()
     _refresh_cache(db)
 

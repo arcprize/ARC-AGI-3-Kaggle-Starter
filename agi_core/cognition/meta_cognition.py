@@ -59,7 +59,7 @@ class MetaCognition:
             base -= 0.15
         if goal_stack_depth > 5:
             base -= 0.1
-        if plan_steps:
+        if plan_steps is not None and len(plan_steps) > 0:
             base += 0.15
         return max(0.05, min(0.95, base))
 
@@ -119,8 +119,8 @@ class MetaCognition:
         #   2. Stagnation → RECOVER / EXPLORE
         #   3. Curiosity → EXPLORE
         #   4. Confidence-based default
-        if working_memory_load > 0.8 and confidence < 0.7 and stagnation_steps >= 3:
-            mode = StrategyMode.EXPLORE
+        if working_memory_load > 0.8 and confidence < 0.7:
+            mode = StrategyMode.EXPLORE if stagnation_steps >= 3 else StrategyMode.BALANCED
         elif stagnation_steps >= 10:
             mode = StrategyMode.RECOVER
         elif stagnation_steps >= 5 and confidence < 0.4:

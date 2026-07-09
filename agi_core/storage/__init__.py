@@ -7,6 +7,8 @@ from .memory_sqlite import (
     record_transition,
     record_transitions,
     upsert_abstract_memory_rows,
+    upsert_chunk,
+    upsert_cognition_traces,
 )
 from .priors_sqlite import (
     initialize_schema,
@@ -32,6 +34,8 @@ __all__ = [
     "record_transitions",
     "upsert_abstract_memory_rows",
     "upsert_board_policy_params",
+    "upsert_chunk",
+    "upsert_cognition_traces",
     "upsert_metadata",
     "upsert_training_counts",
 ]

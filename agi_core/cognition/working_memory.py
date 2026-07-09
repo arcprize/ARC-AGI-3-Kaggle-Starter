@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -73,6 +76,23 @@ class WorkingMemory:
     def available_capacity(self) -> int:
         return self.capacity - len(self._items)
 
+    @staticmethod
+    def _key_prefix(key: str) -> str:
+        """First underscore-delimited segment, or first 8 chars."""
+        return key.split("_")[0] if "_" in key else key[:8]
+
+    def _apply_interference(self, key: str) -> None:
+        """Reduce utility of items sharing ``key``'s prefix (load-proportional)."""
+        if self.available_capacity >= 3:
+            return
+        penalty = 1.0 - 0.15 * self.load
+        prefix = self._key_prefix(key)
+        for existing in list(self._items.values()):
+            if existing.key == key:
+                continue
+            if self._key_prefix(existing.key) == prefix:
+                existing.utility *= penalty
+
     def push(self, item: WMItem) -> None:
         """Add or update an item.  Evict lowest-utility item if full.
         Interference: if a similar key (same prefix) exists, the new item
@@ -83,16 +103,7 @@ class WorkingMemory:
             old.content = item.content
             old.utility = max(old.utility, item.utility)
             old.access()
-            # Apply interference — only when fewer than 3 slots remain
-            if self.available_capacity < 3:
-                penalty = 1.0 - 0.15 * self.load
-                prefix = item.key.split("_")[0] if "_" in item.key else item.key[:8]
-                for existing in list(self._items.values()):
-                    if existing.key == item.key:
-                        continue
-                    other_prefix = existing.key.split("_")[0] if "_" in existing.key else existing.key[:8]
-                    if other_prefix == prefix:
-                        existing.utility *= penalty
+            self._apply_interference(item.key)
             return
         cat = item.category
         cat_items = {k: v for k, v in self._items.items() if v.category == cat}
@@ -106,16 +117,7 @@ class WorkingMemory:
         # Insert the item before applying interference (so we don't penalise
         # items that were evicted making room).
         self._items[item.key] = item
-        # Interference — similar keys compete (only when pressure is high)
-        if self.available_capacity < 3:
-            penalty = 1.0 - 0.15 * self.load  # 0.955 at 30% load, 0.85 at 100%
-            prefix = item.key.split("_")[0] if "_" in item.key else item.key[:8]
-            for existing in list(self._items.values()):
-                if existing.key == item.key:
-                    continue
-                other_prefix = existing.key.split("_")[0] if "_" in existing.key else existing.key[:8]
-                if other_prefix == prefix:
-                    existing.utility *= penalty
+        self._apply_interference(item.key)
 
     def get(self, key: str) -> WMItem | None:
         """Retrieve an item (boosts its utility)."""
@@ -157,19 +159,16 @@ class WorkingMemory:
                     category="percept",
                     utility=0.3,
                 )
-                # Only remove the original if the gist can actually be stored
-                # (i.e., there's room in the percept category).  If percept
-                # slots are full, the gist would be immediately evicted.
-                gist_fits = (
-                    self._category_max.get('percept', 3) > 1
-                    or len([v for v in self._items.values() if v.category == 'percept']) < self._category_max.get('percept', 3)
-                )
-                if gist_fits:
+                # Only remove the original if a percept slot is available
+                # (otherwise the gist would be immediately evicted).
+                cur_percepts = len([v for v in self._items.values() if v.category == 'percept'])
+                max_percepts = self._category_max.get('percept', 3)
+                if cur_percepts < max_percepts:
                     self.remove(oldest_key)
                     self.push(gist)
                 else:
-                    logger = __import__('logging').getLogger(__name__)
-                    logger.debug("WM: skipping gist consolidation — percept slots full")
+                    logger.debug("WM: skipping gist consolidation — percept slots full (%d/%d)",
+                                 cur_percepts, max_percepts)
             self._consolidation_counter = 0  # reset regardless (prevents counter creep)
 
     def snapshot(self) -> dict[str, Any]:

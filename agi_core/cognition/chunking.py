@@ -81,6 +81,8 @@ class ChunkLibrary:
         current ``dynamics``, ``goal_count``, and recent ``action_window``.
         ``last_used`` is updated on matched chunks.
         """
+        if not dynamics:
+            return []
         now = time.monotonic()
         scored: list[tuple[float, Chunk]] = []
         for chunk in self._chunks.values():
@@ -125,7 +127,7 @@ class ChunkLibrary:
         if len(action_sequence) < 3:
             return None
         chunk = Chunk(
-            name=f"auto_{dynamics}_{goal_count}g_{len(self._chunks)}",
+            name=f"auto_{dynamics.lower()}_{goal_count}g_{len(self._chunks)}",
             preconditions={
                 "dynamics": dynamics.lower(),
                 "goal_count": goal_count,
@@ -147,22 +149,37 @@ class ChunkLibrary:
         
         Called periodically during gameplay (not just on win).  If the
         window contains a non-trivial action sequence that looks reusable,
-        save it as a chunk.
+        save it as a chunk.  Supports:
+        - Even-split repetition (A,B,C,A,B,C)
+        - 2-action alternating (A,B,A,B,A,B)
         """
-        if len(action_window) < 6:
+        if not dynamics or not action_window or len(action_window) < 6:
             return None
-        # Only even-length windows can have a clean repeating pattern
         if len(action_window) % 2 != 0:
             return None
         half = len(action_window) // 2
+        # Try even-split repetition
         pattern = action_window[:half]
-        second = action_window[half:]
-        if pattern != second:
-            return None
-        # Reject trivial patterns (all the same action)
-        if len(set(pattern)) == 1:
-            return None
-        return self.extract(pattern, dynamics, goal_count, "progress")
+        if action_window[half:] == pattern and len(set(pattern)) > 1:
+            return self.extract(pattern, dynamics, goal_count, "progress")
+        # Try 2-action alternating pattern (e.g., A,B,A,B,A,B)
+        if half >= 2 and len(set(action_window)) == 2:
+            base = action_window[:2]
+            if action_window[2:] == base * (half - 1):
+                # Build chunk directly (extract requires min 3 actions)
+                chunk = Chunk(
+                    name=f"auto_{dynamics.lower()}_{goal_count}g_{len(self._chunks)}",
+                    preconditions={
+                        "dynamics": dynamics.lower(),
+                        "goal_count": goal_count,
+                        "action_prefix": base,
+                    },
+                    actions=base,
+                    postconditions={"outcome": "progress"},
+                )
+                self.add(chunk)
+                return chunk
+        return None
 
     def update_outcome(self, chunk_name: str, success: bool) -> None:
         """Update a chunk's reliability based on execution outcome."""

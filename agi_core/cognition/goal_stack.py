@@ -93,6 +93,7 @@ class GoalStack:
         queue: deque[Goal] = deque([self._root])
         while queue:
             g = queue.popleft()
+            total += 1
             if g.status == GoalStatus.COMPLETED:
                 completed += 1
             queue.extend(g.children)
@@ -105,6 +106,7 @@ class GoalStack:
         g = Goal(name=name, metadata=meta)
         self._root = g
         self._active_path = [g]
+        self._progress_history.clear()
         return g
 
     def push(self, name: str, **meta: Any) -> Goal:
@@ -161,11 +163,14 @@ class GoalStack:
         
         Progress is defined as: the current goal name differs from the last
         3 entries in ``_progress_history`` (not stuck repeating the same goal).
+        Safe to call multiple times — records only if name differs from last.
         """
         name = current_goal_name or (self.active.name if self.active else None)
         if name is None:
             return True
-        self._progress_history.append(name)
+        # Avoid duplicate recording if the same goal name was just recorded
+        if not self._progress_history or self._progress_history[-1] != name:
+            self._progress_history.append(name)
         if len(self._progress_history) > 10:
             self._progress_history.pop(0)
         if len(self._progress_history) >= 4:
@@ -205,4 +210,5 @@ class GoalStack:
             "active_path": [g.name for g in self._active_path],
             "active_status": self.active.status.value if self.active else None,
             "depth": self.depth,
+            "progress_ratio": round(self.progress_ratio, 3),
         }

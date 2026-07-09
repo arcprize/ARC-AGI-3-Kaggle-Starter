@@ -87,6 +87,8 @@ def main() -> None:
     }
     print(f"per_game_steps={json.dumps(per_game, sort_keys=True)}")
     print(f"per_game_frames={json.dumps(per_game_frames, sort_keys=True)}")
+    print(f"cognition_traces={artifact.get('cognition_traces_count', 0)}")
+    print(f"chunks_extracted={artifact.get('chunk_count', 0)}")
     print(f"output_path={output_path}")
 
 

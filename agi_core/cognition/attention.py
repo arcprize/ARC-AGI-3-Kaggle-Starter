@@ -82,6 +82,24 @@ class AttentionFocus:
             if dx > 10 or dy > 10:
                 self.reset_visitation()
         self._last_player_pos = player_pos
+        # Pre-compute goal vicinity map (Manhattan distance to nearest goal)
+        goal_dist: list[list[float]] | None = None
+        if goal_positions:
+            goal_dist = [[float('inf')] * w for _ in range(h)]
+            # For each goal, mark cells within 16-cell Manhattan radius
+            for ggx, ggy in goal_positions:
+                for dy in range(-16, 17):
+                    gy = ggy + dy
+                    if gy < 0 or gy >= h:
+                        continue
+                    for dx in range(-16 + abs(dy), 17 - abs(dy)):
+                        gx = ggx + dx
+                        if gx < 0 or gx >= w:
+                            continue
+                        d = abs(dx) + abs(dy)
+                        if d < goal_dist[gy][gx]:
+                            goal_dist[gy][gx] = d
+
         for y in range(min(h, len(board))):
             row = board[y]
             prow = pb[y] if pb is not None and y < len(pb) else None
@@ -95,12 +113,11 @@ class AttentionFocus:
                     dist = abs(x - player_pos[0]) + abs(y - player_pos[1])
                     if dist < 20:
                         s += 0.30 * (1.0 - dist / 20.0)
-                # 3. Goal vicinity (Manhattan distance)
-                for gx, gy in goal_positions:
-                    dist = abs(x - gx) + abs(y - gy)
-                    if dist < 16:
-                        s += 0.20 * (1.0 - dist / 16.0)
-                        break
+                # 3. Goal vicinity (Manhattan distance, from pre-computed map)
+                if goal_dist is not None:
+                    d = goal_dist[y][x]
+                    if d < 16:
+                        s += 0.20 * (1.0 - d / 16.0)
                 # 4. Novelty (inverse visitation)
                 vis = self._visitation_counts[y][x]
                 s += 0.15 * max(0.0, 1.0 - vis / 50.0)
