@@ -27,7 +27,7 @@ class MirrorSolver(DynamicsSolver):
     Detects whether the player entity IS the mirror (Level 2+) or controls
     a separate shape piece (Level 1). Navigates the correct entity to the
     computed reflection target position.
-    Refactored from PuzzleSystem._try_mirror_placement().
+    Handles mirror reflection puzzles (color-10 mirror, no beam).
     """
 
     dynamics = "mirror"

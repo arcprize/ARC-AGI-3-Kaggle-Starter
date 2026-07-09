@@ -52,7 +52,6 @@ class ObjectiveReduction:
         self._stable_goal: tuple[int, int] | None = None
         self._hyperon_priors: dict[str, float] = {}
         self._goal_history: list[list[tuple[int, int]]] = []
-        self._puzzle_system = None
         self._solver_selector = None
 
     def decide(self, context: ExecutiveContext) -> ActionDecision:
@@ -80,13 +79,7 @@ class ObjectiveReduction:
                 self._switch_count = sctx["switch_attempted"]
             logger.debug("solver system primary decision: %s", solver_decision.action_name)
             return solver_decision
-        # Fall back to legacy puzzle system for backward compatibility
-        puzzle_decision, pctx = self._try_puzzle_system(context, game_model)
-        if puzzle_decision is not None:
-            if pctx and pctx.get("switch_attempted", 0) > self._switch_count:
-                self._switch_count = pctx["switch_attempted"]
-            logger.debug("puzzle system primary decision: %s", puzzle_decision.action_name)
-            return puzzle_decision
+
         logger.debug(
             "game_model: player=%s goals=%s features=pd:%s gd:%s ptg:%s bt:%s",
             game_model.player_pos, game_model.goal_positions,
@@ -114,8 +107,8 @@ class ObjectiveReduction:
                 # the previous level doesn't carry over (e.g. _impassable_cells,
                 # _beam_puzzle_completed, _last_pos, etc.).
                 try:
-                    if self._puzzle_system is not None:
-                        self._puzzle_system.reset_level()
+                    if self._solver_selector is not None and self._solver_selector.active_solver is not None:
+                        self._solver_selector.active_solver.reset_level()
                 except Exception:
                     pass
         elif self._previous_model is None:
@@ -564,38 +557,6 @@ class ObjectiveReduction:
         )
         cur = plan.current_index
         plan.steps.insert(cur, switch_step)
-
-    def _try_puzzle_system(
-        self,
-        context: ExecutiveContext,
-        game_model: GameModel,
-    ) -> tuple[ActionDecision | None, dict[str, Any] | None]:
-        try:
-            from agi_core.knowledge.puzzle_system import PuzzleSystem
-            if self._puzzle_system is None:
-                memory_db = getattr(context.config, "memory_db_path", None)
-                self._puzzle_system = PuzzleSystem(memory_db_path=memory_db)
-            if self._puzzle_system.should_activate(game_model):
-                pctx: dict[str, Any] = {
-                    "non_beam_controllers": self._non_beam_controllers.copy(),
-                    "failed_directions": self._failed_directions.copy(),
-                    "stable_goal": self._stable_goal,
-                    "switch_attempted": self._switch_count,
-                    "action_priors": {},
-                    "memory_db_path": getattr(context.config, "memory_db_path", None),
-                    "beam_cells": [],
-                    "mirror_axis": game_model.features.mirror_axis,
-                    "abstract_memories": list(context.memory_bundle.abstract_memories) if context.memory_bundle and context.memory_bundle.abstract_memories else [],
-                }
-                if game_model.features.has_beam:
-                    beam_comps = [c for c in game_model.components if c.dominant_color == game_model.features.beam_color and not c.touches_border]
-                    if beam_comps:
-                        pctx["beam_cells"] = beam_comps[0].cells[:20]
-                logger.debug("delegating to hyperon puzzle system")
-                return (self._puzzle_system.decide(context, game_model, pctx), pctx)
-        except Exception:
-            logger.debug("puzzle system failed", exc_info=True)
-        return (None, None)
 
     def _try_solver_system(
         self,

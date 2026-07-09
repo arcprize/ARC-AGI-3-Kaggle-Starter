@@ -241,7 +241,7 @@ class HyperonBridge:
         self._board_policy_params_cache: dict[str, dict[str, str]] | None = None
         self._rules_loaded = False
         self._last_fact_program: str | None = None
-        self._puzzle_system: Any = None
+
         self._initialize_memory_store()
 
     def bind_game(self, game_id: str) -> None:
@@ -672,30 +672,7 @@ class HyperonBridge:
                 logger.debug("beam-solver shadow rule failed: %s", exc)
             return []
         if query_name == "puzzle-solver":
-            try:
-                from agi_core.knowledge.puzzle_system import PuzzleSystem
-                if self._puzzle_system is None:
-                    self._puzzle_system = PuzzleSystem(memory_db_path=self.memory_db_path)
-                dynamics = str(episode.get("primary_dynamics", "") or "")
-                game_model_data = {
-                    "has_beam": bool(episode.get("has_beam", False)),
-                    "board_type": str(episode.get("board_type", "")),
-                    "primary_dynamics": dynamics,
-                    "player_pos": episode.get("player_pos"),
-                    "goal_positions": episode.get("goal_positions", []),
-                    "mirror_axis": int(episode.get("mirror_axis", -1)),
-                    "has_interactive": bool(episode.get("has_interactive", False)),
-                    "has_sprites": bool(episode.get("has_sprites", False)),
-                }
-                puzzle_dynamics = {"beam", "signal", "push-pull", "multi-agent", "pattern-transform", "hybrid", "puzzle"}
-                if (game_model_data["has_beam"]
-                    or game_model_data["board_type"] in ("puzzle", "unknown")
-                    or dynamics in puzzle_dynamics
-                    or game_model_data["has_interactive"]
-                    or game_model_data["has_sprites"]):
-                    return [{"activated": True, "source": "puzzle_system"}]
-            except Exception as exc:
-                logger.debug("puzzle-solver shadow rule failed: %s", exc)
+            # Replaced by solver-select system. Always reports not activated.
             return [{"activated": False}]
         if query_name == "board-click-action-priority":
             value = self._get_board_policy_value(episode, "click-action-priority", cast=str, board_defaults={"puzzle": "high", "platformer": "low", "unknown": "medium"}, fallback="medium")

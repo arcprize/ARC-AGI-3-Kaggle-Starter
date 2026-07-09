@@ -24,7 +24,7 @@ class BeamSolver(DynamicsSolver):
 
     Detects beam entities, computes mirror targets using the beam solver,
     navigates the mirror entity, and switches entities when positioned.
-    Refactored from PuzzleSystem._handle_beam_controller().
+    Handles beam controller strategy (mirror positioning for beam puzzles).
     """
 
     dynamics = "beam"
