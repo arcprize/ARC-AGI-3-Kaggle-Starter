@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from agi_core.cuda import is_enabled as _cuda_enabled
+from agi_core.cuda.salience import compute_salience_gpu as _salience_gpu
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +85,25 @@ class AttentionFocus:
             if dx > 10 or dy > 10:
                 self.reset_visitation()
         self._last_player_pos = player_pos
-        # Pre-compute goal vicinity map (Manhattan distance to nearest goal)
+
+        # CUDA-accelerated salience (GPU path)
+        cuda_result = _salience_gpu(board, player_pos, goal_positions, prev_board=pb)
+        if cuda_result is not None:
+            self.salience.data = cuda_result
+            # Add novelty on CPU (visitation isn't GPU-resident)
+            for y in range(min(h, len(board))):
+                row = board[y]
+                for x in range(min(w, len(row))):
+                    vis = self._visitation_counts[y][x]
+                    self.salience.data[y][x] = min(1.0, self.salience.data[y][x] + 0.15 * max(0.0, 1.0 - vis / 50.0))
+            # Zero out cells not covered
+            for y in range(len(board), h):
+                for x in range(w):
+                    self.salience.data[y][x] = 0.0
+            self._prev_board = board
+            return self.salience
+
+        # CPU path (existing)
         goal_dist: list[list[float]] | None = None
         if goal_positions:
             goal_dist = [[float('inf')] * w for _ in range(h)]

@@ -45,6 +45,26 @@ class ActionDecision:
 
 
 @dataclass(slots=True)
+class AgentProposal:
+    """A proposal from a specific agent in the multi-agent system.
+    
+    Extends ActionProposal with agent metadata for consensus weighting.
+    """
+    action_name: str
+    source: str
+    confidence: float
+    reason: str
+    agent_id: str = ""
+    agent_confidence: float = 0.0
+    agent_goal_depth: int = 0
+    subgoal: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    expected_outcome: str | None = None
+    legal: bool = True
+    score: float = 0.0
+
+
+@dataclass(slots=True)
 class EpisodeRecord:
     game_id: str
     step_index: int
@@ -134,6 +154,7 @@ class ExecutiveContext:
     chunk_library: Any = None
     attention: Any = None
     episodic_memory: Any = None
+    multi_agent_frame_cache: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable

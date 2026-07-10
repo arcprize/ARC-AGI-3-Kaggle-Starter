@@ -1018,6 +1018,86 @@ class ExecutiveTests(unittest.TestCase):
         self.assertEqual(decision.metadata, {"x": 2, "y": 2})
         self.assertEqual(decision.subgoal, "inspect-active-board")
 
+    def test_score_floor_fallback_disallows_board_probe_during_shape_agent_mode(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ar25")
+        board = [[0, 0, 0], [0, 6, 6], [0, 6, 6]]
+        frame_signature = compute_board_signature(board)
+        observation = Observation(
+            game_id="ar25",
+            step_index=6,
+            game_state="ACTIVE",
+            levels_completed=2,
+            last_action="ACTION4",
+            legal_actions=["ACTION1", "ACTION2", "ACTION4", "ACTION5", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=frame_signature,
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": frame_signature},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.multi_agent_frame_cache = {
+            "shape_agent_mode": True,
+            "mirror_puzzle_active": True,
+            "active_shape_target": (2, 1),
+        }
+        rescored = [
+            ActionProposal("ACTION1", "symbolic", 0.10, "fallback"),
+            ActionProposal("ACTION2", "symbolic", 0.10, "fallback"),
+        ]
+        for proposal, score in zip(rescored, (-0.20, -0.22)):
+            proposal.legal = True
+            proposal.score = score
+
+        decision = self.executive._score_floor_fallback(context, rescored)
+
+        self.assertNotEqual(decision.action_name, "ACTION6")
+
+    def test_score_floor_fallback_avoids_switch_spam_when_shape_not_ready(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ar25")
+        board = [[0, 0, 0], [0, 6, 6], [0, 6, 6]]
+        frame_signature = compute_board_signature(board)
+        observation = Observation(
+            game_id="ar25",
+            step_index=7,
+            game_state="ACTIVE",
+            levels_completed=2,
+            last_action="ACTION4",
+            legal_actions=["ACTION2", "ACTION4", "ACTION5"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=frame_signature,
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": frame_signature},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.multi_agent_frame_cache = {
+            "shape_agent_mode": True,
+            "mirror_puzzle_active": True,
+            "active_shape_target": (2, 1),
+            "ready_to_switch": False,
+        }
+        rescored = [
+            ActionProposal("ACTION5", "symbolic", 0.10, "fallback"),
+            ActionProposal("ACTION4", "symbolic", 0.10, "fallback"),
+            ActionProposal("ACTION2", "symbolic", 0.10, "fallback"),
+        ]
+        for proposal, score in zip(rescored, (-0.20, -0.22, -0.24)):
+            proposal.legal = True
+            proposal.score = score
+
+        decision = self.executive._score_floor_fallback(context, rescored)
+
+        self.assertNotEqual(decision.action_name, "ACTION5")
+
     def test_repeated_board_probe_context_metadata_uses_alternate_probe_target(self) -> None:
         memory = EpisodicMemory()
         memory.bind_game("ls20")
@@ -6677,6 +6757,37 @@ class ExecutiveTests(unittest.TestCase):
 
         self.assertEqual(rescored[0].action_name, "ACTION2")
 
+    def test_critic_normalized_bundle_view_caches_action_bonus_maps(self) -> None:
+        bundle = MemoryBundle(
+            semantic_memories=[
+                {"action_name": "ACTION1", "confidence": 0.4, "score": 2.0},
+                {"action_name": "ACTION1", "confidence": 0.9, "score": 5.0},
+            ],
+            procedural_memories=[
+                {"action_name": "ACTION2", "confidence": 0.5, "score": 4.0},
+            ],
+            episodic_recalls=[
+                {"action_name": "ACTION1", "outcome": "stalled"},
+                {"action_name": "ACTION2", "outcome": "progress"},
+            ],
+            working_memory={
+                "semantic_focus_actions": ["ACTION2"],
+                "procedural_focus_actions": ["ACTION2"],
+                "recent_failures": [{"action_name": "ACTION1"}],
+                "open_failure_modes": [{"action_name": "ACTION1"}],
+                "failure_streaks": [{"action_name": "ACTION1", "count": 2}],
+            },
+        )
+
+        view = self.executive.critic._normalized_bundle_view(bundle, {})
+
+        self.assertEqual(view["semantic_memory_bonus"]["ACTION1"], 0.1)
+        self.assertEqual(view["procedural_memory_bonus"]["ACTION2"], 0.08)
+        self.assertEqual(view["episodic_recall_bonus"]["ACTION1"], -0.04)
+        self.assertEqual(view["episodic_recall_bonus"]["ACTION2"], 0.08)
+        self.assertEqual(view["working_memory_focus_bonus"]["ACTION2"], 0.08)
+        self.assertEqual(view["working_memory_failure_penalty"]["ACTION1"], 0.15)
+
     def test_critic_prefers_action6_targeting_active_board_cells(self) -> None:
         memory = EpisodicMemory()
         memory.bind_game("ls20")
@@ -7019,6 +7130,53 @@ class ExecutiveTests(unittest.TestCase):
         )
 
         self.assertEqual(rescored[0].action_name, "ACTION6")
+
+    def test_critic_caches_frame_level_board_probe_metrics(self) -> None:
+        memory = EpisodicMemory()
+        memory.bind_game("ls20")
+        board = [[0, 0, 0], [0, 5, 5], [0, 5, 5]]
+        observation = Observation(
+            game_id="ls20",
+            step_index=1,
+            game_state="NOT_FINISHED",
+            levels_completed=0,
+            last_action="ACTION6",
+            legal_actions=["ACTION3", "ACTION6"],
+            image_input=BoardImageInput(
+                board=board,
+                height=3,
+                width=3,
+                frame_signature=compute_board_signature(board),
+                source_attr="frame",
+            ),
+            derived_features={"frame_signature": "sig-critic-cache"},
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+        context.multi_agent_frame_cache = {}
+
+        self.executive.critic.rescore(
+            context,
+            [
+                ActionProposal(
+                    action_name="ACTION6",
+                    source="symbolic",
+                    confidence=0.25,
+                    reason="board probe",
+                    subgoal="inspect-active-board",
+                    metadata={"x": 2, "y": 2},
+                ),
+                ActionProposal(
+                    action_name="ACTION3",
+                    source="symbolic",
+                    confidence=0.25,
+                    reason="generic followup",
+                ),
+            ],
+        )
+
+        self.assertIn("critic_active_cell_count", context.multi_agent_frame_cache)
+        self.assertIn("critic_recent_board_probe_exit_penalty", context.multi_agent_frame_cache)
+        self.assertEqual(context.multi_agent_frame_cache["critic_active_cell_count"], 4)
 
     def test_critic_repeated_board_probe_exit_penalty_pushes_action6_below_generic_followup(self) -> None:
         memory = EpisodicMemory()

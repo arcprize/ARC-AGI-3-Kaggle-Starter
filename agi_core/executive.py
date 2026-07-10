@@ -588,6 +588,16 @@ class Executive:
 
     def _score_floor_fallback(self, context: ExecutiveContext, rescored: list) -> ActionDecision:
         candidate_actions = self._ordered_score_floor_actions(rescored)
+        frame_cache = getattr(context, "multi_agent_frame_cache", {}) or {}
+        if (
+            frame_cache.get("shape_agent_mode")
+            and not frame_cache.get("ready_to_switch")
+        ):
+            non_switch_candidates = [
+                action_name for action_name in candidate_actions if action_name != "ACTION5"
+            ]
+            if non_switch_candidates:
+                candidate_actions = non_switch_candidates
         allow_board_probe = self._should_allow_score_floor_board_probe(
             context,
             candidate_actions,
@@ -692,6 +702,13 @@ class Executive:
         context: ExecutiveContext,
         candidate_actions: list[str],
     ) -> bool:
+        frame_cache = getattr(context, "multi_agent_frame_cache", {}) or {}
+        if (
+            frame_cache.get("shape_agent_mode")
+            or frame_cache.get("mirror_puzzle_active")
+            or frame_cache.get("active_shape_target")
+        ):
+            return False
         if "ACTION6" not in context.observation.legal_actions:
             return False
         if active_cell_count(context.observation.image_input) <= 0:

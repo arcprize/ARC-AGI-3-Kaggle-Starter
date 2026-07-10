@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from agi_core.orch_or.analyzer import build_game_model, _extract_features
 from agi_core.orch_or.game_model import (
@@ -112,6 +114,38 @@ class GameModelTests(unittest.TestCase):
     def test_plan_step_custom_tolerance(self) -> None:
         step = PlanStep(action="click", params=None, source="test", preconditions=frozenset(), expected_effect="x", tolerance=5)
         self.assertEqual(step.tolerance, 5)
+
+
+class BackgroundPrecomputeTests(unittest.TestCase):
+    def test_background_precompute_uses_thread_pool_for_small_search_spaces(self) -> None:
+        orchestrator = ObjectiveReduction(
+            executive=SimpleNamespace(),
+            config=SimpleNamespace(),
+        )
+        submitted: list[str] = []
+
+        def _thread_submit(fn, *args, **kwargs):
+            submitted.append("thread")
+            return SimpleNamespace()
+
+        def _process_submit(fn, *args, **kwargs):
+            submitted.append("process")
+            return SimpleNamespace()
+
+        snap = (
+            (0, 0),
+            [(3, 0), (4, 0)],
+            {(x, 0) for x in range(5)},
+            5,
+            1,
+        )
+        with patch("agi_core.orch_or.parallel.ThreadPoolManager.submit", side_effect=_thread_submit), patch(
+            "agi_core.orch_or.parallel.ProcessPoolManager.submit",
+            side_effect=_process_submit,
+        ):
+            orchestrator._do_background_precompute(snap)
+
+        self.assertEqual(submitted, ["thread", "thread"])
 
 
 # ---------------------------------------------------------------------------
@@ -951,6 +985,31 @@ class ThreadPoolManagerTests(unittest.TestCase):
         results = ThreadPoolManager.run_all([(slow, "slow"), (fast, "fast")], timeout=0.01)
         result_map = {name: val for val, name in results}
         self.assertEqual(result_map.get("fast"), 1)
+
+    def test_run_all_timeout_keeps_running_tasks_tracked(self) -> None:
+        import time
+        import threading
+        ThreadPoolManager.set_max_workers(1)
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow():
+            started.set()
+            release.wait(timeout=1.0)
+            return 99
+
+        try:
+            results = ThreadPoolManager.run_all([(slow, "slow")], timeout=0.01)
+            self.assertEqual(results, [])
+            self.assertTrue(started.wait(timeout=0.2))
+            self.assertEqual(ThreadPoolManager.active_worker_count(), 1)
+        finally:
+            release.set()
+            for _ in range(20):
+                if ThreadPoolManager.active_worker_count() == 0:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(ThreadPoolManager.active_worker_count(), 0)
 
 
 class ParallelPlanGeneratorTests(unittest.TestCase):

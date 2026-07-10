@@ -38,7 +38,8 @@ class ThreadPoolManager:
     def _resolve_workers(cls) -> int:
         if cls._max_workers <= 0:
             try:
-                return min(4, cpu_count() or 1)
+                cpus = cpu_count() or 1
+                return max(2, min(8, cpus))  # scale with CPU count up to 8
             except Exception:
                 return 2
         return cls._max_workers
@@ -87,6 +88,23 @@ class ThreadPoolManager:
             cls._pending_names.pop(f, None)
 
     @classmethod
+    def _cancel_pending_future(cls, future: Future) -> bool:
+        """Attempt to cancel a pending future.
+
+        Returns True when the future is no longer active and has been removed
+        from tracking. Returns False when the work is still running.
+        """
+        if future.done():
+            cls._pending_futures.discard(future)
+            cls._pending_names.pop(future, None)
+            return True
+        if future.cancel():
+            cls._pending_futures.discard(future)
+            cls._pending_names.pop(future, None)
+            return True
+        return False
+
+    @classmethod
     def run_all(
         cls,
         tasks: list[tuple[Callable[[], Any], str]],
@@ -124,13 +142,23 @@ class ThreadPoolManager:
             except Exception as exc:
                 logger.debug("task %s failed: %s", name, exc)
                 results.append((None, name))
+        if logger.isEnabledFor(logging.DEBUG) and len(futures) > 1:
+            finished = len(results)
+            logger.debug("run_all: %d/%d tasks done (%s)", finished, len(futures),
+                         ", ".join(r[1] if r[0] is not None else f"{r[1]}:FAIL" for r in results))
 
-        # Let remaining finish in background; results collected next cycle.
+        # Cancel remaining futures when possible; keep running work tracked so
+        # health checks still see stale tasks that survived the timeout.
         remaining = set(futures.keys()) - done_set
-        if remaining:
-            logger.debug("run_all: %d tasks pending (%s); next cycle",
-                         len(remaining),
-                         [futures[f] for f in remaining])
+        cancelled = 0
+        for f in remaining:
+            if cls._cancel_pending_future(f):
+                cancelled += 1
+        if cancelled:
+            logger.debug("run_all: %d tasks cancelled after timeout", cancelled)
+        running = len(remaining) - cancelled
+        if running:
+            logger.debug("run_all: %d tasks still running after timeout", running)
         return results
 
     @classmethod
@@ -159,13 +187,12 @@ class ThreadPoolManager:
                 results.append((None, name))
 
         for f in set(futures.keys()) - done:
-            f.cancel()
-            cls._pending_futures.discard(f)
-            cls._pending_names.pop(f, None)
+            cls._cancel_pending_future(f)
         return results
 
     @classmethod
-    def submit(cls, fn, *args, **kwargs):
+    def submit(cls, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+        """Submit a task and track it in pending futures."""
         f = cls.executor().submit(fn, *args, **kwargs)
         cls._pending_futures.add(f)
         return f
@@ -188,6 +215,8 @@ class ProcessPoolManager:
     _instance: ProcessPoolExecutor | None = None
     _lock: Lock = Lock()
     _max_workers: int = 0
+    _pending_futures: set[Future] = set()
+    _pending_names: dict[Future, str] = {}
 
     _atexit_registered = False
 
@@ -227,10 +256,26 @@ class ProcessPoolManager:
         if inst is not None:
             inst.shutdown(wait=False)
             cls._instance = None
+        cls._pending_futures.clear()
+        cls._pending_names.clear()
 
     @classmethod
-    def submit(cls, fn, *args, **kwargs):
-        return cls.executor().submit(fn, *args, **kwargs)
+    def _cancel_pending_future(cls, future: Future) -> bool:
+        if future.done():
+            cls._pending_futures.discard(future)
+            cls._pending_names.pop(future, None)
+            return True
+        if future.cancel():
+            cls._pending_futures.discard(future)
+            cls._pending_names.pop(future, None)
+            return True
+        return False
+
+    @classmethod
+    def submit(cls, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+        f = cls.executor().submit(fn, *args, **kwargs)
+        cls._pending_futures.add(f)
+        return f
 
     @classmethod
     def run_all(
@@ -245,6 +290,8 @@ class ProcessPoolManager:
         for fn, name in tasks:
             f = exec.submit(fn)
             futures[f] = name
+        cls._pending_futures.update(futures.keys())
+        cls._pending_names.update(futures)
         done_set = set()
         if timeout is not None and timeout > 0:
             try:
@@ -258,11 +305,17 @@ class ProcessPoolManager:
         results: list[tuple[Any, str]] = []
         for f in done_set:
             name = futures[f]
+            cls._pending_futures.discard(f)
+            cls._pending_names.pop(f, None)
             try:
                 results.append((f.result(), name))
             except Exception as exc:
                 logger.debug("process task %s failed: %s", name, exc)
                 results.append((None, name))
+        # Cancel remaining futures
+        remaining = set(futures.keys()) - done_set
+        for f in remaining:
+            cls._cancel_pending_future(f)
         return results
 
     @classmethod
@@ -274,7 +327,19 @@ class ProcessPoolManager:
 # Sync both pool worker counts from the same env var.
 # ---------------------------------------------------------------------------
 
-def sync_pool_worker_counts(n: int) -> None:
-    """Set the same worker count on both thread and process pools."""
-    ThreadPoolManager.set_max_workers(n)
+def sync_pool_worker_counts(n: int, thread_workers: int = -1) -> None:
+    """Set worker counts for both thread and process pools.
+    
+    Args:
+        n: Worker count for the process pool (CPU-bound). 0 = auto-resolve.
+        thread_workers: Worker count for the thread pool (I/O-bound).
+            -1 (default) = auto-resolve (max(2, min(8, cpu_count))).
+            0 = same as ``n``.
+    """
     ProcessPoolManager.set_max_workers(n)
+    if thread_workers == -1:
+        ThreadPoolManager.set_max_workers(0)  # auto-resolve
+    elif thread_workers == 0:
+        ThreadPoolManager.set_max_workers(n)
+    else:
+        ThreadPoolManager.set_max_workers(thread_workers)

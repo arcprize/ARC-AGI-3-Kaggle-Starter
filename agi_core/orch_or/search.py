@@ -18,6 +18,10 @@ _PROCESS_POOL_THRESHOLD = 5000
 path_cache: dict[tuple[tuple[int, int], tuple[int, int]], Future] = {}
 
 
+def should_use_process_pool(passable_count: int) -> bool:
+    return int(passable_count) > _PROCESS_POOL_THRESHOLD
+
+
 def astar(
     start: tuple[int, int],
     goal: tuple[int, int],
@@ -39,7 +43,7 @@ def astar(
         except Exception:
             pass
     # Large search spaces → process pool for true CPU parallelism.
-    if len(passable) > _PROCESS_POOL_THRESHOLD:
+    if should_use_process_pool(len(passable)):
         try:
             from agi_core.orch_or.parallel import ProcessPoolManager
             f = ProcessPoolManager.submit(

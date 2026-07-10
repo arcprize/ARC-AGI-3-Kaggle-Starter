@@ -34,6 +34,13 @@ _BEAM_COLOR_KEY = "orch_or_beam_controller_color"
 _LEVEL_JUMP_THRESHOLD = 35
 
 
+def _gameplay_memory_db_path(config: Any) -> Any:
+    helper = getattr(config, "gameplay_memory_db_path", None)
+    if callable(helper):
+        return helper()
+    return getattr(config, "memory_db_path", None)
+
+
 class ObjectiveReduction:
     _MAX_REGENERATE = 3
 
@@ -68,15 +75,24 @@ class ObjectiveReduction:
         ThreadPoolManager.submit(self._do_background_precompute, snap)
 
     def _do_background_precompute(self, snap: tuple) -> None:
-        """Runs in a thread: submits A* to process pool for each goal."""
-        from agi_core.orch_or.parallel import ProcessPoolManager
-        from agi_core.orch_or.search import path_cache, _astar_impl
+        """Runs in a thread: precomputes A* futures using the cheapest pool.
+
+        Small AR25-sized boards are faster on threads because spawning Windows
+        process-pool workers costs more than the search itself.
+        """
+        from agi_core.orch_or.parallel import ProcessPoolManager, ThreadPoolManager
+        from agi_core.orch_or.search import path_cache, _astar_impl, should_use_process_pool
         player, goals, walkable, width, height = snap
         if player is None or not goals or not walkable:
             return
+        submit = (
+            ProcessPoolManager.submit
+            if should_use_process_pool(len(walkable))
+            else ThreadPoolManager.submit
+        )
         for g in goals:
             key = (player, g)
-            f = ProcessPoolManager.submit(
+            f = submit(
                 _astar_impl, player, g, set(walkable), width, height,
             )
             path_cache[key] = f
@@ -242,6 +258,7 @@ class ObjectiveReduction:
                 beam_cells = beam_comps[0].cells
         plan_context: dict[str, Any] = {
             "game_step": context.observation.step_index,
+            "levels_completed": getattr(context.observation, "levels_completed", 0),
             "switch_attempted": self._switch_count,
             "non_beam_controllers": self._non_beam_controllers.copy(),
             "failed_directions": self._failed_directions.copy(),
@@ -270,7 +287,7 @@ class ObjectiveReduction:
             "goal_history": list(self._goal_history),
             "beam_cells": beam_cells[:20],
             "mirror_axis": game_model.features.mirror_axis,
-            "memory_db_path": context.config.memory_db_path,
+            "memory_db_path": _gameplay_memory_db_path(context.config),
         }
         # Override game model features with hyperon-informed values.
         try:
@@ -463,7 +480,7 @@ class ObjectiveReduction:
             "goal_history": list(self._goal_history),
             "beam_cells": beam_cells_pctx,
             "mirror_axis": game_model.features.mirror_axis,
-            "memory_db_path": getattr(context.config, "memory_db_path", None),
+            "memory_db_path": _gameplay_memory_db_path(context.config),
             "recent_actions": list(getattr(context.memory, '_recent_actions', []) or []),
             "goal_count": len(game_model.goal_positions) if game_model else 0,
             "episodic_memory": getattr(context, 'episodic_memory', None),
@@ -603,7 +620,7 @@ class ObjectiveReduction:
         try:
             from agi_core.knowledge.solver_selector import SolverSelector
             if self._solver_selector is None:
-                memory_db = getattr(context.config, "memory_db_path", None)
+                memory_db = _gameplay_memory_db_path(context.config)
                 self._solver_selector = SolverSelector(
                     context.hyperon, memory_db_path=memory_db,
                 )
@@ -615,7 +632,7 @@ class ObjectiveReduction:
                     "stable_goal": self._stable_goal,
                     "switch_attempted": self._switch_count,
                     "action_priors": {},
-                    "memory_db_path": getattr(context.config, "memory_db_path", None),
+                    "memory_db_path": _gameplay_memory_db_path(context.config),
                     "beam_cells": [],
                     "mirror_axis": game_model.features.mirror_axis,
                     "goal_history": list(self._goal_history),

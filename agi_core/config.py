@@ -66,6 +66,26 @@ class RuntimeConfig:
     planner_parallel: bool = True
     planner_workers: int = 0  # 0 = auto: thread pool = min(4, cpu), process pool = min(8, cpu)
     planner_parallel_timeout: float | None = None
+    multi_agent_enabled: bool = True
+    multi_agent_workers: int = 4
+    gameplay_disk_io_enabled: bool = False
+    cuda_enabled: bool = True
+    cuda_device: int = 0
+
+    def gameplay_memory_db_path(self) -> Path | None:
+        if not self.gameplay_disk_io_enabled:
+            return None
+        return self.memory_db_path
+
+    def gameplay_archive_memory_db_path(self) -> Path | None:
+        if not self.gameplay_disk_io_enabled:
+            return None
+        return self.archive_memory_db_path
+
+    def gameplay_trained_priors_db_path(self) -> Path | None:
+        if not self.gameplay_disk_io_enabled:
+            return None
+        return self.trained_priors_db_path
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "RuntimeConfig":
@@ -178,6 +198,14 @@ class RuntimeConfig:
                 if env.get("AGI_PLANNER_PARALLEL_TIMEOUT", "").strip()
                 else None
             ),
+            multi_agent_enabled=env.get("AGI_MULTI_AGENT_ENABLE", "1").strip().lower()
+            in {"1", "true", "yes", "on"},
+            multi_agent_workers=int(env.get("AGI_MULTI_AGENT_WORKERS", "4")),
+            gameplay_disk_io_enabled=env.get("AGI_GAMEPLAY_DISK_IO", "0").strip().lower()
+            in {"1", "true", "yes", "on"},
+            cuda_enabled=env.get("AGI_CUDA_ENABLE", "1").strip().lower()
+            in {"1", "true", "yes", "on"},
+            cuda_device=int(env.get("AGI_CUDA_DEVICE", "0")),
         )
 
 

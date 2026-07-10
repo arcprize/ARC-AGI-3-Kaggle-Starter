@@ -61,9 +61,9 @@ class MyAgent(Agent):
         hyperon = HyperonBridge(
             rules_path=config.hyperon_rules_path,
             learning_path=config.hyperon_learning_path,
-            memory_db_path=config.memory_db_path,
-            archive_memory_db_path=config.archive_memory_db_path,
-            trained_priors_db_path=config.trained_priors_db_path,
+            memory_db_path=config.gameplay_memory_db_path(),
+            archive_memory_db_path=config.gameplay_archive_memory_db_path(),
+            trained_priors_db_path=config.gameplay_trained_priors_db_path(),
             project_root=config.project_root,
             reset_state_names=config.reset_state_names,
             win_state_name=config.win_state_name,
@@ -74,17 +74,27 @@ class MyAgent(Agent):
         llm_backend = build_llm_backend(config) if config.llm_enabled else None
         from agi_core.orch_or.parallel import ProcessPoolManager, ThreadPoolManager, sync_pool_worker_counts
         sync_pool_worker_counts(config.planner_workers)
-        # Pre-warm the in-memory SQLite cache so all subsequent reads hit RAM.
-        from agi_core.storage.memory_cache import get_cache
-        for _db in (config.memory_db_path, config.archive_memory_db_path, config.trained_priors_db_path):
-            if _db:
-                get_cache(_db)
+        # Pre-warm SQLite caches only when live gameplay explicitly allows disk I/O.
+        if config.gameplay_disk_io_enabled:
+            from agi_core.storage.memory_cache import get_cache
+            for _db in (
+                config.gameplay_memory_db_path(),
+                config.gameplay_archive_memory_db_path(),
+                config.gameplay_trained_priors_db_path(),
+            ):
+                if _db:
+                    get_cache(_db)
         # Pre-warm both pools so worker threads/processes exist before first frame.
         ThreadPoolManager.executor()
         try:
             ProcessPoolManager.executor()
         except Exception:
             pass
+        # Initialise CUDA if enabled
+        if config.cuda_enabled:
+            from agi_core.cuda import init_cuda
+            init_cuda(config.cuda_device)
+
         # Human-like cognition modules
         from agi_core.cognition import (
             AttentionFocus, ChunkLibrary, ConsolidatedMemory,
@@ -112,11 +122,20 @@ class MyAgent(Agent):
             meta_cognition=self._meta_cognition,
             chunk_library=self._chunk_library,
         )
-        executive = (
-            ObjectiveReduction(executive=base_executive, config=config)
-            if config.planner_enabled
-            else base_executive
-        )
+        if config.multi_agent_enabled:
+            from agi_core.multi_agent import AgentSupervisor as _Sup
+            from agi_core.multi_agent.agents import (
+                ExplorationAgent, InteractionAgent,
+                MovementAgent, PuzzleAgent,
+            )
+            _agents = [MovementAgent(), ExplorationAgent(), InteractionAgent(), PuzzleAgent()]
+            executive = _Sup(executive=base_executive, config=config, agents=_agents)
+        else:
+            executive = (
+                ObjectiveReduction(executive=base_executive, config=config)
+                if config.planner_enabled
+                else base_executive
+            )
         self.runtime = ExecutiveRuntime(
             adapter=adapter,
             executive=executive,
@@ -157,6 +176,9 @@ class MyAgent(Agent):
                 last = em.last_episode()
                 if last is not None:
                     cl.extract(last.action_sequence, last.dynamics, last.goal_count, "win")
+            # Reset multi-agent cognition for next game
+            if hasattr(self.runtime.executive, 'reset_agents'):
+                self.runtime.executive.reset_agents()
             return True
         return False
 
@@ -251,6 +273,16 @@ class MyAgent(Agent):
         )
 
     def _format_debug_target(self, metadata: dict[str, Any]) -> str:
+        target_anchor = metadata.get("target_anchor")
+        if isinstance(target_anchor, (list, tuple)) and len(target_anchor) == 2:
+            try:
+                stage = metadata.get("shape_stage")
+                return (
+                    f" meta[target_anchor={int(target_anchor[0])},{int(target_anchor[1])}"
+                    f" stage={int(stage) if stage is not None else '-'}]"
+                )
+            except (TypeError, ValueError):
+                pass
         if "x" not in metadata or "y" not in metadata:
             return ""
         try:

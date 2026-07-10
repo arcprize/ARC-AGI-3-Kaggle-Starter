@@ -18,6 +18,12 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.openai_api_key_env, "OPENAI_API_KEY")
         self.assertIsNone(config.openai_base_url)
         self.assertIsNone(config.openai_timeout_seconds)
+        self.assertTrue(config.multi_agent_enabled)
+        self.assertFalse(config.gameplay_disk_io_enabled)
+        self.assertIsNone(config.gameplay_memory_db_path())
+        self.assertIsNone(config.gameplay_archive_memory_db_path())
+        self.assertIsNone(config.gameplay_trained_priors_db_path())
+        self.assertTrue(config.cuda_enabled)
 
     def test_from_env_keeps_memory_and_prior_databases_separate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -79,6 +85,33 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.openai_model, "gpt-4.1")
         self.assertEqual(config.openai_base_url, "https://example.invalid/v1")
         self.assertEqual(config.openai_timeout_seconds, 17.5)
+
+    def test_from_env_can_enable_gameplay_disk_io(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env = {
+                "AGI_GAMEPLAY_DISK_IO": "1",
+                "AGI_MEMORY_DB_PATH": "var/live-memory.sqlite3",
+                "AGI_ARCHIVE_MEMORY_DB_PATH": "var/archive-memory.sqlite3",
+                "AGI_TRAINED_PRIORS_DB_PATH": "var/offline-priors.sqlite3",
+            }
+
+            with patch.dict("os.environ", env, clear=True):
+                config = RuntimeConfig.from_env(project_root=root)
+
+        self.assertTrue(config.gameplay_disk_io_enabled)
+        self.assertEqual(
+            config.gameplay_memory_db_path(),
+            root / "var" / "live-memory.sqlite3",
+        )
+        self.assertEqual(
+            config.gameplay_archive_memory_db_path(),
+            root / "var" / "archive-memory.sqlite3",
+        )
+        self.assertEqual(
+            config.gameplay_trained_priors_db_path(),
+            root / "var" / "offline-priors.sqlite3",
+        )
 
 
 if __name__ == "__main__":

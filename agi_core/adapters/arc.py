@@ -8,6 +8,7 @@ from agi_core.image_input import (
     extract_board_image_input,
     preferred_board_probe_action,
 )
+from agi_core.perception.shape_recognition import ensure_shape_recognition
 from agi_core.types import ActionDecision, Observation
 
 
@@ -43,6 +44,20 @@ class ArcAdapter:
         image_input = extract_board_image_input(latest_frame)
         self._last_image_input = image_input
         default_probe = default_click_target(image_input) if image_input is not None else {}
+        derived_features = {
+            "frame_count": len(frames),
+            "legal_actions": list(legal_actions),
+            "legal_actions_known": legal_actions_known,
+            "step_index_reliable": step_index_reliable,
+            "frame_signature": image_input.frame_signature if image_input is not None else None,
+            "board_height": image_input.height if image_input is not None else 0,
+            "board_width": image_input.width if image_input is not None else 0,
+            "board_active_cells": active_cell_count(image_input),
+            "board_default_probe": default_probe,
+            "board_source_attr": image_input.source_attr if image_input is not None else None,
+            "has_image_input": image_input is not None,
+        }
+        shape_recognition = ensure_shape_recognition(image_input, derived_features)
         return Observation(
             game_id=self._game_id or str(self._get_attr(latest_frame, "game_id", "")),
             step_index=step_index,
@@ -57,17 +72,15 @@ class ArcAdapter:
             image_input=image_input,
             raw_frame_ref=latest_frame,
             derived_features={
-                "frame_count": len(frames),
-                "legal_actions": list(legal_actions),
-                "legal_actions_known": legal_actions_known,
-                "step_index_reliable": step_index_reliable,
-                "frame_signature": image_input.frame_signature if image_input is not None else None,
-                "board_height": image_input.height if image_input is not None else 0,
-                "board_width": image_input.width if image_input is not None else 0,
-                "board_active_cells": active_cell_count(image_input),
-                "board_default_probe": default_probe,
-                "board_source_attr": image_input.source_attr if image_input is not None else None,
-                "has_image_input": image_input is not None,
+                **derived_features,
+                "player_position": tuple(shape_recognition.get("active_anchor") or ()) or None,
+                "goal_positions": [
+                    tuple(cluster.get("center", ()))
+                    for cluster in shape_recognition.get("goal_clusters", [])
+                    if cluster.get("center")
+                ],
+                "has_mirror": bool(shape_recognition.get("mirror", {}).get("present")),
+                "has_beam": any(4 in row for row in image_input.board) if image_input is not None else False,
             },
         )
 
