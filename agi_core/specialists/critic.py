@@ -166,6 +166,19 @@ class ProposalCritic:
                     score += 0.18
                 score -= recent_probe_exit
             score += self._shape_target_bias(context, proposal)
+            # Perception confidence weighting
+            if game_state not in context.config.reset_state_names:
+                pc = float(getattr(observation, "perception_confidence", 1.0))
+                if pc < 0.4:
+                    score -= 0.12
+                elif pc > 0.9:
+                    score += 0.06
+                # Dynamics-specific: solver proposals weighed by dynamics confidence
+                if proposal.source in ("solver:mirror", "solver:beam", "solver:navigation"):
+                    dyn_conf = observation.derived_features.get("dynamics_confidence", {})
+                    source_dyn = proposal.source.split(":")[-1]
+                    dc = float(dyn_conf.get(source_dyn, 0.5))
+                    score *= 0.5 + 0.5 * dc
             proposal.score = round(max(-1.0, min(score, 1.50)), 4)
             rescored.append(proposal)
         rescored.sort(

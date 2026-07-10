@@ -9,6 +9,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import patch
 
 from agi_core.orch_or.analyzer import build_game_model, _detect_grid_scale
 from agi_core.orch_or.game_model import GameModel
@@ -22,7 +23,7 @@ from agi_core.knowledge.solvers.mirror_solver import (
     _horizontal_small_goal_target,
     _is_interior_shape_piece,
 )
-from agi_core.perception.shape_recognition import recognize_shape_recognition
+from agi_core.perception.shape_recognition import ensure_shape_recognition, recognize_shape_recognition
 from agi_core.image_input import BoardImageInput
 from agi_core.knowledge.solvers.navigation_solver import NavigationSolver
 from agi_core.knowledge.solvers.noop_solver import NoopSolver
@@ -2938,6 +2939,123 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         self.assertEqual(decision.action_name, "ACTION5")
         self.assertEqual(decision.reason, "mirror_switch_next_shape")
 
+    def test_mirror_solver_prefers_visible_shape_count_over_stale_cached_count(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+
+        gm = game_ar25_level2()
+        solver = MirrorSolver()
+        solver._mirror_is_horizontal = True
+        solver._switch_count = 1
+        solver._max_shape_count_seen = 2
+        mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
+        mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
+        mirror_gy = mirror_py // gm.features.grid_scale
+        goal_cells = [
+            cell
+            for comp in gm.components
+            if comp.dominant_color == 11
+            and comp.size <= 100
+            and any(cx < gm.width - 1 for cx, _ in comp.cells)
+            for cell in comp.cells
+        ]
+        min_gpy = min(cy for _, cy in goal_cells)
+        max_gpy = max(cy for _, cy in goal_cells)
+        min_ggy = min_gpy // gm.features.grid_scale
+        max_ggy = max_gpy // gm.features.grid_scale
+        min_gpx = min(cx for cx, _ in goal_cells)
+        max_gpx = max(cx for cx, _ in goal_cells)
+        min_ggx = min_gpx // gm.features.grid_scale
+        max_ggx = max_gpx // gm.features.grid_scale
+        shape_comps = [c for c in gm.components if _is_interior_shape_piece(c, gm)]
+        self.assertEqual(len(shape_comps), 1)
+        target_gx = (min_ggx + max_ggx) // 2
+        target_gy = 2 * mirror_gy - min_ggy
+        target = (
+            max(0, min(gm.width - 1, target_gx * gm.features.grid_scale + 1)),
+            max(0, min(gm.height - 1, target_gy * gm.features.grid_scale + 1)),
+        )
+        ctx = SolverContext(game_model=gm, plan_context={})
+
+        decision = solver._navigate_shape(
+            gm,
+            ctx,
+            target,
+            mirror_comp.bbox[0] // gm.features.grid_scale,
+            mirror_gy,
+            mirror_py,
+            gm.features.grid_scale,
+            min_ggx,
+            max_ggx,
+            min_ggy,
+            max_ggy,
+            shape_comps=shape_comps,
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action_name, "ACTION6")
+        self.assertEqual(decision.reason, "mirror_placed_wait")
+        self.assertEqual(solver._switch_count, 1)
+
+    def test_mirror_solver_honors_single_stage_vertical_artifact_target(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+
+        gm = game_ar25_level1()
+        solver = MirrorSolver()
+        solver._mirror_is_horizontal = False
+        solver._switch_count = 1
+        mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
+        mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
+        mirror_gx = mirror_comp.bbox[0] // gm.features.grid_scale
+        goal_cells = [
+            cell
+            for comp in gm.components
+            if comp.dominant_color == 11
+            and comp.size <= 100
+            and any(cx < gm.width - 1 for cx, _ in comp.cells)
+            for cell in comp.cells
+        ]
+        min_gpy = min(cy for _, cy in goal_cells)
+        max_gpy = max(cy for _, cy in goal_cells)
+        min_ggy = min_gpy // gm.features.grid_scale
+        max_ggy = max_gpy // gm.features.grid_scale
+        min_gpx = min(cx for cx, _ in goal_cells)
+        max_gpx = max(cx for cx, _ in goal_cells)
+        min_ggx = min_gpx // gm.features.grid_scale
+        max_ggx = max_gpx // gm.features.grid_scale
+        shape_comps = [c for c in gm.components if _is_interior_shape_piece(c, gm)]
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "shape_recognition": {
+                    "mirror_puzzle": {
+                        "active": True,
+                        "stage_targets": [
+                            {"switch_stage": 1, "entity_id": "shape-1", "target_anchor": [13, 46]}
+                        ],
+                    }
+                }
+            },
+        )
+
+        decision = solver._navigate_shape(
+            gm,
+            ctx,
+            (10, 46),
+            mirror_gx,
+            mirror_py // gm.features.grid_scale,
+            mirror_py,
+            gm.features.grid_scale,
+            min_ggx,
+            max_ggx,
+            min_ggy,
+            max_ggy,
+            shape_comps=shape_comps,
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action_name, "ACTION4")
+        self.assertEqual(decision.reason, "mirror_placement_right")
+
     def test_mirror_solver_clears_failed_directions_on_horizontal_switch(self) -> None:
         from agi_core.knowledge.solvers import SolverContext
 
@@ -3025,6 +3143,260 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         self.assertTrue(mirror_puzzle["active"])
         self.assertGreaterEqual(len(mirror_puzzle["stage_targets"]), 1)
         self.assertTrue(all(stage["fresh_hits"] > 0 for stage in mirror_puzzle["stage_targets"]))
+
+    def test_shape_recognition_active_anchor_matches_active_entity(self) -> None:
+        from agi_core.perception.shape_recognition import _ColorComponent
+
+        board = [[9] * 8 for _ in range(8)]
+        image_input = BoardImageInput(
+            board=board,
+            height=8,
+            width=8,
+            frame_signature="anchor-order",
+            source_attr="test",
+        )
+        inactive = _ColorComponent(
+            color=5,
+            cells=[(5, 5), (6, 5), (5, 6), (6, 6)],
+            bbox=(5, 5, 6, 6),
+            center=(5, 5),
+            touches_border=False,
+        )
+        active = _ColorComponent(
+            color=0,
+            cells=[(1, 1), (2, 1), (1, 2), (2, 2)],
+            bbox=(1, 1, 2, 2),
+            center=(1, 1),
+            touches_border=False,
+        )
+
+        with patch(
+            "agi_core.perception.shape_recognition._color_components",
+            return_value=[inactive, active],
+        ):
+            artifact = recognize_shape_recognition(image_input)
+
+        active_entity_id = artifact["active_shape_entity_id"]
+        active_entity = next(
+            entity for entity in artifact["shape_entities"] if entity["entity_id"] == active_entity_id
+        )
+        self.assertEqual(artifact["active_anchor"], active_entity["center"])
+
+    def test_shape_recognition_player_hint_selects_nearest_shape_without_overlay(self) -> None:
+        from agi_core.perception.shape_recognition import _ColorComponent
+
+        board = [[9] * 8 for _ in range(8)]
+        image_input = BoardImageInput(
+            board=board,
+            height=8,
+            width=8,
+            frame_signature="player-hint",
+            source_attr="test",
+        )
+        farther = _ColorComponent(
+            color=5,
+            cells=[(1, 1), (2, 1), (1, 2), (2, 2)],
+            bbox=(1, 1, 2, 2),
+            center=(1, 1),
+            touches_border=False,
+        )
+        nearer = _ColorComponent(
+            color=5,
+            cells=[(5, 5), (6, 5), (5, 6), (6, 6)],
+            bbox=(5, 5, 6, 6),
+            center=(5, 5),
+            touches_border=False,
+        )
+
+        with patch(
+            "agi_core.perception.shape_recognition._color_components",
+            return_value=[farther, nearer],
+        ):
+            artifact = ensure_shape_recognition(
+                image_input,
+                {
+                    "player_position": (6, 5),
+                },
+            )
+
+        self.assertEqual(artifact["active_anchor"], [5, 5])
+
+    def test_shape_recognition_background_matches_analyzer_detector(self) -> None:
+        board = [[9] * 64 for _ in range(64)]
+        for y in range(64):
+            board[y][63] = 11
+        board[63][63] = 5
+
+        artifact = recognize_shape_recognition(
+            BoardImageInput(
+                board=board,
+                height=64,
+                width=64,
+                frame_signature="background-consistency",
+                source_attr="test",
+            )
+        )
+
+        self.assertEqual(artifact["background_color"], 9)
+
+    def test_shape_recognition_excludes_background_from_components(self) -> None:
+        board = [[9] * 6 for _ in range(6)]
+        board[1][1] = 0
+        board[1][2] = 0
+        board[2][1] = 0
+        board[2][2] = 0
+
+        artifact = recognize_shape_recognition(
+            BoardImageInput(
+                board=board,
+                height=6,
+                width=6,
+                frame_signature="no-background-component",
+                source_attr="test",
+            )
+        )
+
+        self.assertEqual([component["color"] for component in artifact["components"]], [0])
+
+    def test_shape_recognition_excludes_border_goal_ui_clusters(self) -> None:
+        board = [[9] * 6 for _ in range(6)]
+        for y in range(6):
+            board[y][5] = 11
+        board[2][2] = 0
+        board[2][3] = 0
+        board[3][2] = 0
+        board[3][3] = 0
+
+        artifact = recognize_shape_recognition(
+            BoardImageInput(
+                board=board,
+                height=6,
+                width=6,
+                frame_signature="border-goal-ui",
+                source_attr="test",
+            )
+        )
+
+        self.assertEqual(artifact["goal_clusters"], [])
+
+    def test_shape_recognition_cache_refreshes_when_frame_signature_changes(self) -> None:
+        features: dict[str, Any] = {}
+        board_a = [[9] * 4 for _ in range(4)]
+        board_a[1][1] = 0
+        board_a[1][2] = 0
+        board_a[2][1] = 0
+        board_a[2][2] = 0
+        board_b = [[9] * 4 for _ in range(4)]
+        board_b[0][1] = 0
+        board_b[0][2] = 0
+        board_b[1][1] = 0
+        board_b[1][2] = 0
+
+        artifact_a = ensure_shape_recognition(
+            BoardImageInput(
+                board=board_a,
+                height=4,
+                width=4,
+                frame_signature="frame-a",
+                source_attr="test",
+            ),
+            features,
+        )
+        artifact_b = ensure_shape_recognition(
+            BoardImageInput(
+                board=board_b,
+                height=4,
+                width=4,
+                frame_signature="frame-b",
+                source_attr="test",
+            ),
+            features,
+        )
+
+        self.assertEqual(artifact_a["frame_signature"], "frame-a")
+        self.assertEqual(artifact_b["frame_signature"], "frame-b")
+        self.assertNotEqual(artifact_a["active_anchor"], artifact_b["active_anchor"])
+
+    def test_shape_recognition_cache_refreshes_when_player_hint_changes(self) -> None:
+        from agi_core.perception.shape_recognition import _ColorComponent
+
+        image_input = BoardImageInput(
+            board=[[9] * 8 for _ in range(8)],
+            height=8,
+            width=8,
+            frame_signature="same-frame",
+            source_attr="test",
+        )
+        farther = _ColorComponent(
+            color=5,
+            cells=[(1, 1), (2, 1), (1, 2), (2, 2)],
+            bbox=(1, 1, 2, 2),
+            center=(1, 1),
+            touches_border=False,
+        )
+        nearer = _ColorComponent(
+            color=5,
+            cells=[(5, 5), (6, 5), (5, 6), (6, 6)],
+            bbox=(5, 5, 6, 6),
+            center=(5, 5),
+            touches_border=False,
+        )
+        features: dict[str, Any] = {"player_position": (1, 1)}
+
+        with patch(
+            "agi_core.perception.shape_recognition._color_components",
+            return_value=[farther, nearer],
+        ):
+            artifact_a = ensure_shape_recognition(image_input, features)
+            features["player_position"] = (6, 5)
+            artifact_b = ensure_shape_recognition(image_input, features)
+
+        self.assertEqual(artifact_a["active_anchor"], [1, 1])
+        self.assertEqual(artifact_b["active_anchor"], [5, 5])
+
+    def test_shape_recognition_marks_mirror_puzzle_inactive_without_stage_targets(self) -> None:
+        from agi_core.perception.shape_recognition import _ColorComponent
+
+        board = [[9] * 8 for _ in range(8)]
+        image_input = BoardImageInput(
+            board=board,
+            height=8,
+            width=8,
+            frame_signature="no-stage-targets",
+            source_attr="test",
+        )
+        mirror = _ColorComponent(
+            color=10,
+            cells=[(3, y) for y in range(1, 7)],
+            bbox=(3, 1, 3, 6),
+            center=(3, 3),
+            touches_border=False,
+        )
+        shape = _ColorComponent(
+            color=0,
+            cells=[(1, 1), (1, 2), (2, 1), (2, 2)],
+            bbox=(1, 1, 2, 2),
+            center=(1, 1),
+            touches_border=False,
+        )
+        goal = _ColorComponent(
+            color=11,
+            cells=[(5, 5)],
+            bbox=(5, 5, 5, 5),
+            center=(5, 5),
+            touches_border=False,
+        )
+        with patch(
+            "agi_core.perception.shape_recognition._color_components",
+            return_value=[mirror, shape, goal],
+        ), patch(
+            "agi_core.perception.shape_recognition._best_reflection_placement",
+            return_value=None,
+        ):
+            artifact = recognize_shape_recognition(image_input)
+
+        self.assertFalse(artifact["mirror_puzzle"]["active"])
+        self.assertEqual(artifact["mirror_puzzle"]["stage_targets"], [])
 
     def test_mirror_solver_final_horizontal_shape_requires_exact_arrival(self) -> None:
         from agi_core.knowledge.solvers import SolverContext
@@ -3266,6 +3638,83 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         self.assertEqual(decision.action_name, "ACTION5")
         self.assertEqual(decision.reason, "mirror_switch_target_jump")
         self.assertEqual(solver._switch_count, 2)
+
+    def test_mirror_solver_level3_full_flow(self) -> None:
+        """End-to-end: MirrorSolver handles horizontal mirror with 2 shape pieces."""
+        from agi_core.knowledge.solvers import SolverContext
+
+        gm = game_ar25_level3()
+        solver = MirrorSolver()
+        solver._mirror_is_horizontal = True
+        solver._max_shape_count_seen = 2
+        mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
+        mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
+        mirror_gy = mirror_py // gm.features.grid_scale
+        goal_cells = [
+            cell
+            for comp in gm.components
+            if comp.dominant_color == 11
+            and any(cx < gm.width - 1 for cx, _ in comp.cells)
+            for cell in comp.cells
+        ]
+        min_gpy = min(cy for _, cy in goal_cells)
+        max_gpy = max(cy for _, cy in goal_cells)
+        min_ggy = min_gpy // gm.features.grid_scale
+        max_ggy = max_gpy // gm.features.grid_scale
+        min_gpx = min(cx for cx, _ in goal_cells)
+        max_gpx = max(cx for cx, _ in goal_cells)
+        min_ggx = min_gpx // gm.features.grid_scale
+        max_ggx = max_gpx // gm.features.grid_scale
+        shape_comps = [c for c in gm.components if _is_interior_shape_piece(c, gm)]
+        ctx = SolverContext(game_model=gm, plan_context={})
+        gs = gm.features.grid_scale
+
+        # Phase 1: First shape piece navigation (_switch_count=1)
+        solver._switch_count = 1
+        decision = solver._navigate_shape(
+            gm, ctx, (25, 58), mirror_comp.bbox[0] // gs,
+            mirror_gy, mirror_py, gs,
+            min_ggx, max_ggx, min_ggy, max_ggy, shape_comps,
+        )
+        self.assertIsNotNone(decision)
+        self.assertIn(decision.action_name,
+                      ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"],
+                      "Phase 1: Should navigate or switch")
+
+        # Phase 2: Second shape piece navigation (_switch_count=2)
+        solver._switch_count = 2
+        decision = solver._navigate_shape(
+            gm, ctx, (20, 36), mirror_comp.bbox[0] // gs,
+            mirror_gy, mirror_py, gs,
+            min_ggx, max_ggx, min_ggy, max_ggy, shape_comps=[],
+        )
+        self.assertIsNotNone(decision)
+        self.assertNotEqual(decision.action_name, "ACTION6",
+                            "Phase 2: Not at final position yet")
+
+        # Phase 3: Small goal target for second shape
+        small_target = _horizontal_small_goal_target(gm, mirror_py, switch_count=2, gs=gs)
+        self.assertIsNotNone(small_target)
+        target_x, target_y = small_target
+
+        # Phase 4: Second shape at exact target should return ACTION6 (done)
+        solver._switch_count = 2
+        decision = solver._navigate_shape(
+            gm, ctx, (target_x, target_y),
+            mirror_comp.bbox[0] // gs,
+            mirror_gy, mirror_py, gs,
+            min_ggx, max_ggx, min_ggy, max_ggy, shape_comps=[],
+        )
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action_name, "ACTION6",
+                         "Phase 4: At final position, should wait")
+
+        # Phase 5: Verify entity discovery in movement strategy
+        from agi_core.orch_or.strategies.movement import movement_strategy
+        steps = movement_strategy(gm)
+        self.assertTrue(len(steps) > 0, "Phase 5: Movement strategy should produce steps")
+        # On the synthetic board, the player is on color-0 (shape pieces)
+        # so entity discovery should NOT trigger (player IS on color-0)
 
 # ---------------------------------------------------------------------------
 

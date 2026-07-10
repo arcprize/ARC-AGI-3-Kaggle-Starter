@@ -51,7 +51,9 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
             goal_direction = "ACTION4" if gx > px else "ACTION3"
         else:
             goal_direction = "ACTION2" if gy > py else "ACTION1"
-    has_beam = bool(features.get("has_beam"))
+    analyzer_perception_failed = bool(features.get("analyzer_perception_failed"))
+    has_beam_value = features.get("has_beam")
+    has_beam = bool(has_beam_value) if has_beam_value is not None and not analyzer_perception_failed else False
     has_mirror = bool(shape_recognition.get("mirror", {}).get("present"))
     target_distance = None
     ready_to_switch = False
@@ -62,9 +64,13 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
         ready_to_switch = dx <= 1 and dy <= 1
     image = getattr(observation, "image_input", None)
     board = getattr(image, "board", None)
+    beam_visible = False
+    beam_evidence_uncertain = False
     if board:
-        if not has_beam:
+        beam_visible = any(4 in row for row in board)
+        if has_beam_value is None and not analyzer_perception_failed:
             has_beam = any(4 in row for row in board)
+        beam_evidence_uncertain = analyzer_perception_failed and beam_visible
         if not has_mirror:
             has_mirror = any(10 in row for row in board)
     shape_agent_mode = bool(mirror_puzzle.get("active")) and active_target is not None and int(getattr(observation, "levels_completed", 0) or 0) >= 2
@@ -73,6 +79,8 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
             "legal_actions": legal_actions,
             "legal_set": legal_set,
             "has_beam": has_beam,
+            "beam_visible": beam_visible,
+            "beam_evidence_uncertain": beam_evidence_uncertain,
             "has_mirror": has_mirror,
             "goal_direction": goal_direction,
             "shape_recognition": shape_recognition,
@@ -91,6 +99,11 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
 def _has_beam(context: ExecutiveContext) -> bool:
     """Check if the current board has beam (color 4)."""
     return bool(prepare_frame_cache(context).get("has_beam"))
+
+
+def _has_uncertain_beam(context: ExecutiveContext) -> bool:
+    """Check for visible beam evidence when analyzer confirmation failed."""
+    return bool(prepare_frame_cache(context).get("beam_evidence_uncertain"))
 
 
 def _has_mirror(context: ExecutiveContext) -> bool:
@@ -238,11 +251,14 @@ class ExplorationAgent(StrategyAgent):
         # Only propose switch if no mirror present (PuzzleAgent handles mirror cases)
         if has_switch and not has_mirror:
             has_beam_now = _has_beam(context)
-            switch_conf = 0.65 if has_beam_now else 0.55
+            has_uncertain_beam = _has_uncertain_beam(context)
+            switch_conf = 0.65 if has_beam_now else 0.6 if has_uncertain_beam else 0.55
             proposals.append(
                 self._make_proposal(
                     action_name="ACTION5", confidence=switch_conf,
-                    reason="exploration:switch" + ("+beam" if has_beam_now else ""),
+                    reason="exploration:switch" + (
+                        "+beam" if has_beam_now else "+beam-uncertain" if has_uncertain_beam else ""
+                    ),
                     subgoal="try-switch",
                 )
             )
@@ -327,6 +343,7 @@ class PuzzleAgent(StrategyAgent):
         legal = cache["legal_set"]
         proposals = []
         has_beam = _has_beam(context)
+        has_uncertain_beam = _has_uncertain_beam(context)
         has_mirror = _has_mirror(context)
         target_metadata = _target_metadata(context)
         if cache.get("shape_agent_mode") and target_metadata:
@@ -354,7 +371,7 @@ class PuzzleAgent(StrategyAgent):
                     )
             return proposals
         # When beam or mirror present, prioritise switches and strategic movement
-        if has_beam or has_mirror:
+        if has_beam or has_mirror or has_uncertain_beam:
             # Propose ALL relevant actions (not just the first match)
             for action in ("ACTION5", "ACTION4", "ACTION2", "ACTION1", "ACTION3"):
                 if action in legal:
@@ -362,7 +379,9 @@ class PuzzleAgent(StrategyAgent):
                     proposals.append(
                         self._make_proposal(
                             action_name=action, confidence=conf,
-                            reason=f"puzzle:{action}" + ("+beam" if has_beam else "+mirror"),
+                            reason=f"puzzle:{action}" + (
+                                "+beam" if has_beam else "+beam-uncertain" if has_uncertain_beam else "+mirror"
+                            ),
                             subgoal="solve-puzzle",
                         )
                     )

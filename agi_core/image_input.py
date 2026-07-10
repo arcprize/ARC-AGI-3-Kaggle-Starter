@@ -141,7 +141,85 @@ def extract_board_motif_tags(
         and int(next_levels_completed) > int(levels_completed)
     ):
         tags.add("post_progress_new_level")
+
+    # ── Spatial and colour-presence tags ──────────────────────────────
+
+    # Colour presence (fast pixel scan)
+    if any(10 in row for row in board):
+        tags.add("mirror_present")
+    beam_present, beam_evidence_uncertain = _beam_presence_state(board)
+    if beam_present:
+        tags.add("beam_present")
+    elif beam_evidence_uncertain:
+        tags.add("beam_evidence_uncertain")
+
+    # Component spatial analysis
+    if components:
+        all_cells = [cell for comp in components for cell in comp]
+        xs = [x for x, _ in all_cells]
+        ys = [y for _, y in all_cells]
+
+        # Strip layouts
+        bw = max(board_width, 1)
+        bh = max(board_height, 1)
+        if max(xs) - min(xs) < bw * 0.2 and max(ys) - min(ys) > bh * 0.5:
+            tags.add("components_vertical_strip")
+        if max(ys) - min(ys) < bh * 0.2 and max(xs) - min(xs) > bw * 0.5:
+            tags.add("components_horizontal_strip")
+
+        # Player isolation: only one non-trivial component
+        if len(components) <= 2:
+            tags.add("player_isolated")
+
+        # Large central component (> 30 % board area)
+        for comp in components:
+            cx1 = min(c[0] for c in comp)
+            cx2 = max(c[0] for c in comp)
+            cy1 = min(c[1] for c in comp)
+            cy2 = max(c[1] for c in comp)
+            cw = cx2 - cx1 + 1
+            ch = cy2 - cy1 + 1
+            if cw * ch >= 0.30 * bw * bh:
+                tags.add("large_central_component")
+                break
+
+        # Active cells near board edge
+        for x, y in all_cells:
+            if x < 3 or x >= board_width - 3 or y < 3 or y >= board_height - 3:
+                tags.add("active_at_edge")
+                break
+
+        # Goal cells in corner regions
+        for comp in components:
+            color = board[comp[0][1]][comp[0][0]] if comp else -1
+            if color == 11:
+                for x, y in comp:
+                    in_corner = (
+                        (x < 8 and y < 8)
+                        or (x < 8 and y >= board_height - 8)
+                        or (x >= board_width - 8 and y < 8)
+                        or (x >= board_width - 8 and y >= board_height - 8)
+                    )
+                    if in_corner:
+                        tags.add("goals_in_corner")
+                        break
+                else:
+                    continue
+                break
+
     return sorted(tags)
+
+
+def _beam_presence_state(board: list[list[int]]) -> tuple[bool, bool]:
+    if not board:
+        return False, False
+    if not any(4 in row for row in board):
+        return False, False
+    try:
+        from agi_core.orch_or.analyzer import build_game_model
+        return bool(build_game_model(board).features.has_beam), False
+    except Exception:
+        return False, True
 
 
 def default_click_target(image_input: BoardImageInput | None) -> dict[str, int]:

@@ -39,7 +39,7 @@ def interaction_strategy(game_model: GameModel, context: dict | None = None) -> 
                 steps.append(_switch_step())
     non_beam = ctx.get("non_beam_controllers", set())
     switch_count = int(ctx.get("switch_attempted", 0))
-    if (switch_count < 2
+    if (switch_count < 3
             and game_model.features.has_beam
             and game_model.features.goals_lit_by_beam > 0
             and game_model.features.player_color >= 0

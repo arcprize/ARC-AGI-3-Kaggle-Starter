@@ -6,6 +6,43 @@ from typing import Any
 from agi_core.cuda import is_enabled as _cuda_enabled
 from agi_core.cuda.salience import compute_salience_gpu as _salience_gpu
 
+
+def _compute_board_motion(
+    prev_board: list[list[int]] | None,
+    curr_board: list[list[int]] | None,
+) -> tuple[int, int]:
+    """Compute aggregate board-level motion (dx, dy) between two frames.
+
+    Compares centroids of active (non-zero) cells.  Returns (0, 0) when
+    either board is unavailable or has no active cells.
+    """
+    if not prev_board or not curr_board:
+        return (0, 0)
+    h = min(len(prev_board), len(curr_board))
+    if h == 0:
+        return (0, 0)
+    w = min(len(prev_board[0]), len(curr_board[0]))
+    if w == 0:
+        return (0, 0)
+    prev_sx = prev_sy = prev_n = 0
+    curr_sx = curr_sy = curr_n = 0
+    for y in range(h):
+        prow = prev_board[y]
+        crow = curr_board[y]
+        for x in range(w):
+            if prow[x] != 0:
+                prev_sx += x
+                prev_sy += y
+                prev_n += 1
+            if crow[x] != 0:
+                curr_sx += x
+                curr_sy += y
+                curr_n += 1
+    if prev_n == 0 or curr_n == 0:
+        return (0, 0)
+    return (curr_sx // curr_n - prev_sx // prev_n,
+            curr_sy // curr_n - prev_sy // prev_n)
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,6 +96,7 @@ class AttentionFocus:
             [0] * width for _ in range(height)
         ]
         self._last_player_pos: tuple[int, int] | None = None
+        self.board_motion: tuple[int, int] = (0, 0)
 
     def compute(
         self,
@@ -85,6 +123,9 @@ class AttentionFocus:
             if dx > 10 or dy > 10:
                 self.reset_visitation()
         self._last_player_pos = player_pos
+
+        # Compute board-level optical flow
+        self.board_motion = _compute_board_motion(pb, board)
 
         # CUDA-accelerated salience (GPU path)
         cuda_result = _salience_gpu(board, player_pos, goal_positions, prev_board=pb)
@@ -165,6 +206,10 @@ class AttentionFocus:
                     self._visitation_counts[y][x] = min(
                         50, self._visitation_counts[y][x] + 1,
                     )
+
+    def is_relevant(self, x: int, y: int) -> bool:
+        """Alias for ``salience.is_relevant`` — used by ``build_game_model``."""
+        return self.salience.is_relevant(x, y)
 
     def novelty_bonus(self, x: int, y: int) -> float:
         """Return a novelty bonus [0, 0.2] for under-visited cells.

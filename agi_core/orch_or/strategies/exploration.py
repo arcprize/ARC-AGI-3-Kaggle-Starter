@@ -94,7 +94,7 @@ def exploration_strategy(game_model: GameModel, context: dict | None = None) -> 
                 mirror_dir = _mirror_axis_direction(game_model)
                 if mirror_dir is None:
                     switch_count = int(ctx.get("switch_attempted", 0))
-                    if (switch_count < 2
+                    if (switch_count < 3
                             and features.player_color >= 0
                             and features.player_color not in non_beam
                             and any(

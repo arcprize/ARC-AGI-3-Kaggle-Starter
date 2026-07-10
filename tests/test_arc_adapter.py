@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from dataclasses import dataclass
 from enum import Enum
+from unittest.mock import patch
 
 from agi_core.adapters.arc import ArcAdapter
 from agi_core.image_input import compute_board_signature
@@ -54,7 +55,7 @@ class ArcAdapterTests(unittest.TestCase):
         )
 
     def test_observe_normalizes_frame_state_and_actions(self) -> None:
-        board = [[1, 2], [3, 4]]
+        board = [[1, 2], [3, 8]]
         frame = StubFrame(
             state=StubGameState.ACTIVE,
             levels_completed=3,
@@ -260,6 +261,64 @@ class ArcAdapterTests(unittest.TestCase):
         assert observation.image_input is not None
         self.assertEqual(observation.image_input.board, board)
         self.assertEqual(observation.image_input.source_attr, "grid")
+
+    def test_observe_uses_analyzer_beam_detection_not_raw_color4_presence(self) -> None:
+        board = [[9] * 8 for _ in range(8)]
+        for y in range(8):
+            board[y][3] = 10
+        for y in (4, 5):
+            for x in (1, 2):
+                board[y][x] = 5
+        for y in (4, 5):
+            board[y][5] = 4
+            board[y][6] = 4
+        frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=[StubGameAction.ACTION1],
+            frame=[board],
+        )
+
+        observation = self.adapter.observe([frame], frame)
+
+        self.assertFalse(observation.derived_features["has_beam"])
+
+    def test_observe_surfaces_analyzer_perception_failure(self) -> None:
+        board = [[1, 2], [3, 8]]
+        frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=[StubGameAction.ACTION1],
+            frame=[board],
+        )
+
+        with patch("agi_core.adapters.arc.build_game_model", side_effect=RuntimeError("boom")):
+            observation = self.adapter.observe([frame], frame)
+
+        self.assertTrue(observation.derived_features["analyzer_perception_failed"])
+        self.assertEqual(
+            observation.derived_features["analyzer_perception_error"],
+            "RuntimeError: boom",
+        )
+        self.assertIsNone(observation.derived_features["player_position"])
+        self.assertEqual(observation.derived_features["goal_positions"], [])
+        self.assertFalse(observation.derived_features["has_beam"])
+        self.assertFalse(observation.derived_features["beam_visible"])
+        self.assertFalse(observation.derived_features["beam_evidence_uncertain"])
+
+    def test_observe_surfaces_uncertain_beam_evidence_on_analyzer_failure(self) -> None:
+        board = [[9, 4], [3, 4]]
+        frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=[StubGameAction.ACTION1],
+            frame=[board],
+        )
+
+        with patch("agi_core.adapters.arc.build_game_model", side_effect=RuntimeError("boom")):
+            observation = self.adapter.observe([frame], frame)
+
+        self.assertTrue(observation.derived_features["analyzer_perception_failed"])
+        self.assertFalse(observation.derived_features["has_beam"])
+        self.assertTrue(observation.derived_features["beam_visible"])
+        self.assertTrue(observation.derived_features["beam_evidence_uncertain"])
 
     def test_observe_leaves_image_input_empty_when_board_missing(self) -> None:
         frame = StubFrame(

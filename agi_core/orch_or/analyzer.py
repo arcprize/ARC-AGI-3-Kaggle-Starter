@@ -1,18 +1,85 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+from typing import Any
 
-from agi_core.orch_or.game_model import Component, DynamicsCategory, GameFeatures, GameModel, SpriteInfo
+from agi_core.cognition.attention import SalienceMap
+from agi_core.orch_or.game_model import Component, DynamicsCategory, EntityTrack, GameFeatures, GameModel, SpriteInfo
 from agi_core.orch_or.search import astar
+
+
+def _apply_salience_weights(
+    components: list[Component],
+    attention: object | None,
+) -> None:
+    """Reduce component confidence in low-salience regions.
+
+    Components far from the player, goals, and motion get lower confidence,
+    making the system less likely to mistake noise for real entities.
+    """
+    if not components or attention is None:
+        return
+    salience: SalienceMap | None = None
+    if hasattr(attention, "salience"):
+        salience = attention.salience
+    elif isinstance(attention, SalienceMap):
+        salience = attention
+    if salience is None:
+        return
+    for comp in components:
+        cx = (comp.bbox[0] + comp.bbox[2]) // 2
+        cy = (comp.bbox[1] + comp.bbox[3]) // 2
+        s = salience.get(cx, cy)
+        if s < 0.05:
+            comp.confidence *= 0.2
+        elif s < 0.15:
+            comp.confidence *= 0.5
+        elif s < 0.30:
+            comp.confidence *= 0.8
+
+
+try:
+    from agi_core.cuda import detect_components_gpu as _detect_components_gpu
+    from agi_core.cuda import detect_grid_scale_gpu as _detect_grid_scale_gpu
+    from agi_core.perception.gpu_perception import gpu_perceive as _gpu_perceive
+    _CUDA_COMPONENTS_AVAILABLE = True
+except ImportError:
+    _CUDA_COMPONENTS_AVAILABLE = False
 
 _PLATFORMER_THRESHOLD = 5
 
 
-def build_game_model(board: list[list[int]], attention=None) -> GameModel:
+def build_game_model(
+    board: list[list[int]],
+    attention=None,
+    tracker: Any = None,
+    inferred_mechanics: dict | None = None,
+) -> GameModel:
     height = len(board)
     width = len(board[0]) if height > 0 else 0
     bg_color = _detect_background_color(board, width, height)
-    # Phase 1: parallel detection — components, grid scale, color frequencies all independent
+
+    # Try unified GPU perception pipeline first
+    if _CUDA_COMPONENTS_AVAILABLE:
+        gpu_result = _gpu_perceive(board, bg_color=bg_color)
+        if gpu_result is not None:
+            raw_components = gpu_result.analyzer_components
+            grid_scale = gpu_result.grid_scale
+            color_freq = gpu_result.color_frequencies
+            # Skip Phase 1 — already done on GPU
+            components = _merge_nearby_same_color(raw_components)
+            _apply_salience_weights(components, attention)
+            player_pos = _find_player(components, height, color_freq)
+            goal_positions = _find_goals(components, player_pos, board, color_freq)
+            obstacles = _find_obstacles(components, player_pos, goal_positions)
+            # Phase 2 (CPU — depends on Phase 1)
+            return _build_game_model_phase2(
+                board, width, height, bg_color, components, player_pos,
+                goal_positions, obstacles, grid_scale, attention,
+                tracker=tracker, inferred_mechanics=inferred_mechanics,
+            )
+
+    # Phase 1: parallel detection — components, grid scale, color frequencies
     try:
         from agi_core.orch_or.parallel import ThreadPoolManager
         pool = ThreadPoolManager.executor()
@@ -28,13 +95,29 @@ def build_game_model(board: list[list[int]], attention=None) -> GameModel:
         color_freq = _compute_color_frequencies(board, bg_color)
 
     components = _merge_nearby_same_color(raw_components)
+    _apply_salience_weights(components, attention)
     player_pos = _find_player(components, height, color_freq)
     goal_positions = _find_goals(components, player_pos, board, color_freq)
     obstacles = _find_obstacles(components, player_pos, goal_positions)
 
-    # Phase 2: walkable + sprites + tile_size are independent — run in parallel
-    # Use attention salience to skip low-salience regions in walkable scan.
+    return _build_game_model_phase2(
+        board, width, height, bg_color, components, player_pos,
+        goal_positions, obstacles, grid_scale, attention,
+        tracker=tracker, inferred_mechanics=inferred_mechanics,
+    )
+
+
+def _build_game_model_phase2(
+    board, width, height, bg_color,
+    components, player_pos, goal_positions, obstacles,
+    grid_scale, attention=None, tracker=None,
+    inferred_mechanics: dict | None = None,
+) -> GameModel:
+    """Phase 2 of ``build_game_model`` — walkable, sprites, tile_size.
+    Separated so the unified GPU pipeline can call it directly.
+    """
     try:
+        from agi_core.orch_or.parallel import ThreadPoolManager
         pool = ThreadPoolManager.executor()
         walk_future = pool.submit(
             _find_walkable, board, width, height, bg_color, obstacles,
@@ -63,12 +146,25 @@ def build_game_model(board: list[list[int]], attention=None) -> GameModel:
             sprites = []
         tile_size = _detect_tile_size(board, width, height, bg_color)
 
-    features = _extract_features(board, width, height, bg_color, components, player_pos, goal_positions, walkable)
-    features.tile_size = tile_size
+    # Update entity tracker if provided (must happen before _extract_features
+    # so temporal_stats are available for dynamics detection).
+    entity_tracks: list[EntityTrack] = []
+    if tracker is not None:
+        from agi_core.orch_or.tracker import EntityTracker
+        if isinstance(tracker, EntityTracker):
+            entity_tracks = tracker.update(components)
+
+    features = _extract_features(
+        board, width, height, bg_color, components, player_pos,
+        goal_positions, walkable, tile_size=tile_size,
+        entity_tracks=entity_tracks, attention=attention,
+        inferred_mechanics=inferred_mechanics,
+    )
     features.grid_scale = grid_scale
     if grid_scale > 1:
         features.grid_width = width // grid_scale
         features.grid_height = height // grid_scale
+
     return GameModel(
         board=board,
         height=height,
@@ -80,6 +176,7 @@ def build_game_model(board: list[list[int]], attention=None) -> GameModel:
         walkable=walkable,
         features=features,
         sprites=sprites,
+        entity_tracks=entity_tracks,
     )
 
 
@@ -107,6 +204,225 @@ def _detect_background_color(board: list[list[int]], width: int, height: int) ->
     return counts.most_common(1)[0][0]
 
 
+# ── Perception confidence helpers ──────────────────────────────────────
+
+
+def _component_confidence(
+    comp: Component,
+    total_pixels: int,
+    color_freq: dict[int, int],
+) -> float:
+    """Confidence [0, 1] that a component is a real game element."""
+    score = 1.0
+    if comp.size < 3:
+        score -= 0.2
+    elif comp.size > 500:
+        score -= 0.3
+    if comp.touches_border:
+        score -= 0.1
+    freq = color_freq.get(comp.dominant_color, 0)
+    rarity = 1.0 - min(1.0, freq / max(1, total_pixels))
+    score *= 0.5 + 0.5 * rarity
+    x1, y1, x2, y2 = comp.bbox
+    w = x2 - x1 + 1
+    h = y2 - y1 + 1
+    if w * h > 0:
+        area_ratio = comp.size / (w * h)
+        if area_ratio < 0.5:
+            score -= 0.15
+    return max(0.1, min(1.0, score))
+
+
+def _player_confidence(
+    player_pos: tuple[int, int] | None,
+    components: list[Component],
+) -> float:
+    """Confidence [0, 1] in the detected player position."""
+    if player_pos is None:
+        return 0.0
+    comp = _find_player_component(components, player_pos)
+    if comp is None:
+        return 0.3
+    if comp.dominant_color == 0:
+        return 0.95
+    if comp.dominant_color == 5:
+        return 0.70
+    return 0.50
+
+
+def _goal_confidence(
+    goal_pos: tuple[int, int],
+    board: list[list[int]],
+) -> float:
+    """Confidence [0, 1] that a position is a real goal."""
+    x, y = goal_pos
+    if not (0 <= y < len(board) and 0 <= x < len(board[0])):
+        return 0.0
+    color = board[y][x]
+    if color == 11:
+        return 0.90
+    if color == 4:
+        return 0.60
+    if color == 0:
+        return 0.40
+    return 0.30
+
+
+def _dynamics_confidence(
+    dynamics_list: list[str],
+    components: list[Component],
+    goal_positions: list[tuple[int, int]],
+    has_beam: bool,
+    has_player: bool,
+) -> dict[str, float]:
+    """Compute confidence scores for each detected dynamics category.
+    Returns a dict mapping dynamics string → evidence strength [0, 1]."""
+    scores: dict[str, float] = {}
+    if not has_player or not goal_positions:
+        if dynamics_list:
+            scores[dynamics_list[0]] = 0.5
+        return scores
+    for d in dynamics_list:
+        if d == "puzzle":
+            mirror_comp = next((c for c in components if c.dominant_color == 10), None)
+            if mirror_comp is not None:
+                scores[d] = min(1.0, mirror_comp.size / 60.0 + 0.3)
+            else:
+                scores[d] = 0.2
+        elif d == "beam":
+            scores[d] = 0.8 if has_beam else 0.2
+        elif d == "multi-agent":
+            entities = [c for c in components if not c.touches_border and 4 <= c.size <= 100]
+            scores[d] = min(1.0, max(0, len(entities) - 1) * 0.3 + 0.2)
+        elif d == "navigation":
+            scores[d] = 0.5
+        elif d == "gravity":
+            scores[d] = 0.4
+        elif d == "sliding":
+            scores[d] = 0.4
+        elif d == "push-pull":
+            scores[d] = 0.4
+        elif d == "signal":
+            scores[d] = 0.4
+        elif d == "inventory":
+            scores[d] = 0.3
+        else:
+            scores[d] = 0.3
+    if not scores:
+        scores["navigation"] = 0.5
+    total = sum(scores.values()) or 1.0
+    return {k: v / total for k, v in scores.items()}
+
+
+def _compute_temporal_stats(
+    entity_tracks: list[EntityTrack],
+    player_pos: tuple[int, int] | None,
+    attention: object | None = None,
+    inferred_mechanics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract aggregate temporal statistics from entity tracks and optical flow."""
+    stats: dict[str, Any] = {
+        "any_moved": False,
+        "moving_count": 0,
+        "player_velocity": (0, 0),
+        "player_stationary_streak": 0,
+        "downward_motion": False,
+        "horizontal_motion": False,
+        "board_motion": (0, 0),
+        "inferred_mechanics": inferred_mechanics or {},
+    }
+    if not entity_tracks:
+        return stats
+
+    moving = [t for t in entity_tracks if t.moved_this_frame]
+    stats["any_moved"] = bool(moving)
+    stats["moving_count"] = len(moving)
+
+    if player_pos is not None and entity_tracks:
+        px, py = player_pos
+        player_track = min(
+            entity_tracks,
+            key=lambda t: (
+                abs(t.positions[-1][0] - px) + abs(t.positions[-1][1] - py)
+                if t.positions else 9999
+            ),
+        )
+        stats["player_velocity"] = player_track.velocity
+        stats["player_stationary_streak"] = player_track.stationary_streak
+        vx, vy = player_track.velocity
+        stats["downward_motion"] = vy > 1
+        stats["horizontal_motion"] = vx != 0 and vy == 0
+
+    # Board-level optical flow from attention system
+    if attention is not None and hasattr(attention, 'board_motion'):
+        stats["board_motion"] = attention.board_motion
+        bvx, bvy = attention.board_motion
+        if bvy > 0:
+            stats["downward_motion"] = True
+        if bvx != 0 and bvy == 0:
+            stats["horizontal_motion"] = True
+
+    return stats
+
+
+def _component_confidence_simple(
+    cells: list[tuple[int, int]],
+    min_x: int, min_y: int, max_x: int, max_y: int,
+    total_pixels: int,
+    touches_border: bool | None = None,
+) -> float:
+    """Basic confidence without colour frequency data."""
+    score = 1.0
+    size = len(cells)
+    if size < 3:
+        score -= 0.2
+    elif size > 500:
+        score -= 0.3
+    border_touch = touches_border
+    if border_touch is None:
+        border_touch = min_x == 0 or min_y == 0
+    if border_touch:
+        score -= 0.1
+    w = max_x - min_x + 1
+    h = max_y - min_y + 1
+    if w * h > 0 and size / (w * h) < 0.5:
+        score -= 0.15
+    return max(0.1, min(1.0, score))
+
+
+def _components_from_gpu(
+    gpu_result: dict,
+    bg_color: int,
+    total_pixels: int,
+    color_freq: dict[int, int] | None = None,
+) -> list[Component]:
+    """Build Component list from GPU detection results with confidence."""
+    result: list[Component] = []
+    for entry in gpu_result["components"]:
+        if entry["color"] == bg_color or entry["color"] < 0:
+            continue
+        cells = entry["cells"]
+        bbox = entry["bbox"]
+        size = entry["size"]
+        comp = Component(
+            cells=cells,
+            bbox=bbox,
+            size=size,
+            dominant_color=entry["color"],
+            touches_border=entry["touches_border"],
+            confidence=_component_confidence_simple(
+                cells, bbox[0], bbox[1], bbox[2], bbox[3], total_pixels,
+                touches_border=entry["touches_border"],
+            ),
+        )
+        if color_freq:
+            freq = color_freq.get(comp.dominant_color, 0)
+            rarity = 1.0 - min(1.0, freq / max(1, total_pixels))
+            comp.confidence *= 0.5 + 0.5 * rarity
+            comp.confidence = max(0.1, min(1.0, comp.confidence))
+        result.append(comp)
+    return result
+
 
 _GOAL_COLOR_CANDIDATES: set[int] = {11}
 _PLATFORMER_COMPONENT_THRESHOLD: int = 5
@@ -114,7 +430,16 @@ _PLATFORMER_COMPONENT_THRESHOLD: int = 5
 
 def _find_components(
     board: list[list[int]], width: int, height: int, bg_color: int,
+    color_freq: dict[int, int] | None = None,
 ) -> list[Component]:
+    total_pixels = width * height
+    # Try GPU-accelerated path first
+    if _CUDA_COMPONENTS_AVAILABLE:
+        gpu_result = _detect_components_gpu(board, bg_color=bg_color)
+        if gpu_result is not None:
+            return _components_from_gpu(gpu_result, bg_color, total_pixels, color_freq)
+
+    # CPU fallback
     visited: set[tuple[int, int]] = set()
     components: list[Component] = []
     for y in range(height):
@@ -145,17 +470,28 @@ def _find_components(
                             queue.append((nx, ny))
             touches_border = (min_x == 0 or min_y == 0 or max_x == width - 1 or max_y == height - 1)
             dominant_color = val
-            components.append(Component(
+            comp = Component(
                 cells=cells,
                 bbox=(min_x, min_y, max_x, max_y),
                 size=len(cells),
                 dominant_color=dominant_color,
                 touches_border=touches_border,
-            ))
+                confidence=_component_confidence_simple(
+                    cells, min_x, min_y, max_x, max_y, total_pixels,
+                    touches_border=touches_border,
+                ),
+            )
+            components.append(comp)
     return components
 
 
 def _compute_color_frequencies(board: list[list[int]], bg_color: int) -> dict[int, int]:
+    # Try GPU-accelerated path first for colour frequencies
+    if _CUDA_COMPONENTS_AVAILABLE:
+        gpu_result = _detect_components_gpu(board, bg_color=bg_color)
+        if gpu_result is not None:
+            return gpu_result["color_frequencies"]
+    # CPU fallback
     freq: dict[int, int] = {}
     for row in board:
         for v in row:
@@ -178,28 +514,43 @@ def _merge_nearby_same_color(components: list[Component]) -> list[Component]:
         if len(group) <= 1:
             result.extend(group)
             continue
+        centers = [
+            (
+                sum(p[0] for p in comp.cells) // len(comp.cells),
+                sum(p[1] for p in comp.cells) // len(comp.cells),
+            )
+            for comp in group
+        ]
         merged = []
         used = [False] * len(group)
         for i in range(len(group)):
             if used[i]:
                 continue
-            cxi = sum(p[0] for p in group[i].cells) // len(group[i].cells)
-            cyi = sum(p[1] for p in group[i].cells) // len(group[i].cells)
-            merged_cells = set(group[i].cells)
+            merged_indices: list[int] = []
+            frontier = [i]
             used[i] = True
-            for j in range(i + 1, len(group)):
-                if used[j]:
-                    continue
-                cxj = sum(p[0] for p in group[j].cells) // len(group[j].cells)
-                cyj = sum(p[1] for p in group[j].cells) // len(group[j].cells)
-                if abs(cxi - cxj) + abs(cyi - cyj) <= threshold:
-                    merged_cells.update(group[j].cells)
-                    used[j] = True
+            while frontier:
+                current = frontier.pop()
+                merged_indices.append(current)
+                ccx, ccy = centers[current]
+                for j in range(len(group)):
+                    if used[j]:
+                        continue
+                    cxj, cyj = centers[j]
+                    if abs(ccx - cxj) + abs(ccy - cyj) <= threshold:
+                        used[j] = True
+                        frontier.append(j)
+            merged_cells: set[tuple[int, int]] = set()
+            for member_index in merged_indices:
+                merged_cells.update(group[member_index].cells)
             cells = sorted(merged_cells)
             min_x = min(x for x, y in cells)
             min_y = min(y for x, y in cells)
             max_x = max(x for x, y in cells)
             max_y = max(y for x, y in cells)
+            merged_members = [group[k] for k in merged_indices]
+            total_size = sum(member.size for member in merged_members) or 1
+            merged_confidence = sum(member.confidence * member.size for member in merged_members) / total_size
             merged.append(Component(
                 cells=cells,
                 bbox=(min_x, min_y, max_x, max_y),
@@ -209,6 +560,7 @@ def _merge_nearby_same_color(components: list[Component]) -> list[Component]:
                     min_x == 0 or min_y == 0
                     or max_x >= width - 1 or max_y >= height - 1
                 ),
+                confidence=max(0.1, min(1.0, merged_confidence)),
             ))
         result.extend(merged)
     return result
@@ -319,7 +671,7 @@ def _find_goals(
     goal_colored_in_top = [c for _, c in scored[:n_goals] if c.dominant_color in goal_color_candidates]
     if goal_colored_in_top:
         primary_goals = [_component_center(c) for c in goal_colored_in_top]
-    elif player_pos is not None and board and board[0]:
+    if player_pos is not None and board and board[0] and primary_goals:
         h, w = len(board), len(board[0])
         bg = _detect_background_color(board, w, h)
         simple_walk = {(x, y) for y in range(h) for x in range(w) if board[y][x] == bg}
@@ -330,6 +682,8 @@ def _find_goals(
             path = astar(player_pos, (gx, gy), passable, w, h, max_steps=1000)
             if path is not None:
                 reachable.append((gx, gy))
+        if reachable:
+            return reachable
         if not reachable and scored:
             fallback = sorted([c for _, c in scored if not (_in_bbox(player_pos, c.bbox) if player_pos else False)], key=lambda c: abs(c.bbox[0] - px) + abs(c.bbox[1] - py))
             if fallback:
@@ -575,6 +929,10 @@ def _extract_features(
     player_pos: tuple[int, int] | None,
     goal_positions: list[tuple[int, int]],
     walkable: set[tuple[int, int]],
+    tile_size: int = 0,
+    entity_tracks: list[EntityTrack] | None = None,
+    attention: object | None = None,
+    inferred_mechanics: dict[str, Any] | None = None,
 ) -> GameFeatures:
     path_possible = False
     if player_pos is not None and goal_positions and walkable:
@@ -599,10 +957,36 @@ def _extract_features(
             movement_axes.add("x")
         if any(abs(gy - py) > 0 for gy in all_y):
             movement_axes.add("y")
+    inferred_mechanics = getattr(attention, '_inferred_mechanics', None) if attention else None
+    temporal_stats = _compute_temporal_stats(
+        entity_tracks or [], player_pos, attention=attention,
+        inferred_mechanics=inferred_mechanics,
+    )
     dynamics_list, primary_dynamics = _detect_dynamics(
         board, components, player_pos, goal_positions, bg_color,
         has_beam, False, movement_axes, width, height,
+        temporal_stats=temporal_stats,
     )
+    # ── Perception confidence ─────────────────────────────────────────
+    player_conf = _player_confidence(player_pos, components)
+    goal_conf_avg = 0.0
+    if goal_positions:
+        goal_conf_avg = sum(_goal_confidence(g, board) for g in goal_positions) / len(goal_positions)
+    dynamics_conf = _dynamics_confidence(
+        dynamics_list, components, goal_positions, has_beam,
+        player_pos is not None,
+    )
+    primary_conf = dynamics_conf.get(primary_dynamics, 0.5)
+    aggregate_conf = (
+        player_conf * 0.30 +
+        goal_conf_avg * 0.25 +
+        primary_conf * 0.25 +
+        0.20  # component confidence average
+    )
+    if components:
+        comp_conf_avg = sum(c.confidence for c in components) / len(components)
+        aggregate_conf = aggregate_conf * 0.8 + comp_conf_avg * 0.2
+    # ──────────────────────────────────────────────────────────────────
     features = GameFeatures(
         background_color=bg_color,
         player_detectable=player_pos is not None,
@@ -610,7 +994,7 @@ def _extract_features(
         board_type=primary_dynamics,
         dynamics=dynamics_list,
         primary_dynamics=primary_dynamics,
-        tile_size=_detect_tile_size(board, width, height, bg_color),
+        tile_size=tile_size or _detect_tile_size(board, width, height, bg_color),
         path_to_goal_possible=path_possible,
         has_beam=has_beam,
         beam_color=beam_color,
@@ -618,6 +1002,8 @@ def _extract_features(
         goals_lit_by_beam=goals_lit,
         beam_min_dist_to_goal=beam_min_dist,
         mirror_axis=mirror_axis,
+        dynamics_confidence=dynamics_conf,
+        perception_confidence=max(0.1, min(1.0, aggregate_conf)),
     )
     features.has_gravity = "gravity" in dynamics_list
     if player_pos is not None:
@@ -632,14 +1018,6 @@ def _extract_features(
             break
     if movement_axes:
         features.movement_axes = movement_axes
-    player_region = [c for c in components if not c.touches_border and 1 <= c.size <= 80]
-    top_colors = set()
-    for c in player_region:
-        if player_pos is None or not _in_bbox(player_pos, c.bbox):
-            top_colors.add(c.dominant_color)
-    if len(top_colors) >= 2:
-        features.has_click_interaction = True
-        features.has_breakable_blocks = True
     return features
 
 
@@ -664,6 +1042,7 @@ def _detect_dynamics(
     movement_axes: set[str],
     board_width: int,
     board_height: int,
+    temporal_stats: dict | None = None,
 ) -> tuple[list[str], str]:
     detected: list[str] = []
 
@@ -684,6 +1063,13 @@ def _detect_dynamics(
         if player_comp is not None:
             candidate_entities = [c for c in candidate_entities if c is not player_comp]
     entity_count = len(candidate_entities)
+    # Temporal filter: require actual movement for multi-agent
+    if temporal_stats and entity_count >= 2:
+        moving_count = temporal_stats.get("moving_count", 0)
+        if moving_count < 2:
+            entity_count = 1  # static decorations are not agents
+        elif moving_count >= 2:
+            entity_count = max(entity_count, moving_count)  # strengthen signal
     if entity_count >= 2:
         detected.append("multi-agent")
 
@@ -736,6 +1122,7 @@ def _detect_dynamics(
     if player_pos is not None and board_height > 0:
         px, py = player_pos
         bottom_third = board_height * 2 // 3
+        gravity_evidence = False
         if py >= bottom_third:
             below_empty = False
             for y in range(py + 1, board_height):
@@ -744,7 +1131,17 @@ def _detect_dynamics(
                 else:
                     break
             if below_empty:
-                detected.append("gravity")
+                gravity_evidence = True
+        # Temporal booster: consistent downward velocity strengthens gravity signal
+        if temporal_stats and temporal_stats.get("downward_motion"):
+            gravity_evidence = True
+        # Multi-modal booster: inferred gravity from action-effect history
+        if temporal_stats:
+            inferred_mech = temporal_stats.get("inferred_mechanics", {})
+            if isinstance(inferred_mech, dict) and inferred_mech.get("gravity_evidence", 0) > 0.5:
+                gravity_evidence = True
+        if gravity_evidence:
+            detected.append("gravity")
 
     # Inventory: small non-border components (collectible-sized)
     if player_pos is not None:
@@ -789,6 +1186,16 @@ def _detect_dynamics(
                     break
         if long_corridor:
             detected.append("sliding")
+        # Temporal booster: horizontal-only motion strengthens sliding
+        if temporal_stats and temporal_stats.get("horizontal_motion"):
+            if "sliding" not in detected:
+                detected.append("sliding")
+        # Multi-modal booster: inferred sliding from action-effect history
+        if temporal_stats:
+            inferred_mech = temporal_stats.get("inferred_mechanics", {})
+            if isinstance(inferred_mech, dict) and inferred_mech.get("sliding_evidence", 0) > 0.5:
+                if "sliding" not in detected:
+                    detected.append("sliding")
 
     # Signal: many interactive-looking non-border components
     interactive_count = sum(
@@ -815,6 +1222,13 @@ def _detect_dynamics(
             detected.append("navigation")
     elif not detected:
         detected.append("navigation")
+
+    # Temporal puzzle booster: stationary player in a mirror puzzle strengthens puzzle signal
+    if temporal_stats and temporal_stats.get("player_stationary_streak", 0) > 10:
+        if "puzzle" not in detected:
+            mirror_comp = next((c for c in components if c.dominant_color == 10), None)
+            if mirror_comp is not None:
+                detected.append("puzzle")
 
     # Deduplicate while preserving order
     seen: set[str] = set()
@@ -850,6 +1264,12 @@ def _pick_primary_dynamics(
 
 
 def _detect_grid_scale(board: list[list[int]], width: int = 64, height: int = 64) -> int:
+    # Try GPU-accelerated path first
+    if _CUDA_COMPONENTS_AVAILABLE:
+        gpu_scale = _detect_grid_scale_gpu(board)
+        if gpu_scale is not None:
+            return gpu_scale
+
     """Detect the pixel-to-grid scale factor using multi-resolution analysis.
     
     Strategy:

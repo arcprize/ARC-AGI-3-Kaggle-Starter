@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import dataclass
 
+from agi_core.orch_or.analyzer import build_game_model
 from agi_core.image_input import (
     active_cell_count,
     default_click_target,
@@ -10,6 +12,12 @@ from agi_core.image_input import (
 )
 from agi_core.perception.shape_recognition import ensure_shape_recognition
 from agi_core.types import ActionDecision, Observation
+
+
+@dataclass(slots=True)
+class _BoardModelResult:
+    model: Any | None
+    error: str | None = None
 
 
 class ArcAdapter:
@@ -43,6 +51,11 @@ class ArcAdapter:
         step_index, step_index_reliable = self._extract_step_index(frames, latest_frame)
         image_input = extract_board_image_input(latest_frame)
         self._last_image_input = image_input
+        board_model_result = self._board_model(image_input)
+        board_model = board_model_result.model
+        board = image_input.board if image_input is not None else []
+        beam_visible = any(4 in row for row in board) if board else False
+        beam_evidence_uncertain = board_model_result.error is not None and beam_visible
         default_probe = default_click_target(image_input) if image_input is not None else {}
         derived_features = {
             "frame_count": len(frames),
@@ -56,6 +69,13 @@ class ArcAdapter:
             "board_default_probe": default_probe,
             "board_source_attr": image_input.source_attr if image_input is not None else None,
             "has_image_input": image_input is not None,
+            "player_position": board_model.player_pos if board_model is not None else None,
+            "goal_positions": list(board_model.goal_positions) if board_model is not None else [],
+            "has_beam": bool(board_model.features.has_beam) if board_model is not None else False,
+            "beam_visible": beam_visible,
+            "beam_evidence_uncertain": beam_evidence_uncertain,
+            "analyzer_perception_failed": board_model_result.error is not None,
+            "analyzer_perception_error": board_model_result.error,
         }
         shape_recognition = ensure_shape_recognition(image_input, derived_features)
         return Observation(
@@ -73,16 +93,31 @@ class ArcAdapter:
             raw_frame_ref=latest_frame,
             derived_features={
                 **derived_features,
-                "player_position": tuple(shape_recognition.get("active_anchor") or ()) or None,
-                "goal_positions": [
-                    tuple(cluster.get("center", ()))
-                    for cluster in shape_recognition.get("goal_clusters", [])
-                    if cluster.get("center")
-                ],
+                "player_position": (
+                    derived_features["player_position"]
+                    or tuple(shape_recognition.get("active_anchor") or ())
+                    or None
+                ),
+                "goal_positions": (
+                    derived_features["goal_positions"]
+                    or [
+                        tuple(cluster.get("center", ()))
+                        for cluster in shape_recognition.get("goal_clusters", [])
+                        if cluster.get("center")
+                    ]
+                ),
                 "has_mirror": bool(shape_recognition.get("mirror", {}).get("present")),
-                "has_beam": any(4 in row for row in image_input.board) if image_input is not None else False,
+                "has_beam": derived_features["has_beam"],
             },
         )
+
+    def _board_model(self, image_input):
+        if image_input is None or not image_input.board:
+            return _BoardModelResult(model=None)
+        try:
+            return _BoardModelResult(model=build_game_model(image_input.board))
+        except Exception as exc:
+            return _BoardModelResult(model=None, error=f"{type(exc).__name__}: {exc}")
 
     def legal_actions(self, observation: Observation) -> list[str]:
         return list(observation.legal_actions)

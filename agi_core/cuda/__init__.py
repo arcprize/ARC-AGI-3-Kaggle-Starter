@@ -3,6 +3,7 @@
 Provides GPU kernels for:
 - **Salience map** computation (attention system)
 - **Batch A* pathfinding** (multi-agent navigation)
+- **Connected-component labeling** (perception — ``detect_components_gpu``)
 
 Every function has a CPU fallback — CUDA is only used when both the
 ``AGI_CUDA_ENABLE`` environment flag is set AND a compatible GPU is detected.
@@ -16,6 +17,46 @@ logger = logging.getLogger(__name__)
 CUDA_AVAILABLE: bool = False
 CUDA_DEVICE_NAME: str = ""
 CUDA_DEVICE_ID: int = 0
+
+
+def detect_components_gpu(
+    board: list[list[int]],
+    bg_color: int = -1,
+    config: object | None = None,
+) -> dict | None:
+    """Re-exported for convenience; see ``components.detect_components_gpu``."""
+    from agi_core.cuda.components import detect_components_gpu as _dcg
+    return _dcg(board, bg_color=bg_color, config=config)
+
+
+def detect_grid_scale_gpu(
+    board: list[list[int]],
+    config: object | None = None,
+) -> int | None:
+    """Re-exported for convenience; see ``grid_scale.detect_grid_scale_gpu``."""
+    from agi_core.cuda.grid_scale import detect_grid_scale_gpu as _dgsg
+    return _dgsg(board, config=config)
+
+
+def best_reflection_placement_gpu(
+    *,
+    width: int,
+    height: int,
+    component_cells: list[tuple[int, int]],
+    component_bbox: tuple[int, int, int, int],
+    remaining_goals: set[tuple[int, int]],
+    horizontal: bool,
+    axis: int,
+    config: object | None = None,
+) -> tuple | None:
+    """Re-exported for convenience; see ``mirror_solver.best_reflection_placement_gpu``."""
+    from agi_core.cuda.mirror_solver import best_reflection_placement_gpu as _brpg
+    return _brpg(width=width, height=height,
+                 component_cells=component_cells,
+                 component_bbox=component_bbox,
+                 remaining_goals=remaining_goals,
+                 horizontal=horizontal, axis=axis,
+                 config=config)
 
 
 def init_cuda(device_id: int = 0) -> bool:

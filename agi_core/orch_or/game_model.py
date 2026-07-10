@@ -27,6 +27,7 @@ class Component:
     size: int
     dominant_color: int
     touches_border: bool
+    confidence: float = 1.0
 
 
 @dataclass(slots=True)
@@ -49,8 +50,6 @@ class SpriteInfo:
 class GameFeatures:
     has_gravity: bool = False
     gravity_dir: int = 0
-    has_click_interaction: bool = False
-    has_breakable_blocks: bool = False
     has_collectibles: bool = False
     movement_axes: set[str] = field(default_factory=lambda: {"x", "y"})
     player_detectable: bool = False
@@ -72,6 +71,8 @@ class GameFeatures:
     mirror_axis: int = -1
     beam_direction: str = ""
     grid_scale: int = 0
+    dynamics_confidence: dict[str, float] = field(default_factory=dict)
+    perception_confidence: float = 1.0
     grid_width: int = 0
     grid_height: int = 0
 
@@ -88,6 +89,24 @@ class GameModel:
     walkable: set[tuple[int, int]]
     features: GameFeatures
     sprites: list[SpriteInfo] = field(default_factory=list)
+    entity_tracks: list[EntityTrack] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class EntityTrack:
+    """Persistent tracking state for one entity across frames.
+
+    Updated each frame by ``EntityTracker`` (in ``tracker.py``).
+    """
+    entity_id: int
+    color: int
+    positions: list[tuple[int, int]] = field(default_factory=list)
+    bboxes: list[tuple[int, int, int, int]] = field(default_factory=list)
+    age: int = 0
+    last_seen: int = 0
+    velocity: tuple[int, int] = (0, 0)
+    stationary_streak: int = 0
+    moved_this_frame: bool = False
 
 
 @dataclass(slots=True)

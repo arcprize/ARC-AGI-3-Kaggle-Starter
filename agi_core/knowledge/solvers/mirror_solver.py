@@ -81,6 +81,14 @@ def _target_distance(player: tuple[int, int], target: tuple[int, int]) -> int:
     return abs(int(target[0]) - int(player[0])) + abs(int(target[1]) - int(player[1]))
 
 
+def _visible_or_cached_shape_count(
+    shape_comps: list | None,
+    cached_count: int,
+) -> int:
+    visible_count = len(shape_comps) if shape_comps else 0
+    return visible_count if visible_count > 0 else int(cached_count or 0)
+
+
 def _horizontal_small_goal_target(gm, mirror_py: int, switch_count: int, gs: int) -> tuple[int, int] | None:
     goal_components = [
         comp
@@ -122,6 +130,21 @@ def _artifact_stage_target(
     if not isinstance(target, list) or len(target) != 2:
         return None
     return (int(target[0]), int(target[1])), len(stage_targets)
+
+
+def _plan_stage_target(
+    plan_context: dict[str, Any] | None,
+    switch_count: int,
+) -> tuple[tuple[int, int], int] | None:
+    if not isinstance(plan_context, dict):
+        return None
+    stage_targets = plan_context.get("shape_stage_targets")
+    if isinstance(stage_targets, list) and stage_targets:
+        stage_index = min(max(switch_count - 1, 0), len(stage_targets) - 1)
+        target = dict(stage_targets[stage_index] or {}).get("target_anchor")
+        if isinstance(target, list) and len(target) == 2:
+            return (int(target[0]), int(target[1])), len(stage_targets)
+    return _artifact_stage_target(plan_context.get("shape_recognition"), switch_count)
 
 
 class MirrorSolver(DynamicsSolver):
@@ -434,7 +457,7 @@ class MirrorSolver(DynamicsSolver):
         px, py = player
 
         if self._mirror_is_horizontal:
-            artifact_target = _artifact_stage_target(ctx.plan_context.get("shape_recognition"), self._switch_count)
+            artifact_target = _plan_stage_target(ctx.plan_context, self._switch_count)
             max_switches_override = 0
             if artifact_target is not None:
                 (target_px, target_py), max_switches_override = artifact_target
@@ -445,7 +468,7 @@ class MirrorSolver(DynamicsSolver):
                     target_key = (
                         self._switch_count,
                         mirror_py,
-                        self._max_shape_count_seen or len(shape_comps or []),
+                        _visible_or_cached_shape_count(shape_comps, self._max_shape_count_seen),
                     )
                     if horizontal_target is None or self._cached_horizontal_target_key != target_key:
                         horizontal_target = self._best_horizontal_shape_target(
@@ -472,8 +495,8 @@ class MirrorSolver(DynamicsSolver):
                         target_px = max(0, min(gm.width - 1, target_gx * gs + 1))
         else:
             max_switches_override = 0
-            artifact_target = _artifact_stage_target(ctx.plan_context.get("shape_recognition"), self._switch_count)
-            if artifact_target is not None and artifact_target[1] > 1:
+            artifact_target = _plan_stage_target(ctx.plan_context, self._switch_count)
+            if artifact_target is not None:
                 (target_px, target_py), max_switches_override = artifact_target
             else:
                 target_gx = 2 * mirror_gx - max_ggx
@@ -488,7 +511,19 @@ class MirrorSolver(DynamicsSolver):
             self._shape_stuck_steps = 0
         self._last_shape_pos = (px, py)
 
-        max_switches = max_switches_override or self._max_shape_count_seen or (len(shape_comps) if shape_comps else 0)
+        # Use entity tracker's stationary streak if available
+        entity_tracks = ctx.plan_context.get("entity_tracks", [])
+        if entity_tracks and self._shape_stuck_steps < 5:
+            for et in entity_tracks:
+                et_center = et.get("center")
+                if et_center and abs(et_center[0] - px) + abs(et_center[1] - py) <= 3:
+                    if et.get("stationary") and et.get("age", 0) > 3:
+                        self._shape_stuck_steps = max(self._shape_stuck_steps, int(et.get("age", 0)))
+                    break
+
+        max_switches = max_switches_override or _visible_or_cached_shape_count(
+            shape_comps, self._max_shape_count_seen
+        )
         cached_stage_target = (
             self._cached_stage_target
             if self._cached_stage_target_key == (("horizontal" if self._mirror_is_horizontal else "vertical"), int(self._switch_count))
@@ -531,7 +566,7 @@ class MirrorSolver(DynamicsSolver):
                 # Final horizontal placements need an exact anchor match.
                 arrival_tolerance = 0
         if abs(px - target_px) + abs(py - target_py) <= arrival_tolerance:
-            max_switches = self._max_shape_count_seen or (len(shape_comps) if shape_comps else 0)
+            max_switches = _visible_or_cached_shape_count(shape_comps, self._max_shape_count_seen)
             if self._switch_count < max_switches:
                 self._switch_count += 1
                 self._cached_horizontal_target_key = None

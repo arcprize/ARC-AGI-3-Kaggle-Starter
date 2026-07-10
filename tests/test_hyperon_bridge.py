@@ -135,6 +135,52 @@ class HyperonBridgeTests(unittest.TestCase):
             [{"subgoal": "advance-level", "confidence": 0.70}],
         )
 
+    def test_sync_copies_beam_uncertainty_into_episode_facts(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        observation = make_observation(
+            derived_features={
+                "has_beam": False,
+                "beam_visible": True,
+                "beam_evidence_uncertain": True,
+                "analyzer_perception_failed": True,
+            },
+        )
+
+        bridge.sync(
+            observation,
+            memory,
+            [GoalState(name="finish-episode", target_state="WIN")],
+        )
+
+        episode = bridge.facts["episode"]
+        self.assertFalse(episode["has_beam"])
+        self.assertTrue(episode["beam_visible"])
+        self.assertTrue(episode["beam_evidence_uncertain"])
+        self.assertTrue(episode["analyzer_perception_failed"])
+
+    def test_board_puzzle_strategy_treats_uncertain_visible_beam_as_beam(self) -> None:
+        bridge = HyperonBridge(enabled=False)
+        memory = EpisodicMemory()
+        observation = make_observation(
+            derived_features={
+                "has_beam": False,
+                "beam_visible": True,
+                "beam_evidence_uncertain": True,
+            },
+        )
+
+        bridge.sync(
+            observation,
+            memory,
+            [GoalState(name="finish-episode", target_state="WIN")],
+        )
+
+        self.assertEqual(
+            bridge.run_rules("board-puzzle-strategy"),
+            [{"strategy": "beam", "board_type": "unknown", "dynamics": ""}],
+        )
+
     def test_shadow_goal_hints_prefers_board_inspection_when_active_cells_exist(self) -> None:
         bridge = HyperonBridge(enabled=False)
         memory = EpisodicMemory()

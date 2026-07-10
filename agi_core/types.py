@@ -17,6 +17,7 @@ class Observation:
     image_input: BoardImageInput | None = None
     raw_frame_ref: Any = None
     derived_features: dict[str, Any] = field(default_factory=dict)
+    perception_confidence: float = 1.0
 
 
 @dataclass(slots=True)

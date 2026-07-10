@@ -287,6 +287,92 @@ class TestMultiAgent(unittest.TestCase):
         self.assertIn("shape_recognition", cache)
         self.assertIs(cache, prepare_frame_cache(ctx))
 
+    def test_prepare_frame_cache_respects_explicit_false_beam_hint(self):
+        ctx = self._mock_context(
+            legal=["ACTION2", "ACTION4", "ACTION6"],
+            derived_features={
+                "player_position": (2, 2),
+                "goal_positions": [(5, 2)],
+                "has_beam": False,
+            },
+            board=[
+                [9, 9, 9, 9, 9, 9, 9, 9],
+                [9, 9, 9, 10, 9, 9, 9, 9],
+                [9, 9, 9, 10, 9, 9, 9, 9],
+                [9, 9, 9, 10, 9, 9, 9, 9],
+                [9, 5, 5, 10, 9, 4, 4, 9],
+                [9, 5, 5, 10, 9, 4, 4, 9],
+                [9, 9, 9, 10, 9, 9, 9, 9],
+                [9, 9, 9, 10, 9, 9, 9, 9],
+            ],
+        )
+
+        cache = prepare_frame_cache(ctx)
+
+        self.assertFalse(cache["has_beam"])
+
+    def test_prepare_frame_cache_keeps_beam_uncertain_when_analyzer_failed(self):
+        ctx = self._mock_context(
+            legal=["ACTION2", "ACTION4", "ACTION6"],
+            derived_features={
+                "player_position": (2, 2),
+                "goal_positions": [(5, 2)],
+                "has_beam": False,
+                "analyzer_perception_failed": True,
+            },
+            board=[
+                [9, 9, 9],
+                [9, 4, 9],
+                [9, 9, 9],
+            ],
+        )
+
+        cache = prepare_frame_cache(ctx)
+
+        self.assertFalse(cache["has_beam"])
+        self.assertTrue(cache["beam_visible"])
+        self.assertTrue(cache["beam_evidence_uncertain"])
+
+    def test_exploration_agent_marks_uncertain_beam_switch_reason(self):
+        agent = ExplorationAgent()
+        ctx = self._mock_context(
+            legal=["ACTION1", "ACTION5"],
+            derived_features={
+                "analyzer_perception_failed": True,
+                "has_beam": False,
+            },
+            board=[
+                [9, 4, 9],
+                [9, 9, 9],
+                [9, 9, 9],
+            ],
+        )
+
+        proposals = agent.produce(ctx)
+
+        switch = next(p for p in proposals if p.action_name == "ACTION5")
+        self.assertEqual(switch.reason, "exploration:switch+beam-uncertain")
+
+    def test_puzzle_agent_uses_uncertain_beam_as_puzzle_signal(self):
+        agent = PuzzleAgent()
+        ctx = self._mock_context(
+            legal=["ACTION5", "ACTION4"],
+            derived_features={
+                "analyzer_perception_failed": True,
+                "has_beam": False,
+            },
+            board=[
+                [9, 4, 9],
+                [9, 9, 9],
+                [9, 9, 9],
+            ],
+        )
+
+        proposals = agent.produce(ctx)
+
+        self.assertTrue(proposals)
+        self.assertTrue(all("+beam-uncertain" in p.reason for p in proposals))
+
     def test_prepare_frame_cache_exposes_shape_target(self):
         ctx = self._mock_context(
             legal=["ACTION2", "ACTION4", "ACTION5"],

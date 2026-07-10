@@ -45,6 +45,31 @@ def movement_strategy(game_model: GameModel, context: dict | None = None) -> lis
     for g in goals:
         if not search_goals or g != stable_goal:
             search_goals.append(g)
+    # When player is not on a color-0 cell (active entity may be off-screen),
+    # move toward board center to discover it rather than navigating to goals.
+    px, py = player
+    on_color_0 = any(
+        c.dominant_color == 0
+        and c.bbox[0] <= px <= c.bbox[2]
+        and c.bbox[1] <= py <= c.bbox[3]
+        for c in game_model.components
+    )
+    if game_model.components and not on_color_0:
+        cx2, cy2 = game_model.width // 2, game_model.height // 2
+        dxc, dyc = cx2 - px, cy2 - py
+        if abs(dxc) >= abs(dyc):
+            d = "right" if dxc > 0 else "left"
+        else:
+            d = "down" if dyc > 0 else "up"
+        steps.append(PlanStep(
+            action="move", params={"direction": d},
+            source="movement_strategy:entity_discovery",
+            preconditions=frozenset(),
+            expected_effect=f"move_{d}",
+            tolerance=8,
+        ))
+        return steps
+
     # Board-type path preference: "safe" avoids interactive obstacles.
     _path_walkable = set(game_model.walkable)
     try:

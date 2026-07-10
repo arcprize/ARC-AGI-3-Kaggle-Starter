@@ -606,6 +606,15 @@ def _get_board_data(observation: Any) -> list[list[int]] | None:
 def _build_solver_context(solver: Any, game_model: Any, context: ExecutiveContext,
                           supervisor: AgentSupervisor) -> Any:
     """Build a SolverContext for the given solver."""
+    shape_recognition = ensure_shape_recognition(
+        getattr(context.observation, "image_input", None),
+        getattr(context.observation, "derived_features", {}),
+    )
+    mirror_puzzle = (
+        shape_recognition.get("mirror_puzzle", {})
+        if isinstance(shape_recognition, dict)
+        else {}
+    )
     pctx: dict[str, Any] = {
         "non_beam_controllers": getattr(supervisor, '_non_beam_controllers', set()),
         "failed_directions": getattr(supervisor, '_failed_directions', set()),
@@ -618,10 +627,8 @@ def _build_solver_context(solver: Any, game_model: Any, context: ExecutiveContex
         "mirror_axis": game_model.features.mirror_axis if hasattr(game_model, 'features') else -1,
         "goal_history": list(getattr(supervisor, '_goal_history', [])),
         "abstract_memories": list(context.memory_bundle.abstract_memories) if context.memory_bundle and context.memory_bundle.abstract_memories else [],
-        "shape_recognition": ensure_shape_recognition(
-            getattr(context.observation, "image_input", None),
-            getattr(context.observation, "derived_features", {}),
-        ),
+        "shape_recognition": shape_recognition,
+        "shape_stage_targets": list(mirror_puzzle.get("stage_targets", [])) if isinstance(mirror_puzzle, dict) else [],
     }
     if supervisor._solver_selector is not None:
         return supervisor._solver_selector.build_solver_context(game_model, pctx, context)

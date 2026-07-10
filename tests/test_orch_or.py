@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agi_core.orch_or.analyzer import build_game_model, _extract_features
+from agi_core.orch_or.analyzer import _extract_features, _find_goals, build_game_model
 from agi_core.orch_or.game_model import (
     ADVANCE,
     ESCALATE,
@@ -248,6 +248,21 @@ class AnalyzerTests(unittest.TestCase):
         gm = build_game_model(board)
         self.assertEqual(len(gm.goal_positions), 0)
 
+    def test_goal_detection_prefers_reachable_candidates(self) -> None:
+        board = [[0] * 7 for _ in range(7)]
+        for y in range(7):
+            board[y][3] = 1
+        player_pos = (1, 3)
+        components = [
+            Component(cells=[player_pos], bbox=(1, 3, 1, 3), size=1, dominant_color=5, touches_border=False, confidence=1.0),
+            Component(cells=[(1, 1)], bbox=(1, 1, 1, 1), size=1, dominant_color=11, touches_border=False, confidence=1.0),
+            Component(cells=[(5, 3)], bbox=(5, 3, 5, 3), size=1, dominant_color=11, touches_border=False, confidence=1.0),
+        ]
+
+        goals = _find_goals(components, player_pos, board, color_freq={5: 1, 11: 2, 1: 7})
+
+        self.assertEqual(goals, [(1, 1)])
+
     def test_board_classified_as_puzzle(self) -> None:
         board = [[0] * 10 for _ in range(10)]
         for y in range(1, 9):
@@ -280,17 +295,6 @@ class AnalyzerTests(unittest.TestCase):
         for ox, oy, otype in gm.obstacles:
             if ox == 0 or oy == 0:
                 self.assertEqual(otype, "wall")
-
-    def test_interaction_flag_with_multiple_colors(self) -> None:
-        board = [
-            [0, 0, 0, 0, 0, 0],
-            [0, 9, 0, 0, 7, 0],
-            [0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 14, 0, 0],
-            [0, 0, 0, 0, 0, 0],
-        ]
-        gm = build_game_model(board)
-        self.assertTrue(gm.features.has_click_interaction)
 
     def test_player_color_extracted_correctly(self) -> None:
         board = [

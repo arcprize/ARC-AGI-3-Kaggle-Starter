@@ -8,12 +8,16 @@ logger = logging.getLogger(__name__)
 
 from agi_core.orch_or.analyzer import build_game_model
 from agi_core.orch_or.game_model import (
+    EntityTrack,
     Plan,
     PlanStep,
     deserialize_plan,
     serialize_plan,
 )
+from agi_core.cognition.multi_modal import ActionEffectLog
+from agi_core.image_input import compute_board_signature
 from agi_core.orch_or.monitor import check_progress
+from agi_core.orch_or.tracker import EntityTracker
 from agi_core.orch_or.parallel import ThreadPoolManager
 from agi_core.orch_or.plan_executor import (
     plan_step_to_proposal,
@@ -60,6 +64,10 @@ class ObjectiveReduction:
         self._hyperon_priors: dict[str, float] = {}
         self._goal_history: list[list[tuple[int, int]]] = []
         self._solver_selector = None
+        self._entity_tracker = EntityTracker()
+        self._action_effect_log = ActionEffectLog()
+        self._cached_model: GameModel | None = None
+        self._cached_board_sig: str | None = None
 
     def _background_precompute(self, game_model: GameModel) -> None:
         """Pre-compute A* paths for next frame via background thread + process pool.
@@ -106,7 +114,47 @@ class ObjectiveReduction:
             logger.debug("no board data, falling back to executive")
             return self._fallback_executive(context)
         attn = getattr(context, 'attention', None)
-        game_model = build_game_model(board_data, attention=attn)
+
+        # Perception cache: skip build_game_model when board is unchanged
+        board_sig = compute_board_signature(board_data)
+        if board_sig and board_sig == self._cached_board_sig and self._cached_model is not None:
+            game_model = self._cached_model
+            # Entity tracker still needs to be updated (track age/last_seen)
+            if self._entity_tracker is not None:
+                game_model.entity_tracks = self._entity_tracker.update(
+                    game_model.components,
+                    frame=getattr(context.observation, "step_index", 0),
+                )
+        else:
+            inferred_mechanics = self._action_effect_log.infer().as_dict()
+            game_model = build_game_model(
+                board_data, attention=attn, tracker=self._entity_tracker,
+                inferred_mechanics=inferred_mechanics,
+            )
+            self._cached_model = game_model
+            self._cached_board_sig = board_sig
+
+        # Multi-modal: record action effect and infer mechanics
+        last_action = context.memory.most_recent_action()
+        if last_action is not None and last_action != "RESET":
+            prev_player = self._previous_model.player_pos if self._previous_model else None
+            prev_color = self._previous_model.features.player_color if self._previous_model else -1
+            curr_color = game_model.features.player_color
+            prev_tracks = list(self._previous_model.entity_tracks) if self._previous_model else None
+            curr_tracks = list(game_model.entity_tracks)
+            board_changed = (self._previous_model is not None and
+                             self._previous_model.board != game_model.board)
+            self._action_effect_log.record(
+                action=last_action,
+                player_pos_before=prev_player,
+                player_pos_after=game_model.player_pos,
+                player_color_before=prev_color,
+                player_color_after=curr_color,
+                entity_tracks_before=prev_tracks,
+                entity_tracks_after=curr_tracks,
+                board_changed=board_changed,
+            )
+
         # Feed board_type and dynamics into hyperon facts BEFORE solver selection.
         try:
             if hasattr(context.hyperon, "facts"):
@@ -129,6 +177,10 @@ class ObjectiveReduction:
                 self._switch_count = 0
                 self._failed_directions.clear()
                 self._stable_goal = None
+                self._entity_tracker.reset()
+                self._action_effect_log.reset()
+                self._cached_model = None
+                self._cached_board_sig = None
                 try:
                     if self._solver_selector is not None and self._solver_selector.active_solver is not None:
                         self._solver_selector.active_solver.reset_level()
@@ -139,6 +191,10 @@ class ObjectiveReduction:
             self._switch_count = 0
             self._failed_directions.clear()
             self._stable_goal = None
+            self._entity_tracker.reset()
+            self._action_effect_log.reset()
+            self._cached_model = None
+            self._cached_board_sig = None
 
         # Try the hyperon memory-based solver system first (handles all 12 dynamics)
         solver_decision, sctx = self._try_solver_system(context, game_model)
@@ -285,6 +341,19 @@ class ObjectiveReduction:
             "board_danger_detection": board_danger_detection,
             "board_viewport_style": board_viewport_style,
             "goal_history": list(self._goal_history),
+            "entity_tracks": [
+                {
+                    "id": t.entity_id,
+                    "color": t.color,
+                    "center": list(t.positions[-1]) if t.positions else None,
+                    "velocity": list(t.velocity),
+                    "age": t.age,
+                    "stationary": t.stationary_streak > 5,
+                    "moved": t.moved_this_frame,
+                }
+                for t in getattr(game_model, "entity_tracks", [])
+            ],
+            "inferred_mechanics": self._action_effect_log.infer().as_dict(),
             "beam_cells": beam_cells[:20],
             "mirror_axis": game_model.features.mirror_axis,
             "memory_db_path": _gameplay_memory_db_path(context.config),
@@ -419,12 +488,29 @@ class ObjectiveReduction:
                 self._handle_status(status, context, game_model)
         self._previous_model = game_model
 
+    @staticmethod
+    def _player_on_color_0(game_model: GameModel) -> bool:
+        pp = game_model.player_pos
+        if pp is None:
+            return False
+        px, py = pp
+        return any(
+            c.dominant_color == 0
+            and c.bbox[0] <= px <= c.bbox[2]
+            and c.bbox[1] <= py <= c.bbox[3]
+            for c in game_model.components
+        )
+
     def _handle_plan_exhausted(
         self, context: ExecutiveContext, game_model,
     ) -> ActionDecision:
         # After first switch (mirror → shape), inject a switch back to mirror
         if self._switch_count == 1 and game_model.player_pos is not None and game_model.features.player_color in self._non_beam_controllers:
             return self._switch_back_to_mirror(context)
+        # Entity discovery: if player not on color-0, the active entity may be
+        # off-screen. Move toward the board center to bring it into view.
+        if game_model.player_pos is not None and game_model.components and not self._player_on_color_0(game_model):
+            return self._entity_discovery_move(context, game_model)
         hyperon_priors: dict[str, float] = {}
         try:
             for row in context.hyperon.run_rules("game-action-priors"):
@@ -478,6 +564,19 @@ class ObjectiveReduction:
             "stable_goal": self._stable_goal,
             "action_priors": hyperon_priors,
             "goal_history": list(self._goal_history),
+            "entity_tracks": [
+                {
+                    "id": t.entity_id,
+                    "color": t.color,
+                    "center": list(t.positions[-1]) if t.positions else None,
+                    "velocity": list(t.velocity),
+                    "age": t.age,
+                    "stationary": t.stationary_streak > 5,
+                    "moved": t.moved_this_frame,
+                }
+                for t in getattr(game_model, "entity_tracks", [])
+            ],
+            "inferred_mechanics": self._action_effect_log.infer().as_dict(),
             "beam_cells": beam_cells_pctx,
             "mirror_axis": game_model.features.mirror_axis,
             "memory_db_path": _gameplay_memory_db_path(context.config),
@@ -543,6 +642,19 @@ class ObjectiveReduction:
             if step.params and "direction" in step.params:
                 self._pending_failed_dir = step.params["direction"]
                 self._failed_directions.add(step.params["direction"])
+            # If player not on color-0, the active entity may be off-screen
+            # (no selection indicator visible).  Increase tolerance to give
+            # the entity more steps to move into view.
+            if game_model is not None and game_model.player_pos is not None:
+                px, py = game_model.player_pos
+                on_color_0 = any(
+                    c.dominant_color == 0
+                    and c.bbox[0] <= px <= c.bbox[2]
+                    and c.bbox[1] <= py <= c.bbox[3]
+                    for c in game_model.components
+                )
+                if not on_color_0:
+                    step.tolerance = max(step.tolerance, 8)
             # Early abort: if hyperon gives low confidence to this action,
             # accelerate retry_count so we give up faster.
             _DIR_TO_ACTION = {"up": "ACTION1", "down": "ACTION2", "left": "ACTION3", "right": "ACTION4"}
@@ -570,7 +682,7 @@ class ObjectiveReduction:
             except Exception:
                 pass
         elif status == "switch_entity" and self._active_plan is not None:
-            if self._switch_count >= 2:
+            if self._switch_count >= 3:
                 self._active_plan = None
                 self._regenerate_count = 0
             else:
@@ -582,6 +694,31 @@ class ObjectiveReduction:
                 self._pending_failed_dir = None
             self._active_plan = None
             self._regenerate_count = 0
+
+    def _entity_discovery_move(self, context: ExecutiveContext, game_model: GameModel) -> ActionDecision:
+        """Move toward board center to bring a potentially off-screen entity into view."""
+        px, py = game_model.player_pos
+        cx, cy = game_model.width // 2, game_model.height // 2
+        dx, dy = cx - px, cy - py
+        if abs(dx) >= abs(dy):
+            direction = "right" if dx > 0 else "left"
+        else:
+            direction = "down" if dy > 0 else "up"
+        step = PlanStep(
+            action="move", params={"direction": direction},
+            source="orch_or:entity_discovery",
+            preconditions=frozenset(),
+            expected_effect=f"move_{direction}",
+            tolerance=8,
+        )
+        self._active_plan = Plan(
+            objective_id="reach-goal", steps=[step],
+            created_at_step=context.observation.step_index,
+            confidence=0.5,
+        )
+        self._persist_plan(context)
+        self._skip_monitoring = True
+        return self.decide(context)
 
     def _switch_back_to_mirror(self, context: ExecutiveContext) -> ActionDecision:
         self._is_switch_back = True
@@ -638,6 +775,21 @@ class ObjectiveReduction:
                     "goal_history": list(self._goal_history),
                     "abstract_memories": list(context.memory_bundle.abstract_memories) if context.memory_bundle and context.memory_bundle.abstract_memories else [],
                 }
+                shape_recognition = ensure_shape_recognition(
+                    getattr(context.observation, "image_input", None),
+                    getattr(context.observation, "derived_features", {}),
+                )
+                mirror_puzzle = (
+                    shape_recognition.get("mirror_puzzle", {})
+                    if isinstance(shape_recognition, dict)
+                    else {}
+                )
+                pctx["shape_recognition"] = shape_recognition
+                pctx["shape_stage_targets"] = (
+                    list(mirror_puzzle.get("stage_targets", []))
+                    if isinstance(mirror_puzzle, dict)
+                    else []
+                )
                 if game_model.features.has_beam:
                     beam_comps = [c for c in game_model.components if c.dominant_color == game_model.features.beam_color and not c.touches_border]
                     if beam_comps:

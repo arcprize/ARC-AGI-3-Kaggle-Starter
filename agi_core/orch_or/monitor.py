@@ -25,10 +25,14 @@ def check_progress(
     if step.action == "move":
         if moved:
             return ADVANCE
+        # Use entity tracker's stationary streak to accelerate stuck detection
+        stationary_streak = _player_stationary_streak(current_model)
+        if stationary_streak >= max(step.tolerance + 2, 5):
+            return REPLAN
         if step.retry_count >= step.tolerance:
             if _player_on_color_0(current_model) and _count_entities(current_model) >= 2:
                 return SWITCH_ENTITY
-            if not _plan_has_switch(plan):
+            if _player_on_color_0(current_model) and not _plan_has_switch(plan):
                 return SWITCH_ENTITY
             return REPLAN
         return RETRY
@@ -70,6 +74,21 @@ def _player_on_color_0(gm: GameModel) -> bool:
             if c.dominant_color == 0:
                 return True
     return False
+
+
+def _player_stationary_streak(gm: GameModel) -> int:
+    """Return the stationary streak of the player entity from tracking data."""
+    if not gm.entity_tracks or gm.player_pos is None:
+        return 0
+    px, py = gm.player_pos
+    best = 0
+    for t in gm.entity_tracks:
+        if not t.positions:
+            continue
+        cx, cy = t.positions[-1]
+        if abs(cx - px) + abs(cy - py) <= 3:
+            best = max(best, t.stationary_streak)
+    return best
 
 
 def _board_changed(prev: list[list[int]], curr: list[list[int]]) -> bool:

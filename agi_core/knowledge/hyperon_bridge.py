@@ -299,6 +299,14 @@ class HyperonBridge:
                 "board_active_cells": board_active_cells,
                 "board_default_probe": board_default_probe,
                 "board_source_attr": board_source_attr,
+                "has_beam": bool(observation.derived_features.get("has_beam", False)),
+                "beam_visible": bool(observation.derived_features.get("beam_visible", False)),
+                "beam_evidence_uncertain": bool(
+                    observation.derived_features.get("beam_evidence_uncertain", False)
+                ),
+                "analyzer_perception_failed": bool(
+                    observation.derived_features.get("analyzer_perception_failed", False)
+                ),
             },
             "goals": [
                 {
@@ -703,8 +711,10 @@ class HyperonBridge:
             board_type = str(episode.get("board_type", "") or "unknown")
             dynamics = str(episode.get("primary_dynamics", "") or "")
             has_beam = bool(episode.get("has_beam", False))
+            beam_visible = bool(episode.get("beam_visible", False))
+            beam_evidence_uncertain = bool(episode.get("beam_evidence_uncertain", False))
             has_interactive = bool(episode.get("has_interactive", False))
-            if dynamics == "beam" or (not dynamics and has_beam):
+            if dynamics == "beam" or (not dynamics and (has_beam or (beam_visible and beam_evidence_uncertain))):
                 return [{"strategy": "beam", "board_type": board_type, "dynamics": dynamics}]
             elif dynamics in ("signal", "push-pull", "multi-agent") or (not dynamics and has_interactive):
                 return [{"strategy": "interact", "board_type": board_type, "dynamics": dynamics}]
