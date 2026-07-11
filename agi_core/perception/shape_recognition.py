@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from agi_core.image_input import BoardImageInput
@@ -44,7 +47,7 @@ def ensure_shape_recognition(
     cached_player_hint = _coerce_player_hint(cached.get("player_hint")) if isinstance(cached, dict) else None
     if (
         isinstance(cached, dict)
-        and cached.get("version") == 1
+        and         cached.get("version") == 2
         and cached.get("frame_signature") == current_signature
         and (
             cached_player_hint == player_hint
@@ -68,7 +71,7 @@ def recognize_shape_recognition(
 ) -> dict[str, Any]:
     if image_input is None or not image_input.board:
         return {
-            "version": 1,
+            "version": 2,
             "frame_signature": image_input.frame_signature if image_input is not None else None,
             "board_size": {"width": 0, "height": 0},
             "components": [],
@@ -121,7 +124,7 @@ def recognize_shape_recognition(
         mirror_component=mirror_component,
     )
     return {
-        "version": 1,
+        "version": 2,
         "frame_signature": image_input.frame_signature,
         "player_hint": list(player_hint) if player_hint is not None else None,
         "board_size": {"width": width, "height": height},
@@ -211,6 +214,11 @@ def _color_components(board: list[list[int]], background_color: int) -> list[_Co
 
 def _serialize_component(component: _ColorComponent, width: int, height: int) -> dict[str, Any]:
     mask = _normalized_mask(component.cells)
+    contour = _extract_contour(component.cells)
+    perimeter = _compute_perimeter(contour)
+    hu_moments = _compute_hu_moments(component.cells)
+    features = _compute_shape_features(component.cells, contour, perimeter, component.bbox)
+    rotation_estimate = _estimate_rotation_angle(component.cells)
     return {
         "color": component.color,
         "size": len(component.cells),
@@ -226,6 +234,11 @@ def _serialize_component(component: _ColorComponent, width: int, height: int) ->
             and component.bbox[2] < width - 1
             and component.bbox[3] < height - 1
         ),
+        "contour": [[x, y] for x, y in contour],
+        "perimeter": perimeter,
+        "hu_moments": hu_moments,
+        "features": features,
+        "rotation_estimate": rotation_estimate,
     }
 
 
@@ -247,15 +260,73 @@ def _serialize_goal_clusters(goal_components: list[_ColorComponent]) -> list[dic
     return clusters
 
 
+_HU_SIMILARITY_THRESHOLD = 5.0
+_FEATURE_SIMILARITY_WEIGHT = 0.3
+
+
+def _estimate_rotation_angle(cells: list[tuple[int, int]]) -> float:
+    """Estimate rotation angle (radians) from central moments.
+
+    Uses the orientation of the best-fit ellipse:
+    θ = 0.5 * atan2(2 * μ11, μ20 - μ02)
+    Returns angle in [-π/2, π/2] radians.
+    """
+    if len(cells) < 3:
+        return 0.0
+    cx = sum(x for x, _ in cells) / len(cells)
+    cy = sum(y for _, y in cells) / len(cells)
+    mu20 = mu02 = mu11 = 0.0
+    for x, y in cells:
+        dx = x - cx
+        dy = y - cy
+        mu20 += dx * dx
+        mu02 += dy * dy
+        mu11 += dx * dy
+    denom = mu20 - mu02
+    if abs(denom) < _EPSILON and abs(mu11) < _EPSILON:
+        return 0.0
+    return 0.5 * math.atan2(2.0 * mu11, denom)
+
+
+def _feature_vector_distance(f1: dict[str, float], f2: dict[str, float]) -> float:
+    """Normalized Euclidean distance between two shape feature vectors.
+
+    Uses subset of features: aspect_ratio, compactness, solidity, extent, convexity.
+    Returns distance in [0, 1] (0 = identical, 1 = maximally different).
+    """
+    keys = ["aspect_ratio", "compactness", "solidity", "extent", "convexity"]
+    eps = 1e-6
+    dist_sum = 0.0
+    count = 0
+    for key in keys:
+        a = f1.get(key, 0.0)
+        b = f2.get(key, 0.0)
+        # Normalize difference by max value to get [0, 1] range per feature
+        max_val = max(abs(a), abs(b), 1.0)
+        dist_sum += abs(a - b) / max_val
+        count += 1
+    return dist_sum / max(count, 1)
+
+
 def _serialize_shape_entities(
     shape_components: list[_ColorComponent],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     ordered = sorted(shape_components, key=lambda item: (item.center[1], item.center[0], item.color))
     mask_groups: dict[tuple[tuple[int, int], ...], list[int]] = {}
     entities: list[dict[str, Any]] = []
+    all_hu: list[list[float]] = []
+    all_features: list[dict[str, float]] = []
     for index, component in enumerate(ordered):
         mask = tuple(_normalized_mask(component.cells))
         mask_groups.setdefault(mask, []).append(index)
+        contour = _extract_contour(component.cells)
+        hu_moments = _compute_hu_moments(component.cells)
+        all_hu.append(hu_moments)
+        features = _compute_shape_features(
+            component.cells, contour, _compute_perimeter(contour), component.bbox
+        )
+        all_features.append(features)
+        rotation_estimate = _estimate_rotation_angle(component.cells)
         entities.append(
             {
                 "entity_id": f"shape-{index + 1}",
@@ -267,8 +338,15 @@ def _serialize_shape_entities(
                 "anchor": [component.center[0], component.center[1]],
                 "normalized_mask": [[x, y] for x, y in mask],
                 "overlay": component.color == 0,
+                "contour": [[x, y] for x, y in contour],
+                "perimeter": _compute_perimeter(contour),
+                "hu_moments": hu_moments,
+                "features": features,
+                "rotation_estimate": rotation_estimate,
             }
         )
+
+    # Exact-match equivalence classes (backward compatible)
     equivalence_classes: list[dict[str, Any]] = []
     for class_index, (mask, member_indices) in enumerate(
         sorted(mask_groups.items(), key=lambda item: (len(item[1]), item[0]))
@@ -283,7 +361,69 @@ def _serialize_shape_entities(
                 "normalized_mask": [[x, y] for x, y in mask],
             }
         )
-    return entities, equivalence_classes
+
+    # Hu-moment-based descriptor classes (rotation-invariant similarity)
+    descriptor_groups: list[list[int]] = _cluster_by_hu_descriptor(all_hu, all_features)
+    descriptor_classes: list[dict[str, Any]] = []
+    for class_index, member_indices in enumerate(descriptor_groups):
+        group_id = f"desc-{class_index + 1}"
+        for member_index in member_indices:
+            entities[member_index]["descriptor_class"] = group_id
+        descriptor_classes.append(
+            {
+                "descriptor_class": group_id,
+                "members": [entities[member_index]["entity_id"] for member_index in member_indices],
+            }
+        )
+
+    return entities, [*equivalence_classes, *descriptor_classes]
+
+
+def _cluster_by_hu_descriptor(
+    all_hu: list[list[float]],
+    all_features: list[dict[str, float]] | None = None,
+) -> list[list[int]]:
+    """Cluster shape indices by combined Hu moment and feature vector similarity.
+
+    Uses greedy single-linkage clustering.
+    Combined distance = (1 - w) * hu_dist + w * feature_dist.
+    Returns list of index groups, each group containing similar shapes.
+    """
+    n = len(all_hu)
+    if n <= 1:
+        return [list(range(n))]
+
+    assigned = [False] * n
+    groups: list[list[int]] = []
+    w = _FEATURE_SIMILARITY_WEIGHT
+
+    for i in range(n):
+        if assigned[i]:
+            continue
+        group = [i]
+        assigned[i] = True
+        changed = True
+        while changed:
+            changed = False
+            for j in range(n):
+                if assigned[j]:
+                    continue
+                for k in group:
+                    hu_dist = _hu_log_distance(all_hu[j], all_hu[k])
+                    feat_dist = (
+                        _feature_vector_distance(all_features[j], all_features[k])
+                        if all_features is not None
+                        else 0.0
+                    )
+                    combined = (1.0 - w) * hu_dist + w * feat_dist
+                    if combined < _HU_SIMILARITY_THRESHOLD:
+                        group.append(j)
+                        assigned[j] = True
+                        changed = True
+                        break
+        groups.append(group)
+
+    return groups
 
 
 def _serialize_mirror(mirror_component: _ColorComponent | None) -> dict[str, Any]:
@@ -366,10 +506,21 @@ def _build_mirror_puzzle(
         remaining_goals -= set(best_candidate.reflected_hits)
     stage_targets: list[dict[str, Any]] = []
     recommended_order: list[str] = []
+    mirror_cells = list(mirror_component.cells) if mirror_component else None
+    goal_cells = [cell for comp in goal_components for cell in comp.cells] if goal_components else None
     for stage_index, placement in enumerate(placements, start=1):
         entity = ordered_shapes[placement.entity_index]
         entity_id = f"shape-{placement.entity_index + 1}"
         recommended_order.append(entity_id)
+        other_shape_cells = [
+            c.cells for i, c in enumerate(ordered_shapes) if i != placement.entity_index
+        ]
+        spatial = _compute_spatial_descriptors(
+            list(entity.cells),
+            mirror_cells=mirror_cells,
+            goal_cells=goal_cells,
+            other_shapes_cells=other_shape_cells,
+        )
         stage_targets.append(
             {
                 "switch_stage": stage_index,
@@ -380,6 +531,7 @@ def _build_mirror_puzzle(
                 "goal_cluster_ids": list(placement.goal_cluster_ids),
                 "reflected_coverage": [[x, y] for x, y in sorted(placement.reflected_hits)],
                 "fresh_hits": placement.fresh_hits,
+                "spatial": spatial,
             }
         )
     if not stage_targets:
@@ -570,6 +722,505 @@ def _normalized_mask(cells: list[tuple[int, int]]) -> list[tuple[int, int]]:
     min_x = min(x for x, _ in cells)
     min_y = min(y for _, y in cells)
     return sorted((x - min_x, y - min_y) for x, y in cells)
+
+
+def _extract_contour(cells: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Extract boundary pixels sorted by polar angle around centroid.
+
+    Returns the outer boundary pixels as an ordered list of (x, y) tuples.
+    For small shapes (< 3 cells), returns all cells.
+    """
+    if len(cells) <= 2:
+        return sorted(cells)
+
+    cell_set = set(cells)
+    # Boundary: cells with at least one 4-connected neighbor NOT in the shape
+    boundary = sorted(
+        (x, y) for x, y in cells
+        if (x + 1, y) not in cell_set
+        or (x - 1, y) not in cell_set
+        or (x, y + 1) not in cell_set
+        or (x, y - 1) not in cell_set
+    )
+    if len(boundary) <= 2:
+        return boundary
+
+    cx = sum(x for x, _ in boundary) / len(boundary)
+    cy = sum(y for _, y in boundary) / len(boundary)
+    return sorted(boundary, key=lambda c: (math.atan2(c[1] - cy, c[0] - cx), c[0], c[1]))
+
+
+def _compute_perimeter(contour: list[tuple[int, int]]) -> int:
+    """Compute perimeter as sum of consecutive edge pixel distances.
+
+    8-connectivity: horizontal/vertical steps = 1, diagonal steps = sqrt(2).
+    Returns integer perimeter (rounded).
+    """
+    if len(contour) <= 1:
+        return 0
+    total = 0.0
+    for i in range(len(contour)):
+        x1, y1 = contour[i]
+        x2, y2 = contour[(i + 1) % len(contour)]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        if dx == 0 or dy == 0:
+            total += 1.0
+        else:
+            total += math.sqrt(2.0)
+    return int(round(total))
+
+
+def _compute_area(cells: list[tuple[int, int]]) -> int:
+    """Compute area as number of pixels in the shape."""
+    return len(cells)
+
+
+_EPSILON = 1e-12
+
+
+def _compute_hu_moments(cells: list[tuple[int, int]]) -> list[float]:
+    """Compute 7 rotation-invariant Hu moments for a set of pixel coordinates.
+
+    Uses image moment formulas for binary shapes (I(x,y) = 1 for shape pixels).
+    Returns 7 Hu moment values (as floats, clamped to avoid zero/overflow).
+    """
+    if not cells:
+        return [0.0] * 7
+
+    # Raw moments M_{pq} = sum x^p y^q
+    m00 = float(len(cells))
+    if m00 < _EPSILON:
+        return [0.0] * 7
+
+    m10 = sum(x for x, _ in cells)
+    m01 = sum(y for _, y in cells)
+    cx = m10 / m00
+    cy = m01 / m00
+
+    # Central moments mu_{pq} = sum (x-cx)^p (y-cy)^q
+    mu20 = mu02 = mu11 = mu30 = mu03 = mu12 = mu21 = 0.0
+    for x, y in cells:
+        dx = x - cx
+        dy = y - cy
+        dx2 = dx * dx
+        dy2 = dy * dy
+        mu20 += dx2
+        mu02 += dy2
+        mu11 += dx * dy
+        dx3 = dx2 * dx
+        dy3 = dy2 * dy
+        mu30 += dx3
+        mu03 += dy3
+        mu12 += dx * dy2
+        mu21 += dx2 * dy
+
+    # Normalized central moments eta_{pq} = mu_{pq} / mu_{00}^{(1 + (p+q)/2)}
+    denom = m00  # mu00 = m00 (already normalized)
+    denom2 = denom * denom
+    denom_1_5 = denom * math.sqrt(denom)
+    denom2_sqrt = denom2 * denom
+
+    eta20 = mu20 / denom2 if denom2 > _EPSILON else 0.0
+    eta02 = mu02 / denom2 if denom2 > _EPSILON else 0.0
+    eta11 = mu11 / denom2 if denom2 > _EPSILON else 0.0
+    eta30 = mu30 / denom_1_5 if denom_1_5 > _EPSILON else 0.0
+    eta03 = mu03 / denom_1_5 if denom_1_5 > _EPSILON else 0.0
+    eta12 = mu12 / denom_1_5 if denom_1_5 > _EPSILON else 0.0
+    eta21 = mu21 / denom_1_5 if denom_1_5 > _EPSILON else 0.0
+
+    # Hu moments (7 invariants)
+    h1 = eta20 + eta02
+    h2 = (eta20 - eta02) ** 2 + 4 * eta11 ** 2
+    h3 = (eta30 - 3 * eta12) ** 2 + (3 * eta21 - eta03) ** 2
+    h4 = (eta30 + eta12) ** 2 + (eta21 + eta03) ** 2
+    h5 = (
+        (eta30 - 3 * eta12) * (eta30 + eta12) * ((eta30 + eta12) ** 2 - 3 * (eta21 + eta03) ** 2)
+        + (3 * eta21 - eta03) * (eta21 + eta03) * (3 * (eta30 + eta12) ** 2 - (eta21 + eta03) ** 2)
+    )
+    h6 = (
+        (eta20 - eta02) * ((eta30 + eta12) ** 2 - (eta21 + eta03) ** 2)
+        + 4 * eta11 * (eta30 + eta12) * (eta21 + eta03)
+    )
+    h7 = (
+        (3 * eta21 - eta03) * (eta30 + eta12) * ((eta30 + eta12) ** 2 - 3 * (eta21 + eta03) ** 2)
+        - (eta30 - 3 * eta12) * (eta21 + eta03) * (3 * (eta30 + eta12) ** 2 - (eta21 + eta03) ** 2)
+    )
+
+    # Clamp near-zero values and use absolute value (sign can vary with rotation)
+    moments = [h1, h2, h3, h4, h5, h6, h7]
+    clamped = [abs(m) if abs(m) > _EPSILON else 0.0 for m in moments]
+    return clamped
+
+
+def _hu_log_distance(m1: list[float], m2: list[float]) -> float:
+    """Compute log-scaled distance between two sets of 7 Hu moments.
+
+    Distance = sum |log(|m1_i| + 1e-12) - log(|m2_i| + 1e-12)| for i = 1..7
+    Lower = more similar.
+    """
+    dist = 0.0
+    for a, b in zip(m1, m2):
+        log_a = math.log(abs(a) + 1e-12)
+        log_b = math.log(abs(b) + 1e-12)
+        dist += abs(log_a - log_b)
+    return dist
+
+
+def _convex_hull(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Compute convex hull using Andrew's monotone chain algorithm.
+
+    Returns hull points in counter-clockwise order, without collinear points.
+    Returns empty list for < 3 points.
+    """
+    if len(points) < 3:
+        return []
+
+    pts = sorted(set(points))
+
+    def cross(o: tuple[int, int], a: tuple[int, int], b: tuple[int, int]) -> int:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[int, int]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper: list[tuple[int, int]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    return lower[:-1] + upper[:-1]
+
+
+def _compute_shape_features(
+    cells: list[tuple[int, int]],
+    contour: list[tuple[int, int]],
+    perimeter: int,
+    bbox: tuple[int, int, int, int],
+) -> dict[str, float]:
+    """Compute structural shape features.
+
+    Returns dict with: aspect_ratio, compactness, solidity, extent.
+    """
+    features: dict[str, float] = {}
+    area = float(len(cells))
+    x1, y1, x2, y2 = bbox
+    bbox_w = float(max(1, x2 - x1 + 1))
+    bbox_h = float(max(1, y2 - y1 + 1))
+
+    # Aspect ratio
+    features["aspect_ratio"] = bbox_w / bbox_h if bbox_h > _EPSILON else 0.0
+
+    # Extent = area / bbox area
+    bbox_area = bbox_w * bbox_h
+    features["extent"] = area / bbox_area if bbox_area > _EPSILON else 0.0
+
+    # Compactness = perimeter² / area (circle ≈ 12.6)
+    if area > _EPSILON:
+        features["compactness"] = (float(perimeter) ** 2) / area
+    else:
+        features["compactness"] = 0.0
+
+    # Convex hull derived features
+    hull = _convex_hull(contour if len(contour) >= 3 else cells)
+    if len(hull) >= 3:
+        hull_perimeter = _compute_perimeter(hull)
+        hull_area = _compute_hull_area(hull)
+        # Solidity = area / convex hull area
+        features["solidity"] = area / hull_area if hull_area > _EPSILON else 1.0
+        # Convexity = convex hull perimeter / actual perimeter
+        features["convexity"] = hull_perimeter / float(perimeter) if perimeter > 0 else 1.0
+    else:
+        features["solidity"] = 1.0
+        features["convexity"] = 1.0
+
+    return features
+
+
+def _compute_hull_area(hull: list[tuple[int, int]]) -> float:
+    """Compute area of a convex polygon in pixel units.
+
+    Counts integer-coordinate pixels inside or on the hull polygon.
+    """
+    if len(hull) < 3:
+        return 0.0
+    x1 = min(x for x, _ in hull)
+    y1 = min(y for _, y in hull)
+    x2 = max(x for x, _ in hull)
+    y2 = max(y for _, y in hull)
+
+    count = 0.0
+    for y in range(y1, y2 + 1):
+        for x in range(x1, x2 + 1):
+            if _point_in_convex_polygon((x, y), hull):
+                count += 1.0
+    return count
+
+
+def _point_in_convex_polygon(point: tuple[int, int], hull: list[tuple[int, int]]) -> bool:
+    """Test if point is inside or on a convex polygon using cross product signs."""
+    x, y = point
+    n = len(hull)
+    sign: bool | None = None
+    for i in range(n):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % n]
+        cross = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
+        if abs(cross) < _EPSILON:
+            continue
+        if sign is None:
+            sign = cross > 0
+        elif (cross > 0) != sign:
+            return False
+    return True
+
+
+def match_shape_to_template(
+    cells: list[tuple[int, int]],
+    template_hu_moments: list[float],
+    threshold: float = 0.1,
+) -> tuple[float, float]:
+    """Compare a shape against a template using Hu moment log-distance.
+
+    Args:
+        cells: The shape's pixel coordinates.
+        template_hu_moments: 7 Hu moments of the template.
+        threshold: Distance threshold below which shapes are considered matching.
+
+    Returns:
+        (similarity_score, rotation_estimate)
+        similarity_score in [0, 1] where 1.0 = identical, 0.0 = very different.
+    """
+    shape_hu = _compute_hu_moments(cells)
+    hu_dist = _hu_log_distance(shape_hu, template_hu_moments)
+    # Convert distance to similarity: 1 / (1 + dist)
+    similarity = 1.0 / (1.0 + hu_dist)
+    rotation = _estimate_rotation_angle(cells)
+    return similarity, rotation
+
+
+def find_best_template_match(
+    cells: list[tuple[int, int]],
+    templates: list[dict[str, Any]],
+    min_score: float = 0.7,
+) -> tuple[int | None, float]:
+    """Find the best matching template for a shape from a list of templates.
+
+    Args:
+        cells: The shape's pixel coordinates.
+        templates: List of template dicts, each must have "hu_moments" key.
+        min_score: Minimum similarity score required.
+
+    Returns:
+        (best_template_index, similarity_score) or (None, 0.0) if no match found.
+    """
+    if not templates or not cells:
+        return None, 0.0
+
+    best_idx: int | None = None
+    best_score = 0.0
+
+    for i, template in enumerate(templates):
+        tm = template.get("hu_moments")
+        if tm is None:
+            continue
+        score, _ = match_shape_to_template(cells, tm, threshold=0.1)
+        if score > best_score and score >= min_score:
+            best_score = score
+            best_idx = i
+
+    return best_idx, best_score
+
+
+# ---------------------------------------------------------------------------
+# Iteration 7: Template storage from solved puzzles
+# ---------------------------------------------------------------------------
+
+_SHAPE_TEMPLATES_PATH = Path("shape_templates.json")
+
+
+def store_shape_template(
+    cells: list[tuple[int, int]],
+    hu_moments: list[float] | None = None,
+    features: dict[str, float] | None = None,
+    placement: dict[str, Any] | None = None,
+    goal_coverage: list[tuple[int, int]] | None = None,
+    filepath: str | Path | None = None,
+) -> None:
+    """Store a shape template to a JSON file.
+
+    Each template stores the shape's Hu moments, features, and optional
+    placement metadata (mirror orientation, pixel target, goal coverage).
+    """
+    if hu_moments is None:
+        hu_moments = _compute_hu_moments(cells)
+    path = Path(filepath) if filepath else _SHAPE_TEMPLATES_PATH
+    templates = load_shape_templates(filepath)
+    template = {
+        "hu_moments": hu_moments,
+        "features": features or {},
+        "placement": placement or {},
+        "goal_coverage": sorted(goal_coverage) if goal_coverage else [],
+        "cell_count": len(cells),
+        "normalized_mask": _normalized_mask(cells),
+    }
+    # Check for near-duplicate (same Hu moments, close enough)
+    for existing in templates:
+        existing_hu = existing.get("hu_moments")
+        if existing_hu and _hu_log_distance(hu_moments, existing_hu) < 0.5:
+            # Merge: keep the one with more complete data
+            if placement and not existing.get("placement"):
+                existing["placement"] = placement
+            if goal_coverage and not existing.get("goal_coverage"):
+                existing["goal_coverage"] = sorted(goal_coverage)
+            if features and not existing.get("features"):
+                existing["features"] = features
+            _write_templates(templates, path)
+            return
+    templates.append(template)
+    _write_templates(templates, path)
+
+
+def _write_templates(templates: list[dict[str, Any]], path: Path) -> None:
+    """Write templates list to JSON file."""
+    try:
+        with open(path, "w") as f:
+            json.dump(templates, f, indent=2)
+    except (OSError, PermissionError):
+        pass
+
+
+def load_shape_templates(filepath: str | Path | None = None) -> list[dict[str, Any]]:
+    """Load shape templates from a JSON file.
+
+    Returns empty list if file doesn't exist or is corrupt.
+    """
+    path = Path(filepath) if filepath else _SHAPE_TEMPLATES_PATH
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Iteration 8: Template-aware mirror placement
+# ---------------------------------------------------------------------------
+
+def _template_aware_placement(
+    component: _ColorComponent,
+    remaining_goals: set[tuple[int, int]],
+    goal_cluster_map: dict[str, set[tuple[int, int]]],
+    horizontal: bool,
+    axis: int,
+    *,
+    width: int,
+    height: int,
+    templates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Try template-aware placement before brute-force search.
+
+    If a shape matches a stored template with the same mirror orientation,
+    use the template's cached target. Otherwise returns None to fall back
+    to brute-force.
+    """
+    if not templates:
+        return None
+
+    cells = component.cells
+    best_idx, score = find_best_template_match(cells, templates, min_score=0.8)
+    if best_idx is None:
+        return None
+
+    template = templates[best_idx]
+    tp = template.get("placement", {})
+    template_horiz = tp.get("horizontal")
+    if template_horiz is not None and template_horiz != horizontal:
+        return None  # mirror orientation mismatch
+    return {
+        "template_index": best_idx,
+        "score": score,
+        "target_anchor": tp.get("target_anchor"),
+        "placement": tp,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Iteration 9: Partial overlap / fuzzy mask matching
+# ---------------------------------------------------------------------------
+
+def _mask_overlap_score(
+    cells1: list[tuple[int, int]],
+    cells2: list[tuple[int, int]],
+) -> float:
+    """Compute IoU (Intersection over Union) between two masks.
+
+    Returns value in [0, 1] where 1.0 = identical masks.
+    No alignment — masks are compared at their raw positions.
+    Use this to detect the same shape appearing at the same location.
+    """
+    if not cells1 or not cells2:
+        return 0.0
+
+    set_a = set(cells1)
+    set_b = set(cells2)
+
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    if union == 0:
+        return 0.0
+    return intersection / union
+
+
+# ---------------------------------------------------------------------------
+# Iteration 10: Spatial relationship descriptors
+# ---------------------------------------------------------------------------
+
+def _compute_spatial_descriptors(
+    cells: list[tuple[int, int]],
+    mirror_cells: list[tuple[int, int]] | None = None,
+    goal_cells: list[tuple[int, int]] | None = None,
+    other_shapes_cells: list[list[tuple[int, int]]] | None = None,
+) -> dict[str, Any]:
+    """Compute spatial relationship descriptors for a shape.
+
+    Describes the shape's position relative to mirror, goals, and other shapes.
+    """
+    descriptors: dict[str, Any] = {}
+    shape_center = _center(cells)
+
+    if mirror_cells:
+        mirror_center = _center(mirror_cells)
+        descriptors["mirror_distance"] = abs(shape_center[0] - mirror_center[0]) + abs(shape_center[1] - mirror_center[1])
+        descriptors["mirror_side"] = "left" if shape_center[0] < mirror_center[0] else "right"
+
+    if goal_cells:
+        goal_centers = _center(goal_cells)
+        descriptors["goal_distance"] = abs(shape_center[0] - goal_centers[0]) + abs(shape_center[1] - goal_centers[1])
+        # Distance to nearest goal
+        min_gdist = min(abs(shape_center[0] - gx) + abs(shape_center[1] - gy) for gx, gy in goal_cells)
+        descriptors["nearest_goal_distance"] = min_gdist
+
+    if other_shapes_cells:
+        other_centers = [_center(s) for s in other_shapes_cells]
+        descriptors["other_shape_count"] = len(other_shapes_cells)
+        if other_centers:
+            min_sdist = min(
+                abs(shape_center[0] - cx) + abs(shape_center[1] - cy)
+                for cx, cy in other_centers
+            )
+            descriptors["nearest_shape_distance"] = min_sdist
+
+    return descriptors
 
 
 def _bbox(cells: list[tuple[int, int]]) -> tuple[int, int, int, int]:
