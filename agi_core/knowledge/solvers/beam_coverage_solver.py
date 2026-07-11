@@ -243,6 +243,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._last_levels_completed: int | None = None
         self._switched: bool = False
         self._last_switch_step: int = -1
+        self._board_sig: tuple = ()
 
     def reset_level(self) -> None:
         self._cached_targets = None
@@ -273,6 +274,14 @@ class BeamCoverageSolver(DynamicsSolver):
         primary = gm.features.primary_dynamics
         if primary == "beam":
             return False
+        # Build a board signature to detect level transitions
+        # Use stable features that don't change within a level.
+        sig = (mirror_info["horizontal"], mirror_info.get("axis_py"), mirror_info.get("axis_px"),
+               len(gm.goal_positions), len(shapes))
+        # Reset on any change in board configuration (new level)
+        if sig != self._board_sig:
+            self.reset_level()
+            self._board_sig = sig
         if mirror_info["horizontal"]:
             return True
         return len(shapes) >= 2
