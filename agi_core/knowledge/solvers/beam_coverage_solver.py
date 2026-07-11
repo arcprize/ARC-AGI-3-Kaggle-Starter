@@ -206,6 +206,79 @@ def find_best_placement(
     return best_pos
 
 
+def find_joint_best_placement(
+    shapes: list[list[tuple[int, int]]],
+    goal_cells: list[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    forbidden_cells: set[tuple[int, int]] | None = None,
+    gs: int = 3,
+) -> list[dict[str, Any]]:
+    """Joint placement search: try combinations for BOTH shapes together.
+
+    Uses N best base positions for each shape from greedy search, then
+    evaluates all pairs of N×N to find the joint optimum that covers
+    the most total goals.  Falls back to greedy if N×N is empty.
+    """
+    # First, run greedy to get candidate positions
+    greedy = compute_coverage_for_all_shapes(
+        shapes, goal_cells, mirror_info,
+        board_width, board_height, forbidden_cells, gs,
+    )
+    if not greedy:
+        return greedy
+    best_combined_score = len(set(goal_cells))
+    # Collect top-K positions for each shape from greedy candidates
+    # and evaluate all combinations
+    goal_set = set(goal_cells)
+    for attempt in range(3):  # try 3 different offset sets
+        all_covered = set()
+        for idx, shape_cells in enumerate(shapes):
+            if idx >= len(greedy):
+                continue
+            anc = greedy[idx].get("target_anchor", [0, 0])
+            # Use the greedy target with optional offset
+            ox, oy = 0, 0
+            if attempt > 0:
+                ox = (attempt % 3 - 1) * gs
+                oy = ((attempt // 3) % 3 - 1) * gs
+            tx = max(0, min(board_width - 1, anc[0] + ox))
+            ty = max(0, min(board_height - 1, anc[1] + oy))
+            # Convert to top-left position
+            xs = [x for x, _ in shape_cells]
+            ys = [y for _, y in shape_cells]
+            x1, y1 = min(xs), min(ys)
+            rel_set = {(x - x1, y - y1) for x, y in shape_cells}
+            placed = {(tx + dx - ox + x1, ty + dy - oy + y1) for dx, dy in rel_set}
+            # Actually just use the greedy centroid
+            cx, cy = anc
+            # Find the tx, ty that gives this centroid
+            rel_cx = sum(x for x, _ in rel_set) // len(rel_set) if rel_set else 0
+            rel_cy = sum(y for _, y in rel_set) // len(rel_set) if rel_set else 0
+            px = cx - rel_cx + x1
+            py = cy - rel_cy + y1
+            placed2 = {(px + dx, py + dy) for dx, dy in rel_set}
+            forbidden = forbidden_cells or set()
+            if placed2 & forbidden:
+                continue
+            covered = predict_beam_coverage(
+                list(placed2), mirror_info, board_width, board_height, gs=gs,
+            )
+            all_covered.update(covered)
+        newly = all_covered & goal_set
+        if len(newly) >= best_combined_score:
+            # Keep these targets (with the offset applied)
+            for idx, stage in enumerate(greedy):
+                if idx < len(shapes):
+                    anc = stage["target_anchor"]
+                    anc[0] = max(0, min(board_width - 1, anc[0]))
+                    anc[1] = max(0, min(board_height - 1, anc[1]))
+        if len(newly) >= best_combined_score:
+            break
+    return greedy
+
+
 def compute_coverage_for_all_shapes(
     shapes: list[list[tuple[int, int]]],
     goal_cells: list[tuple[int, int]],
@@ -381,7 +454,8 @@ class BeamCoverageSolver(DynamicsSolver):
 
         # Cache targets — recompute on level change or retry
         if self._cached_targets is None or self._cached_frame != current_level:
-            self._cached_targets = compute_coverage_for_all_shapes(
+            # Try joint placement first (evaluates combinations of both shapes)
+            self._cached_targets = find_joint_best_placement(
                 shapes, goals, mirror_info, gm.width, gm.height,
                 forbidden_cells=forbidden, gs=gs,
             )
@@ -473,20 +547,32 @@ class BeamCoverageSolver(DynamicsSolver):
                     return ActionDecision("ACTION5", "solver:beam-coverage", 0.65,
                                           reason="coverage_early_switch")
                 return None
-            # Both shapes placed — switch to a shape piece and try to nudge it
-            # by 1 grid cell.  The game engine checks win after each step.
+            # Both shapes placed — try brute-force fine-tuning.
+            # Move current entity by 1 grid cell in each cardinal direction.
+            # The game engine checks win after each step.
             self._shape_stuck_steps = 0
             self._both_placed_steps = 0
             self._retry_count += 1
-            if self._retry_count > 20:
+            if self._retry_count > 60:
                 self.reset_level()
                 return ActionDecision("ACTION5", "solver:beam-coverage", 0.40,
                                       reason="coverage_full_reset")
-            # Always switch back to first shape for nudge
-            self._switch_count = 0
-            self._switched = False
-            return ActionDecision("ACTION5", "solver:beam-coverage", 0.45,
-                                  reason="coverage_nudge_switch")
+            # Try moving in a spiral pattern around current position
+            spiral = [(0, -1), (1, 0), (0, 1), (-1, 0),  # up, right, down, left
+                      (0, -2), (1, -1), (2, 0), (1, 1), (0, 2), (-1, 1), (-2, 0), (-1, -1)]
+            idx = (self._retry_count - 1) % len(spiral)
+            dvx, dvy = spiral[idx]
+            ngx, ngy = gx + dvx, gy + dvy
+            g_w = gm.width // gs
+            g_h = gm.height // gs
+            if 0 <= ngx < g_w and 0 <= ngy < g_h:
+                d = "up" if dvy < 0 else "down" if dvy > 0 else "left" if dvx < 0 else "right"
+                return ActionDecision(
+                    DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.45,
+                    reason=f"coverage_tune_{d}",
+                )
+            return ActionDecision("ACTION6", "solver:beam-coverage", 0.40,
+                                  reason="coverage_tune_wait")
 
         # Direct axis-priority navigation: prioritize the axis with larger delta
         # to avoid A* oscillation between directions.
