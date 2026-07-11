@@ -183,14 +183,10 @@ def compute_coverage_for_all_shapes(
     for idx, shape_cells in enumerate(shapes):
         if not shape_cells:
             continue
-        current_center = (
-            sum(x for x, _ in shape_cells) // len(shape_cells),
-            sum(y for _, y in shape_cells) // len(shape_cells),
-        )
         best_pos = find_best_placement(
             shape_cells, remaining, mirror_info,
             board_width, board_height,
-            current_center=current_center,
+            current_center=None,
             forbidden_cells=forbidden_cells,
         )
         if best_pos is None:
@@ -243,6 +239,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._switch_count: int = 0
         self._last_player_pos: tuple[int, int] | None = None
         self._shape_stuck_steps: int = 0
+        self._move_history: list[str] = []
 
     def reset_level(self) -> None:
         self._cached_targets = None
@@ -250,6 +247,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._switch_count = 0
         self._last_player_pos = None
         self._shape_stuck_steps = 0
+        self._move_history = []
 
     # ── Activation ─────────────────────────────────────────────────────
 
@@ -308,13 +306,19 @@ class BeamCoverageSolver(DynamicsSolver):
                 for dx in range(-1, 2):
                     forbidden.add((mx + dx, y))
 
-        # Cache targets per switch_count for stability (don't recompute each frame)
-        if self._cached_targets is None or self._cached_frame != self._switch_count:
+        # Cache targets ONCE per level (stable across switches).
+        # Use a level-wide key so targets don't change as shapes move.
+        level_key = hash((
+            tuple(sorted(gm.goal_positions)),
+            mirror_info["horizontal"],
+            mirror_info.get("axis_px"), mirror_info.get("axis_py"),
+        )) if gm.goal_positions else 0
+        if self._cached_targets is None or self._cached_frame != level_key:
             self._cached_targets = compute_coverage_for_all_shapes(
                 shapes, goals, mirror_info, gm.width, gm.height,
                 forbidden_cells=forbidden,
             )
-            self._cached_frame = self._switch_count
+            self._cached_frame = level_key
 
         if not self._cached_targets:
             return None
@@ -365,9 +369,12 @@ class BeamCoverageSolver(DynamicsSolver):
         g_w = gm.width // gs
         g_h = gm.height // gs
         arrival_dist = abs(gx - target_gx) + abs(gy - target_gy)
+        # Also compute pixel distance for comparison
+        pixel_dist = abs(px - target_cx) + abs(py - target_cy)
         final_stage = self._switch_count >= len(shapes)
 
-        if arrival_dist <= 1:
+        # Emergency switch if close enough in pixel or grid space
+        if arrival_dist <= 1 or pixel_dist <= gs * 2:
             if self._switch_count < len(shapes):
                 self._switch_count += 1
                 if self._switch_count < len(shapes):
@@ -377,6 +384,15 @@ class BeamCoverageSolver(DynamicsSolver):
                                       reason="coverage_all_placed")
             return ActionDecision("ACTION6", "solver:beam-coverage", 0.60,
                                   reason="coverage_wait")
+
+        # Emergency switch after enough movement has been attempted
+        if self._shape_stuck_steps >= 8 and self._switch_count < len(shapes):
+            self._switch_count += 1
+            self._shape_stuck_steps = 0
+            if self._switch_count < len(shapes):
+                return ActionDecision("ACTION5", "solver:beam-coverage", 0.65,
+                                      reason="coverage_early_switch")
+            return None
 
         # Grid-level A* pathfinding: convert expanded walkable to grid coords
         expanded = self._build_expanded_walkable(gm)
@@ -395,6 +411,22 @@ class BeamCoverageSolver(DynamicsSolver):
             ngx, ngy = path[1]
             d = ("right" if ngx > gx else "left" if ngx < gx else
                  "down" if ngy > gy else "up")
+            # Oscillation damping: if the same direction was used in the last
+            # 3 frames and the player hasn't moved, try the alternate axis.
+            self._move_history.append(d)
+            if len(self._move_history) > 5:
+                self._move_history.pop(0)
+            if len(self._move_history) >= 4:
+                last4 = self._move_history[-4:]
+                if last4 == ["down", "up", "down", "up"] or last4 == ["up", "down", "up", "down"]:
+                    # Oscillation detected — use horizontal direction instead
+                    if target_gx > gx:
+                        d = "right"
+                    elif target_gx < gx:
+                        d = "left"
+                    else:
+                        d = "down"  # fallback
+                    self._move_history.clear()
             return ActionDecision(
                 DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.75,
                 reason=f"coverage_nav_{d}",
