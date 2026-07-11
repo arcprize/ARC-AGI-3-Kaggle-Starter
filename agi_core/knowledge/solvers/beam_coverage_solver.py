@@ -35,6 +35,8 @@ def _get_shape_pixels(
     components: list,
     width: int,
     height: int,
+    board: list[list[int]] | None = None,
+    gs: int = 3,
 ) -> list[list[tuple[int, int]]]:
     # Collect color-5 interior components (the actual shape pieces)
     color5_shapes = []
@@ -50,22 +52,40 @@ def _get_shape_pixels(
             continue
         color5_shapes.append(c)
 
-    # Merge color-0 overlays into their parent color-5 shape
+    # For each shape, extract the precise pixel pattern from the board
+    # at the sprite's grid-aligned bounding box.  This is more accurate
+    # than using the analyzer's component cells (which may include artifacts).
     result = []
     for c5 in color5_shapes:
-        cells = set(c5.cells)
         x1, y1, x2, y2 = c5.bbox
-        # Find any color-0 component overlapping this shape
+        # Determine the grid-aligned sprite bounding box.
+        # Shape sprites are 1:1 pixel sprites rendered at grid positions.
+        # Find the sprite width/height from the bbox.
+        sw = x2 - x1 + 1
+        sh = y2 - y1 + 1
+        # Read non-background pixels from the board within the bbox
+        cells = set()
+        bg = 9  # AR25 background color
+        if board:
+            for dy in range(sh):
+                for dx in range(sw):
+                    px, py = x1 + dx, y1 + dy
+                    if 0 <= px < width and 0 <= py < height:
+                        v = board[py][px]
+                        if v not in (-1, bg):
+                            cells.add((px, py))
+        if not cells:
+            # Fallback to component cells if board reading failed
+            cells = set(c5.cells)
+        # Merge color-0 overlays
         for c0 in components:
             if c0.dominant_color != 0:
                 continue
             if c0.touches_border:
                 continue
-            # Check bounding box overlap
             ox1, oy1, ox2, oy2 = c0.bbox
             if ox1 > x2 or ox2 < x1 or oy1 > y2 or oy2 < y1:
                 continue
-            # Check cell overlap
             if any(cell in cells for cell in c0.cells):
                 cells.update(c0.cells)
         result.append(list(cells))
@@ -291,7 +311,7 @@ class BeamCoverageSolver(DynamicsSolver):
         mirror_info = _find_mirror_info(gm.components, gm.width, gm.height)
         if mirror_info is None:
             return False
-        shapes = _get_shape_pixels(gm.components, gm.width, gm.height)
+        shapes = _get_shape_pixels(gm.components, gm.width, gm.height, board=gm.board if hasattr(gm, 'board') else None)
         if not shapes:
             return False
         goals = get_goal_cells(gm.components, gm.width)
@@ -322,7 +342,9 @@ class BeamCoverageSolver(DynamicsSolver):
         mirror_info = _find_mirror_info(gm.components, gm.width, gm.height)
         if mirror_info is None:
             return None
-        shapes = _get_shape_pixels(gm.components, gm.width, gm.height)
+        gs = max(1, gm.features.grid_scale) if hasattr(gm.features, 'grid_scale') else 3
+        board = gm.board if hasattr(gm, 'board') else None
+        shapes = _get_shape_pixels(gm.components, gm.width, gm.height, board=board, gs=gs)
         if not shapes:
             return None
         goals = get_goal_cells(gm.components, gm.width)
@@ -330,7 +352,6 @@ class BeamCoverageSolver(DynamicsSolver):
             return None
 
         px, py = gm.player_pos
-        gs = max(1, gm.features.grid_scale) if hasattr(gm.features, 'grid_scale') else 3
 
         # Reset on level transition (MUST be before cache check)
         try:
@@ -368,17 +389,6 @@ class BeamCoverageSolver(DynamicsSolver):
 
         if not self._cached_targets:
             return None
-
-        player_near_mirror = False
-        if mirror_info["horizontal"]:
-            player_near_mirror = abs(py - mirror_info["axis_py"]) <= 3
-        else:
-            player_near_mirror = abs(px - mirror_info["axis_px"]) <= 3
-
-        # If on the mirror, immediately switch to a shape piece
-        if player_near_mirror and self._switch_count >= 0 and len(shapes) > 0:
-            return ActionDecision("ACTION5", "solver:beam-coverage", 0.60,
-                                  reason="coverage_switch_from_mirror")
 
         # Apply retry offset to nudge shapes to different positions.
         if self._retry_count > 0:
@@ -463,20 +473,20 @@ class BeamCoverageSolver(DynamicsSolver):
                     return ActionDecision("ACTION5", "solver:beam-coverage", 0.65,
                                           reason="coverage_early_switch")
                 return None
-            # Both shapes placed but level not complete — switch back to
-            # shape 0 and try a different position via cache invalidation.
+            # Both shapes placed — switch to a shape piece and try to nudge it
+            # by 1 grid cell.  The game engine checks win after each step.
             self._shape_stuck_steps = 0
             self._both_placed_steps = 0
-            self._cached_targets = None
             self._retry_count += 1
             if self._retry_count > 20:
                 self.reset_level()
                 return ActionDecision("ACTION5", "solver:beam-coverage", 0.40,
                                       reason="coverage_full_reset")
+            # Always switch back to first shape for nudge
             self._switch_count = 0
             self._switched = False
-            return ActionDecision("ACTION5", "solver:beam-coverage", 0.50,
-                                  reason="coverage_retry_switch")
+            return ActionDecision("ACTION5", "solver:beam-coverage", 0.45,
+                                  reason="coverage_nudge_switch")
 
         # Direct axis-priority navigation: prioritize the axis with larger delta
         # to avoid A* oscillation between directions.
