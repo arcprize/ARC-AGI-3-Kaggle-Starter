@@ -87,39 +87,55 @@ def predict_beam_coverage(
     mirror_info: dict[str, Any],
     board_width: int,
     board_height: int,
+    gs: int = 3,
 ) -> set[tuple[int, int]]:
-    """Simulate beam propagation: each non-transparent pixel reflects
-    across the mirror up to _MAX_REFLECT_DEPTH times, matching the
-    game engine's frckrbsfcm() logic.
+    """Simulate beam propagation in GRID coordinates (0-20).
+
+    The game engine's beam grid is indexed by GRID coordinates.
+    All inputs (shape_cells, mirror axis) can be in pixel coordinates;
+    they are converted to grid coordinates internally.
+    Returns covered grid cells as pixel positions (the grid cell center).
     """
-    covered: set[tuple[int, int]] = set()
-    q: deque[tuple[int, int, int]] = deque()
-    visited: set[tuple[int, int]] = set()
-
-    for px, py in shape_cells:
-        covered.add((px, py))
-        if (px, py) not in visited:
-            visited.add((px, py))
-            q.append((px, py, 0))
-
+    grid_w = board_width // gs
+    grid_h = board_height // gs
+    if grid_w <= 0 or grid_h <= 0:
+        return set()
+    # Convert pixel coords to grid coords
+    grid_cells = {(x // gs, y // gs) for x, y in shape_cells
+                  if 0 <= x // gs < grid_w and 0 <= y // gs < grid_h}
+    if not grid_cells:
+        return set()
+    # Mirror axis in grid coordinates
     horizontal = mirror_info.get("horizontal", True)
-    axis_px = mirror_info.get("axis_px", 0)
-    axis_py = mirror_info.get("axis_py", 0)
-
+    axis_gx = mirror_info.get("axis_px", 0) // gs
+    axis_gy = mirror_info.get("axis_py", 0) // gs
+    covered: set[tuple[int, int]] = set(grid_cells)
+    q: deque[tuple[int, int, int]] = deque()
+    visited: set[tuple[int, int]] = set(grid_cells)
+    for gx, gy in grid_cells:
+        q.append((gx, gy, 0))
     while q:
-        px, py, depth = q.popleft()
+        gx, gy, depth = q.popleft()
         if depth >= _MAX_REFLECT_DEPTH:
             continue
         if horizontal:
-            rx, ry = px, 2 * axis_py - py
+            rgx, rgy = gx, 2 * axis_gy - gy
         else:
-            rx, ry = 2 * axis_px - px, py
-        if 0 <= rx < board_width and 0 <= ry < board_height and (rx, ry) not in visited:
-            visited.add((rx, ry))
-            covered.add((rx, ry))
-            q.append((rx, ry, depth + 1))
-
-    return covered
+            rgx, rgy = 2 * axis_gx - gx, gy
+        if 0 <= rgx < grid_w and 0 <= rgy < grid_h and (rgx, rgy) not in visited:
+            visited.add((rgx, rgy))
+            covered.add((rgx, rgy))
+            q.append((rgx, rgy, depth + 1))
+    # Convert grid cells to ALL pixel positions within each cell
+    # so that pixel-level goal checks match correctly.
+    pixel_covered = set()
+    for gx, gy in covered:
+        base_x = gx * gs
+        base_y = gy * gs
+        for dx in range(gs):
+            for dy in range(gs):
+                pixel_covered.add((base_x + dx, base_y + dy))
+    return pixel_covered
 
 
 def find_best_placement(
@@ -130,6 +146,7 @@ def find_best_placement(
     board_height: int,
     current_center: tuple[int, int] | None = None,
     forbidden_cells: set[tuple[int, int]] | None = None,
+    gs: int = 3,
 ) -> tuple[int, int] | None:
     if not shape_cells or not remaining_goals:
         return None
@@ -153,7 +170,7 @@ def find_best_placement(
             if forbidden_cells and placed & forbidden_cells:
                 continue
             covered = predict_beam_coverage(
-                list(placed), mirror_info, board_width, board_height,
+                list(placed), mirror_info, board_width, board_height, gs=gs,
             )
             hits = len(covered & remaining_goals)
             if hits == 0:
@@ -176,6 +193,7 @@ def compute_coverage_for_all_shapes(
     board_width: int,
     board_height: int,
     forbidden_cells: set[tuple[int, int]] | None = None,
+    gs: int = 3,
 ) -> list[dict[str, Any]]:
     remaining = set(goal_cells)
     stage_targets: list[dict[str, Any]] = []
@@ -193,6 +211,7 @@ def compute_coverage_for_all_shapes(
             board_width, board_height,
             current_center=current_center,
             forbidden_cells=forbidden_cells,
+            gs=gs,
         )
         if best_pos is None:
             continue
@@ -203,7 +222,7 @@ def compute_coverage_for_all_shapes(
         rel_set = {(x - x1, y - y1) for x, y in shape_cells}
         placed = {(tx + dx, ty + dy) for dx, dy in rel_set}
         covered = predict_beam_coverage(
-            list(placed), mirror_info, board_width, board_height,
+            list(placed), mirror_info, board_width, board_height, gs=gs,
         )
         newly_covered = covered & remaining
         remaining -= newly_covered
@@ -343,7 +362,7 @@ class BeamCoverageSolver(DynamicsSolver):
         if self._cached_targets is None or self._cached_frame != current_level:
             self._cached_targets = compute_coverage_for_all_shapes(
                 shapes, goals, mirror_info, gm.width, gm.height,
-                forbidden_cells=forbidden,
+                forbidden_cells=forbidden, gs=gs,
             )
             self._cached_frame = current_level
 

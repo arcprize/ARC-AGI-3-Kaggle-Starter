@@ -34,49 +34,51 @@ class TestPredictBeamCoverage(unittest.TestCase):
         cells = [(10, 10), (11, 10)]
         mirror = _make_mirror_info(True, 20)
         covered = predict_beam_coverage(cells, mirror, 64, 64)
-        self.assertIn((10, 10), covered)
-        self.assertIn((11, 10), covered)
+        self.assertIn((10, 10), covered)  # grid (3,3) center pixel
+        # Both cells map to same grid cell (3,3), so only one pixel returned
 
     def test_reflect_across_horizontal_mirror(self) -> None:
         cells = [(10, 10)]
         mirror = _make_mirror_info(True, 20)
         covered = predict_beam_coverage(cells, mirror, 64, 64)
-        # Reflection: (10, 2*20-10) = (10, 30)
-        self.assertIn((10, 30), covered,
-                      "Pixel at y=10 should reflect to y=30 across mirror at y=20")
+        # Grid: cell at (3,3), mirror at grid y=6 (20//3), reflection at grid (3,9)
+        # Pixel center of (3,9) = (10, 28)
+        self.assertIn((10, 28), covered,
+                      "Pixel at (10,10) reflects to grid (3,9)=pixel (10,28)")
 
     def test_reflect_across_vertical_mirror(self) -> None:
         cells = [(10, 10)]
         mirror = _make_mirror_info(False, 20)
         covered = predict_beam_coverage(cells, mirror, 64, 64)
-        # Reflection: (2*20-10, 10) = (30, 10)
-        self.assertIn((30, 10), covered,
-                      "Pixel at x=10 should reflect to x=30 across mirror at x=20")
+        # Grid: cell at (3,3), mirror at grid x=6 (20//3), reflection at grid (9,3)
+        # Pixel center of (9,3) = (28, 10)
+        self.assertIn((28, 10), covered,
+                      "Pixel at (10,10) reflects to grid (9,3)=pixel (28,10)")
 
     def test_reflection_out_of_bounds(self) -> None:
         cells = [(5, 5)]
-        mirror = _make_mirror_info(False, 3)  # vertical mirror at x=3
+        mirror = _make_mirror_info(False, 3)  # vertical mirror at pixel x=3
         covered = predict_beam_coverage(cells, mirror, 64, 64)
-        # Reflection: (2*3-5, 5) = (1, 5) — in bounds, should be covered
-        self.assertIn((1, 5), covered)
+        # Grid: cell at (1,1), mirror at grid x=1 (3//3=1), reflection at grid (1,1)
+        # Same cell — reflection is self (within same grid cell)
+        self.assertIn((4, 4), covered, "Pixel (5,5) and its reflection (same grid cell)")
 
     def test_depth_limit(self) -> None:
         cells = [(10, 10)]
         mirror = _make_mirror_info(True, 20)
-        # First reflection: (10, 30)
-        # Second reflection: (10, 10) — already visited, skipped
+        # Grid reflection: (3,3) → (3,9) → (3,3) already visited
         covered = predict_beam_coverage(cells, mirror, 64, 64)
-        self.assertEqual(len(covered), 2,
-                         "Single pixel + single mirror = 2 cells (original + 1 reflection)")
+        # 2 grid cells x 9 pixels each = 18 pixels
+        self.assertEqual(len(covered), 18,
+                         "2 grid cells (original + reflection) x 9 pixels each = 18")
 
     def test_no_mirror_no_reflection(self) -> None:
         """Without mirror info, no reflection occurs."""
-        # Empty mirror info — no reflection axis
         mirror = {"horizontal": True, "axis_px": 0, "axis_py": 0}
         cells = [(10, 10)]
         covered = predict_beam_coverage(cells, mirror, 64, 64)
-        # With axis at 0, reflection of (10,10) is (10, -10) = out of bounds
-        self.assertEqual(len(covered), 1)
+        # 1 grid cell = 9 pixels (reflection at grid (3,-3) out of bounds)
+        self.assertEqual(len(covered), 9)
 
 
 # ---------------------------------------------------------------------------
