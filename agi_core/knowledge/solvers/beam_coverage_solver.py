@@ -240,6 +240,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._last_player_pos: tuple[int, int] | None = None
         self._shape_stuck_steps: int = 0
         self._move_history: list[str] = []
+        self._last_levels_completed: int | None = None
 
     def reset_level(self) -> None:
         self._cached_targets = None
@@ -248,6 +249,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._last_player_pos = None
         self._shape_stuck_steps = 0
         self._move_history = []
+        self._last_levels_completed = None
 
     # ── Activation ─────────────────────────────────────────────────────
 
@@ -307,24 +309,28 @@ class BeamCoverageSolver(DynamicsSolver):
                     forbidden.add((mx + dx, y))
 
         # Cache targets ONCE per level (stable across switches).
-        # Use a level-wide key so targets don't change as shapes move.
-        level_key = hash((
-            tuple(sorted(gm.goal_positions)),
-            mirror_info["horizontal"],
-            mirror_info.get("axis_px"), mirror_info.get("axis_py"),
-        )) if gm.goal_positions else 0
-        if self._cached_targets is None or self._cached_frame != level_key:
+        # Use the level number as key so targets never change within a level.
+        if self._cached_targets is None or self._cached_frame != current_level:
             self._cached_targets = compute_coverage_for_all_shapes(
                 shapes, goals, mirror_info, gm.width, gm.height,
                 forbidden_cells=forbidden,
             )
-            self._cached_frame = level_key
+            self._cached_frame = current_level
 
         if not self._cached_targets:
             return None
 
         px, py = gm.player_pos
         gs = max(1, gm.features.grid_scale) if hasattr(gm.features, 'grid_scale') else 3
+
+        # Reset on level transition
+        try:
+            current_level = int(ctx.plan_context.get("levels_completed", 0))
+        except (TypeError, ValueError):
+            current_level = 0
+        if self._last_levels_completed is None or current_level > self._last_levels_completed:
+            self.reset_level()
+        self._last_levels_completed = current_level
 
         player_near_mirror = False
         if mirror_info["horizontal"]:
@@ -345,13 +351,14 @@ class BeamCoverageSolver(DynamicsSolver):
             self._shape_stuck_steps = 0
         self._last_player_pos = (px, py)
 
-        if player_near_mirror and self._switch_count == 0:
+        # Always switch to first shape piece on first activation for horizontal mirrors.
+        # The player might start on a shape piece (not the mirror), so the mirror
+        # proximity check is unreliable.  Just switch immediately.
+        if self._switch_count == 0:
             if len(shapes) > 0:
                 self._switch_count = 1
                 return ActionDecision("ACTION5", "solver:beam-coverage", 0.70,
                                       reason="coverage_switch_to_shape")
-
-        if self._switch_count == 0:
             return None
 
         if self._shape_stuck_steps >= 30 and self._switch_count < len(shapes):
