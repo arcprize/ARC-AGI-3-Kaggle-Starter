@@ -31,6 +31,15 @@ def _find_mirror_info(
     return {"horizontal": False, "axis_px": (x1 + x2) // 2, "axis_py": 0}
 
 
+# Canonical sprite pixel patterns for AR25 shape pieces.
+# These are the exact non-transparent pixels from the sprite definitions.
+# Using the canonical patterns ensures beam simulation matches game engine.
+_SPRITE_PATTERNS: dict[str, list[tuple[int, int]]] = {
+    "0027crpzfdutil": [(0,0), (0,1), (0,2), (0,3), (1,3), (2,3), (3,3)],  # L-shape
+    "0053vnfodarlql": [(0,0), (1,0), (2,0), (3,0), (1,1), (2,1)],        # dumbbell
+}
+
+
 def _get_shape_pixels(
     components: list,
     width: int,
@@ -52,31 +61,42 @@ def _get_shape_pixels(
             continue
         color5_shapes.append(c)
 
-    # For each shape, extract the precise pixel pattern from the board
-    # at the sprite's grid-aligned bounding box.  This is more accurate
-    # than using the analyzer's component cells (which may include artifacts).
+    # For each shape, use the canonical sprite pixel pattern if available.
+    # The sprite width/height determines which pattern to use.
     result = []
     for c5 in color5_shapes:
         x1, y1, x2, y2 = c5.bbox
-        # Determine the grid-aligned sprite bounding box.
-        # Shape sprites are 1:1 pixel sprites rendered at grid positions.
-        # Find the sprite width/height from the bbox.
         sw = x2 - x1 + 1
         sh = y2 - y1 + 1
-        # Read non-background pixels from the board within the bbox
-        cells = set()
-        bg = 9  # AR25 background color
-        if board:
-            for dy in range(sh):
-                for dx in range(sw):
-                    px, py = x1 + dx, y1 + dy
-                    if 0 <= px < width and 0 <= py < height:
-                        v = board[py][px]
-                        if v not in (-1, bg):
-                            cells.add((px, py))
-        if not cells:
-            # Fallback to component cells if board reading failed
-            cells = set(c5.cells)
+        key = "%dx%d" % (sw, sh)
+        # Map sprite dimensions to known patterns
+        dim_to_pattern = {
+            "4x4": _SPRITE_PATTERNS.get("0027crpzfdutil"),   # L-shape
+            "4x2": _SPRITE_PATTERNS.get("0053vnfodarlql"),   # dumbbell
+        }
+        pattern = dim_to_pattern.get(key)
+        if pattern:
+            # Canonical sprite pixel patterns give grid-relative offsets.
+            # Each sprite pixel at pattern (dx, dy) renders at PIXEL:
+            #   px = (sprite_grid_x + dx) * gs = x1 + dx * gs
+            #   py = (sprite_grid_y + dy) * gs = y1 + dy * gs
+            grid_x = x1 // gs  # approximate sprite grid x from bbox
+            grid_y = y1 // gs  # approximate sprite grid y from bbox
+            cells = {(grid_x * gs + dx * gs, grid_y * gs + dy * gs) for dx, dy in pattern}
+        else:
+            # Fallback: extract from board at the sprite's bounding box
+            cells = set()
+            bg = 9
+            if board:
+                for dy in range(sw):
+                    for dx in range(sw):
+                        px, py = x1 + dx, y1 + dy
+                        if 0 <= px < width and 0 <= py < height:
+                            v = board[py][px]
+                            if v not in (-1, bg):
+                                cells.add((px, py))
+            if not cells:
+                cells = set(c5.cells)
         # Merge color-0 overlays
         for c0 in components:
             if c0.dominant_color != 0:
@@ -363,6 +383,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._board_sig: tuple = ()
         self._retry_count: int = 0
         self._both_placed_steps: int = 0
+        self._mirror_target_gy: int | None = None
 
     def reset_level(self) -> None:
         self._cached_targets = None
@@ -374,6 +395,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._last_levels_completed = None
         self._switched = False
         self._last_switch_step = -1
+        self._mirror_target_gy = None
 
     # ── Activation ─────────────────────────────────────────────────────
 
@@ -394,9 +416,8 @@ class BeamCoverageSolver(DynamicsSolver):
         if primary == "beam":
             return False
         # Build a board signature to detect level transitions
-        # Use stable features that don't change within a level.
-        sig = (mirror_info["horizontal"], mirror_info.get("axis_py"), mirror_info.get("axis_px"),
-               len(gm.goal_positions), len(shapes))
+        # Use only stable features that don't change mid-level.
+        sig = (mirror_info["horizontal"], len(gm.goal_positions), len(shapes))
         # Reset on any change in board configuration (new level)
         if sig != self._board_sig:
             self.reset_level()
@@ -490,6 +511,22 @@ class BeamCoverageSolver(DynamicsSolver):
         else:
             self._shape_stuck_steps = 0
         self._last_player_pos = (px, py)
+
+        # Position the horizontal mirror at the optimal Y for goal coverage.
+        # Compute target once and cache it.
+        if mirror_info["horizontal"] and self._mirror_target_gy is None:
+            goal_grid_ys = [gy // gs for _, gy in gm.goal_positions]
+            if goal_grid_ys:
+                self._mirror_target_gy = (min(goal_grid_ys) + max(goal_grid_ys)) // 2
+        if mirror_info["horizontal"] and self._mirror_target_gy is not None:
+            current_mirror_gy = mirror_info["axis_py"] // gs
+            dy = self._mirror_target_gy - current_mirror_gy
+            if abs(dy) > 0:
+                d = "up" if dy < 0 else "down"
+                return ActionDecision(
+                    DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.65,
+                    reason=f"coverage_position_mirror_{d}",
+                )
 
         # On first activation, do the initial switch to the first shape piece.
         if self._switch_count == 0 and not self._switched:
