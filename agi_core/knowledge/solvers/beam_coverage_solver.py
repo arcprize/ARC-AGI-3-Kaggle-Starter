@@ -36,13 +36,40 @@ def _get_shape_pixels(
     width: int,
     height: int,
 ) -> list[list[tuple[int, int]]]:
-    return [
-        list(c.cells)
-        for c in components
-        if c.dominant_color in (0, 5)
-        and 4 <= c.size <= 100
-        and not c.touches_border
-    ]
+    # Collect color-5 interior components (the actual shape pieces)
+    color5_shapes = []
+    for c in components:
+        if c.dominant_color != 5:
+            continue
+        if c.touches_border:
+            continue
+        if not (4 <= c.size <= 100):
+            continue
+        x1, y1, x2, y2 = c.bbox
+        if x1 <= 1 or y1 <= 1 or x2 >= width - 2 or y2 >= height - 2:
+            continue
+        color5_shapes.append(c)
+
+    # Merge color-0 overlays into their parent color-5 shape
+    result = []
+    for c5 in color5_shapes:
+        cells = set(c5.cells)
+        x1, y1, x2, y2 = c5.bbox
+        # Find any color-0 component overlapping this shape
+        for c0 in components:
+            if c0.dominant_color != 0:
+                continue
+            if c0.touches_border:
+                continue
+            # Check bounding box overlap
+            ox1, oy1, ox2, oy2 = c0.bbox
+            if ox1 > x2 or ox2 < x1 or oy1 > y2 or oy2 < y1:
+                continue
+            # Check cell overlap
+            if any(cell in cells for cell in c0.cells):
+                cells.update(c0.cells)
+        result.append(list(cells))
+    return result
 
 
 def get_goal_cells(components: list, width: int) -> list[tuple[int, int]]:
@@ -102,6 +129,7 @@ def find_best_placement(
     board_width: int,
     board_height: int,
     current_center: tuple[int, int] | None = None,
+    forbidden_cells: set[tuple[int, int]] | None = None,
 ) -> tuple[int, int] | None:
     if not shape_cells or not remaining_goals:
         return None
@@ -121,6 +149,9 @@ def find_best_placement(
     for tx in range(0, max(1, board_width - shape_w + 1)):
         for ty in range(0, max(1, board_height - shape_h + 1)):
             placed = {(tx + dx, ty + dy) for dx, dy in rel_set}
+            # Skip if any placed cell overlaps the mirror
+            if forbidden_cells and placed & forbidden_cells:
+                continue
             covered = predict_beam_coverage(
                 list(placed), mirror_info, board_width, board_height,
             )
@@ -144,6 +175,7 @@ def compute_coverage_for_all_shapes(
     mirror_info: dict[str, Any],
     board_width: int,
     board_height: int,
+    forbidden_cells: set[tuple[int, int]] | None = None,
 ) -> list[dict[str, Any]]:
     remaining = set(goal_cells)
     stage_targets: list[dict[str, Any]] = []
@@ -159,6 +191,7 @@ def compute_coverage_for_all_shapes(
             shape_cells, remaining, mirror_info,
             board_width, board_height,
             current_center=current_center,
+            forbidden_cells=forbidden_cells,
         )
         if best_pos is None:
             continue
@@ -257,17 +290,37 @@ class BeamCoverageSolver(DynamicsSolver):
         if not goals:
             return None
 
-        frame_key = len(gm.components) * 1000 + (gm.player_pos[0] * gm.width + gm.player_pos[1])
-        if self._cached_targets is None or self._cached_frame != frame_key:
+        # Collect forbidden cells: mirror strip + border-touching obstacles
+        forbidden: set[tuple[int, int]] = set()
+        for c in gm.components:
+            if c.touches_border and c.dominant_color not in (5, 11):
+                forbidden.update(c.cells)
+        # Add a thin buffer around the mirror axis to prevent shape overlap.
+        # Use gs-1 (2 pixels at scale=3) so valid positions near the mirror remain.
+        if mirror_info["horizontal"]:
+            my = mirror_info["axis_py"]
+            for x in range(gm.width):
+                for dy in range(-1, 2):
+                    forbidden.add((x, my + dy))
+        else:
+            mx = mirror_info["axis_px"]
+            for y in range(gm.height):
+                for dx in range(-1, 2):
+                    forbidden.add((mx + dx, y))
+
+        # Cache targets per switch_count for stability (don't recompute each frame)
+        if self._cached_targets is None or self._cached_frame != self._switch_count:
             self._cached_targets = compute_coverage_for_all_shapes(
                 shapes, goals, mirror_info, gm.width, gm.height,
+                forbidden_cells=forbidden,
             )
-            self._cached_frame = frame_key
+            self._cached_frame = self._switch_count
 
         if not self._cached_targets:
             return None
 
         px, py = gm.player_pos
+        gs = max(1, gm.features.grid_scale) if hasattr(gm.features, 'grid_scale') else 3
 
         player_near_mirror = False
         if mirror_info["horizontal"]:
@@ -278,6 +331,9 @@ class BeamCoverageSolver(DynamicsSolver):
         active_target_idx = min(self._switch_count, len(self._cached_targets) - 1)
         stage = self._cached_targets[active_target_idx]
         target_cx, target_cy = stage["target_anchor"]
+        # Grid-align target: snap to nearest grid cell's pixel center
+        target_cx = (target_cx // gs) * gs + (gs // 2)
+        target_cy = (target_cy // gs) * gs + (gs // 2)
 
         if self._last_player_pos == (px, py):
             self._shape_stuck_steps += 1
@@ -302,10 +358,16 @@ class BeamCoverageSolver(DynamicsSolver):
                                       reason="coverage_stuck_switch")
             return None
 
-        arrival_dist = abs(px - target_cx) + abs(py - target_cy)
+        # Convert to grid coordinates for navigation (game engine moves in grid steps)
+        gx, gy = px // gs, py // gs
+        target_gx = target_cx // gs
+        target_gy = target_cy // gs
+        g_w = gm.width // gs
+        g_h = gm.height // gs
+        arrival_dist = abs(gx - target_gx) + abs(gy - target_gy)
         final_stage = self._switch_count >= len(shapes)
 
-        if arrival_dist <= (1 if final_stage else 3):
+        if arrival_dist <= 1:
             if self._switch_count < len(shapes):
                 self._switch_count += 1
                 if self._switch_count < len(shapes):
@@ -316,19 +378,23 @@ class BeamCoverageSolver(DynamicsSolver):
             return ActionDecision("ACTION6", "solver:beam-coverage", 0.60,
                                   reason="coverage_wait")
 
+        # Grid-level A* pathfinding: convert expanded walkable to grid coords
         expanded = self._build_expanded_walkable(gm)
+        grid_walkable = set()
+        for wx, wy in expanded:
+            grid_walkable.add((wx // gs, wy // gs))
         try:
             path = astar(
-                (px, py), (target_cx, target_cy), expanded,
-                gm.width, gm.height, max_steps=5000,
+                (gx, gy), (target_gx, target_gy), grid_walkable,
+                g_w, g_h, max_steps=5000,
             )
         except Exception:
             path = None
 
         if path and len(path) > 1:
-            nx, ny = path[1]
-            d = ("right" if nx > px else "left" if nx < px else
-                 "down" if ny > py else "up")
+            ngx, ngy = path[1]
+            d = ("right" if ngx > gx else "left" if ngx < gx else
+                 "down" if ngy > gy else "up")
             return ActionDecision(
                 DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.75,
                 reason=f"coverage_nav_{d}",
@@ -336,9 +402,10 @@ class BeamCoverageSolver(DynamicsSolver):
                           "shape_stage": self._switch_count},
             )
 
+        # Grid-level heuristic fallback
         failed = ctx.plan_context.get("failed_directions", set())
-        dx = target_cx - px
-        dy = target_cy - py
+        dx = target_gx - gx
+        dy = target_gy - gy
         candidates = []
         if dx > 0: candidates.append("right")
         elif dx < 0: candidates.append("left")
@@ -349,8 +416,8 @@ class BeamCoverageSolver(DynamicsSolver):
             if d in failed:
                 continue
             dvx, dvy = vec[d]
-            nx, ny = px + dvx, py + dvy
-            if not expanded or (nx, ny) in expanded:
+            ngx, ngy = gx + dvx, gy + dvy
+            if (ngx, ngy) in grid_walkable:
                 return ActionDecision(
                     DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.55,
                     reason=f"coverage_heuristic_{d}",
@@ -358,8 +425,8 @@ class BeamCoverageSolver(DynamicsSolver):
                               "shape_stage": self._switch_count},
                 )
         for d, (dvx, dvy) in vec.items():
-            nx, ny = px + dvx, py + dvy
-            if 0 <= nx < gm.width and 0 <= ny < gm.height:
+            ngx, ngy = gx + dvx, gy + dvy
+            if 0 <= ngx < g_w and 0 <= ngy < g_h:
                 return ActionDecision(
                     DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.40,
                     reason=f"coverage_forced_{d}",
@@ -369,15 +436,18 @@ class BeamCoverageSolver(DynamicsSolver):
         return None
 
     def _build_expanded_walkable(self, gm) -> set[tuple[int, int]]:
-        w = set(gm.walkable)
+        # In beam-coverage puzzles, shape pieces can move across all
+        # board cells (the game engine's sprite-based collision model
+        # allows traversal through most terrain).  Use the full board.
+        w = set()
+        for y in range(gm.height):
+            for x in range(gm.width):
+                w.add((x, y))
+        # Exclude only border-touching walls (immovable obstacles)
         for c in gm.components:
-            if not c.touches_border:
+            if c.touches_border and c.dominant_color != 11:
                 for cx, cy in c.cells:
-                    w.add((cx, cy))
-        if gm.player_pos:
-            w.add(gm.player_pos)
-        for gx, gy in gm.goal_positions:
-            w.add((gx, gy))
+                    w.discard((cx, cy))
         return w
 
 
