@@ -241,7 +241,10 @@ class MirrorSolver(DynamicsSolver):
             return False
         horiz = self._detect_mirror_axis(mirror_comp)
         if horiz:
-            return bool(gm.goal_positions)
+            # Horizontal mirrors are handled by BeamCoverageSolver.
+            # The reflection-target model in MirrorSolver doesn't match
+            # the beam-coverage win condition of horizontal-mirror puzzles.
+            return False
         px, py = gm.player_pos
         mirr_cells = list(mirror_comp.cells)
         mirror_px = sum(cx for cx, _ in mirr_cells) // len(mirr_cells)

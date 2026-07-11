@@ -723,7 +723,8 @@ class HyperonBridge:
         if query_name == "solver-select":
             dynamics = str(episode.get("primary_dynamics", "") or "navigation")
             _SOLVER_MAP = {
-                "beam": "beam", "puzzle": "mirror", "mirror": "mirror",
+                "beam": "beam", "beam-coverage": "beam-coverage",
+                "puzzle": "mirror", "mirror": "mirror",
                 "navigation": "navigation", "static": "noop",
                 "sliding": "sliding", "gravity": "gravity",
                 "push-pull": "push-pull", "signal": "signal",

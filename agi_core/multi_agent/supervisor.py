@@ -286,6 +286,14 @@ class AgentSupervisor(ObjectiveReduction):
             game_model = build_game_model(board_data)
             if game_model is None:
                 return None
+            # Sync hyperon episode facts for solver selection
+            try:
+                ep = context.hyperon.facts.setdefault("episode", {})
+                ep["board_type"] = game_model.features.board_type
+                ep["primary_dynamics"] = game_model.features.primary_dynamics
+                ep["dynamics"] = list(game_model.features.dynamics)
+            except Exception:
+                pass
             ensure_shape_recognition(
                 getattr(context.observation, "image_input", None),
                 getattr(context.observation, "derived_features", {}),

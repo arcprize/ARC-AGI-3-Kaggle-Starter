@@ -74,18 +74,21 @@ class SolverSelector:
             from agi_core.knowledge.solvers.navigation_solver import NavigationSolver
             solver_cls = NavigationSolver
 
-        # Reuse existing solver of the same type to preserve state across frames
-        if self._active_solver is not None and type(self._active_solver) is solver_cls:
-            self._active_name = solver_name
-            return self._active_solver
-        # Don't switch a MirrorSolver away mid-level — dynamics can oscillate
-        # between "puzzle", "sliding", "beam" etc. within the same level.
+        # Reuse existing solver of the same type to preserve state across frames.
+        # Allow switching when the solver name genuinely changes (level transition).
         if self._active_solver is not None:
-            from agi_core.knowledge.solvers.mirror_solver import MirrorSolver
-            from agi_core.knowledge.solvers.navigation_solver import NavigationSolver
-            if isinstance(self._active_solver, (MirrorSolver, NavigationSolver)):
+            if type(self._active_solver) is solver_cls:
                 self._active_name = solver_name
                 return self._active_solver
+            # Don't switch a known solver away mid-level — dynamics can oscillate
+            # between "puzzle", "sliding", "beam" etc. within the same level,
+            # BUT only if the solver name hasn't changed (genuine level boundary).
+            if solver_name == self._active_name:
+                from agi_core.knowledge.solvers.mirror_solver import MirrorSolver
+                from agi_core.knowledge.solvers.navigation_solver import NavigationSolver
+                from agi_core.knowledge.solvers.beam_coverage_solver import BeamCoverageSolver
+                if isinstance(self._active_solver, (MirrorSolver, NavigationSolver, BeamCoverageSolver)):
+                    return self._active_solver
         self._active_solver = solver_cls(memory_db_path=self._memory_db_path)
         self._active_name = solver_name
         return self._active_solver

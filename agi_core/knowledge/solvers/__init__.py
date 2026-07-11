@@ -75,6 +75,7 @@ from agi_core.knowledge.solvers import (
     observe_solver,
     inventory_solver,
     beam_solver,
+    beam_coverage_solver,
     mirror_solver,
     hybrid_solver,
 )

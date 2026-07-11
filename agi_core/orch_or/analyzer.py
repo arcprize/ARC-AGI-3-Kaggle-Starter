@@ -1095,6 +1095,15 @@ def _detect_dynamics(
                 goal_ys = [gy for _, gy in goal_positions]
                 if goal_ys and player_pos is not None:
                     detected.append("puzzle")
+                # Beam-coverage: horizontal mirror + shape pieces (colors 0/5, interior, 4-100 cells)
+                shape_pieces = [
+                    c for c in components
+                    if c.dominant_color in (0, 5)
+                    and 4 <= c.size <= 100
+                    and not c.touches_border
+                ]
+                if len(shape_pieces) >= 1:
+                    detected.append("beam-coverage")
             else:
                 goal_xs = [gx for gx, _ in goal_positions]
                 if not goal_xs:
@@ -1253,9 +1262,9 @@ def _pick_primary_dynamics(
     has_goals: bool,
 ) -> str:
     priority = [
-        "static", "beam", "puzzle", "gravity", "sliding", "push-pull", "signal",
-        "cellular-automata", "pattern-transform", "multi-agent",
-        "inventory", "navigation", "hybrid",
+        "static", "beam", "beam-coverage", "puzzle", "gravity", "sliding",
+        "push-pull", "signal", "cellular-automata", "pattern-transform",
+        "multi-agent", "inventory", "navigation", "hybrid",
     ]
     for p in priority:
         if p in detected:
