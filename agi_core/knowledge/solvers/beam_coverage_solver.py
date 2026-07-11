@@ -242,6 +242,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._move_history: list[str] = []
         self._last_levels_completed: int | None = None
         self._switched: bool = False
+        self._last_switch_step: int = -1
 
     def reset_level(self) -> None:
         self._cached_targets = None
@@ -252,6 +253,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._move_history = []
         self._last_levels_completed = None
         self._switched = False
+        self._last_switch_step = -1
 
     # ── Activation ─────────────────────────────────────────────────────
 
@@ -352,8 +354,6 @@ class BeamCoverageSolver(DynamicsSolver):
         self._last_player_pos = (px, py)
 
         # On first activation, do the initial switch to the first shape piece.
-        # Keep switch_count=0 so the solver navigates to stage target 0.
-        # When that shape reaches it, the arrival check increments switch_count.
         if self._switch_count == 0 and not self._switched:
             self._switched = True
             if len(shapes) > 0:
@@ -394,7 +394,7 @@ class BeamCoverageSolver(DynamicsSolver):
             return ActionDecision("ACTION6", "solver:beam-coverage", 0.60,
                                   reason="coverage_wait")
 
-        # Emergency switch after enough movement has been attempted
+        # Emergency switch after too many stuck steps
         if self._shape_stuck_steps >= 8 and self._switch_count < len(shapes):
             self._switch_count += 1
             self._shape_stuck_steps = 0
@@ -403,56 +403,27 @@ class BeamCoverageSolver(DynamicsSolver):
                                       reason="coverage_early_switch")
             return None
 
-        # Grid-level A* pathfinding: convert expanded walkable to grid coords
+        # Direct axis-priority navigation: prioritize the axis with larger delta
+        # to avoid A* oscillation between directions.
+        dx = target_gx - gx
+        dy = target_gy - gy
+        candidates = []
+        if abs(dx) >= abs(dy):
+            if dx > 0: candidates.append("right")
+            elif dx < 0: candidates.append("left")
+            if dy > 0: candidates.append("down")
+            elif dy < 0: candidates.append("up")
+        else:
+            if dy > 0: candidates.append("down")
+            elif dy < 0: candidates.append("up")
+            if dx > 0: candidates.append("right")
+            elif dx < 0: candidates.append("left")
+        vec = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
         expanded = self._build_expanded_walkable(gm)
         grid_walkable = set()
         for wx, wy in expanded:
             grid_walkable.add((wx // gs, wy // gs))
-        try:
-            path = astar(
-                (gx, gy), (target_gx, target_gy), grid_walkable,
-                g_w, g_h, max_steps=5000,
-            )
-        except Exception:
-            path = None
-
-        if path and len(path) > 1:
-            ngx, ngy = path[1]
-            d = ("right" if ngx > gx else "left" if ngx < gx else
-                 "down" if ngy > gy else "up")
-            # Oscillation damping: if the same direction was used in the last
-            # 3 frames and the player hasn't moved, try the alternate axis.
-            self._move_history.append(d)
-            if len(self._move_history) > 5:
-                self._move_history.pop(0)
-            if len(self._move_history) >= 4:
-                last4 = self._move_history[-4:]
-                if last4 == ["down", "up", "down", "up"] or last4 == ["up", "down", "up", "down"]:
-                    # Oscillation detected — use horizontal direction instead
-                    if target_gx > gx:
-                        d = "right"
-                    elif target_gx < gx:
-                        d = "left"
-                    else:
-                        d = "down"  # fallback
-                    self._move_history.clear()
-            return ActionDecision(
-                DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.75,
-                reason=f"coverage_nav_{d}",
-                metadata={"target_anchor": [target_cx, target_cy],
-                          "shape_stage": self._switch_count},
-            )
-
-        # Grid-level heuristic fallback
         failed = ctx.plan_context.get("failed_directions", set())
-        dx = target_gx - gx
-        dy = target_gy - gy
-        candidates = []
-        if dx > 0: candidates.append("right")
-        elif dx < 0: candidates.append("left")
-        if dy > 0: candidates.append("down")
-        elif dy < 0: candidates.append("up")
-        vec = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
         for d in candidates:
             if d in failed:
                 continue
@@ -460,11 +431,12 @@ class BeamCoverageSolver(DynamicsSolver):
             ngx, ngy = gx + dvx, gy + dvy
             if (ngx, ngy) in grid_walkable:
                 return ActionDecision(
-                    DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.55,
-                    reason=f"coverage_heuristic_{d}",
+                    DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.65,
+                    reason=f"coverage_nav_{d}",
                     metadata={"target_anchor": [target_cx, target_cy],
                               "shape_stage": self._switch_count},
                 )
+        # Forced fallback
         for d, (dvx, dvy) in vec.items():
             ngx, ngy = gx + dvx, gy + dvy
             if 0 <= ngx < g_w and 0 <= ngy < g_h:
