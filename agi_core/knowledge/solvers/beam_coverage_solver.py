@@ -369,19 +369,30 @@ class BeamCoverageSolver(DynamicsSolver):
         if not self._cached_targets:
             return None
 
-        # Apply retry offset to nudge shapes to slightly different positions
-        if self._retry_count > 0:
-            shift = (self._retry_count % 3) * gs  # shift by 0, 3, or 6 pixels
-            for stage in self._cached_targets:
-                anc = stage["target_anchor"]
-                anc[0] = max(0, min(gm.width - 1, anc[0] + shift))
-                anc[1] = max(0, min(gm.height - 1, anc[1] + shift))
-
         player_near_mirror = False
         if mirror_info["horizontal"]:
             player_near_mirror = abs(py - mirror_info["axis_py"]) <= 3
         else:
             player_near_mirror = abs(px - mirror_info["axis_px"]) <= 3
+
+        # If on the mirror, immediately switch to a shape piece
+        if player_near_mirror and self._switch_count >= 0 and len(shapes) > 0:
+            return ActionDecision("ACTION5", "solver:beam-coverage", 0.60,
+                                  reason="coverage_switch_from_mirror")
+
+        # Apply retry offset to nudge shapes to different positions.
+        if self._retry_count > 0:
+            offsets = [
+                (0, gs), (0, -gs), (gs, 0), (-gs, 0),
+                (gs, gs), (gs, -gs), (-gs, gs), (-gs, -gs),
+                (0, gs*2), (0, -gs*2), (gs*2, 0), (-gs*2, 0),
+            ]
+            idx = (self._retry_count - 1) % len(offsets)
+            dx, dy = offsets[idx]
+            for stage in self._cached_targets:
+                anc = stage["target_anchor"]
+                anc[0] = max(0, min(gm.width - 1, anc[0] + dx))
+                anc[1] = max(0, min(gm.height - 1, anc[1] + dy))
 
         active_target_idx = min(self._switch_count, len(self._cached_targets) - 1)
         stage = self._cached_targets[active_target_idx]
@@ -431,7 +442,7 @@ class BeamCoverageSolver(DynamicsSolver):
 
         # Emergency switch if close enough in pixel or grid space.
         # Skip when both shapes have been placed for >5 frames (to allow retry).
-        if self._both_placed_steps <= 5 and (arrival_dist <= 1 or pixel_dist <= gs * 2):
+        if self._both_placed_steps <= 2 and (arrival_dist <= 1 or pixel_dist <= gs * 2):
             if self._switch_count < len(shapes):
                 self._switch_count += 1
                 self._shape_stuck_steps = 0
@@ -443,8 +454,8 @@ class BeamCoverageSolver(DynamicsSolver):
             return ActionDecision("ACTION6", "solver:beam-coverage", 0.60,
                                   reason="coverage_wait")
 
-        # Emergency switch after too many stuck steps or both placed for a while
-        if self._shape_stuck_steps >= 8 or self._both_placed_steps >= 8:
+        # Emergency switch after stuck or both placed (fast retry with 3-frame cooldown)
+        if self._shape_stuck_steps >= 6 or self._both_placed_steps >= 3:
             if self._switch_count < len(shapes):
                 self._switch_count += 1
                 self._shape_stuck_steps = 0
@@ -452,15 +463,20 @@ class BeamCoverageSolver(DynamicsSolver):
                     return ActionDecision("ACTION5", "solver:beam-coverage", 0.65,
                                           reason="coverage_early_switch")
                 return None
-            # Both shapes placed but level not complete — invalidate cache
-            # to try different targets.  Keep _switch_count as-is and navigate
-            # the current entity to the recomputed target.
+            # Both shapes placed but level not complete — switch back to
+            # shape 0 and try a different position via cache invalidation.
             self._shape_stuck_steps = 0
             self._both_placed_steps = 0
             self._cached_targets = None
             self._retry_count += 1
-            # Don't change _switch_count — retry with current entity
-            return None  # fall through to let frame advance
+            if self._retry_count > 20:
+                self.reset_level()
+                return ActionDecision("ACTION5", "solver:beam-coverage", 0.40,
+                                      reason="coverage_full_reset")
+            self._switch_count = 0
+            self._switched = False
+            return ActionDecision("ACTION5", "solver:beam-coverage", 0.50,
+                                  reason="coverage_retry_switch")
 
         # Direct axis-priority navigation: prioritize the axis with larger delta
         # to avoid A* oscillation between directions.
