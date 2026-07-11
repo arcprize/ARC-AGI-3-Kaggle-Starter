@@ -241,6 +241,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._shape_stuck_steps: int = 0
         self._move_history: list[str] = []
         self._last_levels_completed: int | None = None
+        self._switched: bool = False
 
     def reset_level(self) -> None:
         self._cached_targets = None
@@ -250,6 +251,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._shape_stuck_steps = 0
         self._move_history = []
         self._last_levels_completed = None
+        self._switched = False
 
     # ── Activation ─────────────────────────────────────────────────────
 
@@ -290,13 +292,24 @@ class BeamCoverageSolver(DynamicsSolver):
         if not goals:
             return None
 
+        px, py = gm.player_pos
+        gs = max(1, gm.features.grid_scale) if hasattr(gm.features, 'grid_scale') else 3
+
+        # Reset on level transition (MUST be before cache check)
+        try:
+            current_level = int(ctx.plan_context.get("levels_completed", 0))
+        except (TypeError, ValueError):
+            current_level = 0
+        if self._last_levels_completed is None or current_level > self._last_levels_completed:
+            self.reset_level()
+        self._last_levels_completed = current_level
+
         # Collect forbidden cells: mirror strip + border-touching obstacles
         forbidden: set[tuple[int, int]] = set()
         for c in gm.components:
             if c.touches_border and c.dominant_color not in (5, 11):
                 forbidden.update(c.cells)
         # Add a thin buffer around the mirror axis to prevent shape overlap.
-        # Use gs-1 (2 pixels at scale=3) so valid positions near the mirror remain.
         if mirror_info["horizontal"]:
             my = mirror_info["axis_py"]
             for x in range(gm.width):
@@ -309,7 +322,6 @@ class BeamCoverageSolver(DynamicsSolver):
                     forbidden.add((mx + dx, y))
 
         # Cache targets ONCE per level (stable across switches).
-        # Use the level number as key so targets never change within a level.
         if self._cached_targets is None or self._cached_frame != current_level:
             self._cached_targets = compute_coverage_for_all_shapes(
                 shapes, goals, mirror_info, gm.width, gm.height,
@@ -319,18 +331,6 @@ class BeamCoverageSolver(DynamicsSolver):
 
         if not self._cached_targets:
             return None
-
-        px, py = gm.player_pos
-        gs = max(1, gm.features.grid_scale) if hasattr(gm.features, 'grid_scale') else 3
-
-        # Reset on level transition
-        try:
-            current_level = int(ctx.plan_context.get("levels_completed", 0))
-        except (TypeError, ValueError):
-            current_level = 0
-        if self._last_levels_completed is None or current_level > self._last_levels_completed:
-            self.reset_level()
-        self._last_levels_completed = current_level
 
         player_near_mirror = False
         if mirror_info["horizontal"]:
@@ -351,12 +351,12 @@ class BeamCoverageSolver(DynamicsSolver):
             self._shape_stuck_steps = 0
         self._last_player_pos = (px, py)
 
-        # Always switch to first shape piece on first activation for horizontal mirrors.
-        # The player might start on a shape piece (not the mirror), so the mirror
-        # proximity check is unreliable.  Just switch immediately.
-        if self._switch_count == 0:
+        # On first activation, do the initial switch to the first shape piece.
+        # Keep switch_count=0 so the solver navigates to stage target 0.
+        # When that shape reaches it, the arrival check increments switch_count.
+        if self._switch_count == 0 and not self._switched:
+            self._switched = True
             if len(shapes) > 0:
-                self._switch_count = 1
                 return ActionDecision("ACTION5", "solver:beam-coverage", 0.70,
                                       reason="coverage_switch_to_shape")
             return None
@@ -384,6 +384,8 @@ class BeamCoverageSolver(DynamicsSolver):
         if arrival_dist <= 1 or pixel_dist <= gs * 2:
             if self._switch_count < len(shapes):
                 self._switch_count += 1
+                self._shape_stuck_steps = 0
+                self._move_history.clear()
                 if self._switch_count < len(shapes):
                     return ActionDecision("ACTION5", "solver:beam-coverage", 0.68,
                                           reason="coverage_switch_next")
