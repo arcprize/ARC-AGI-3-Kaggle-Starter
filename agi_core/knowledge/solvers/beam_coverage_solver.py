@@ -384,6 +384,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._retry_count: int = 0
         self._both_placed_steps: int = 0
         self._mirror_target_gy: int | None = None
+        self._mirror_phase: bool = False
 
     def reset_level(self) -> None:
         self._cached_targets = None
@@ -396,6 +397,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._switched = False
         self._last_switch_step = -1
         self._mirror_target_gy = None
+        self._mirror_phase = False
 
     # ── Activation ─────────────────────────────────────────────────────
 
@@ -456,6 +458,28 @@ class BeamCoverageSolver(DynamicsSolver):
             self.reset_level()
         self._last_levels_completed = current_level
 
+        # ── Mirror positioning phase ─────────────────────────────────
+        # Run before ANY other logic.  Keep positioning until the mirror
+        # reaches the optimal Y for goal coverage.
+        if mirror_info["horizontal"]:
+            if self._mirror_target_gy is None:
+                goal_grid_ys = [gy // gs for _, gy in gm.goal_positions]
+                if goal_grid_ys:
+                    self._mirror_target_gy = (min(goal_grid_ys) + max(goal_grid_ys)) // 2
+                    self._mirror_phase = True
+            if self._mirror_phase and self._mirror_target_gy is not None:
+                current_mirror_gy = mirror_info["axis_py"] // gs
+                dy = self._mirror_target_gy - current_mirror_gy
+                if abs(dy) > 0:
+                    d = "up" if dy < 0 else "down"
+                    return ActionDecision(
+                        DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.65,
+                        reason=f"coverage_position_mirror_{d}",
+                    )
+                else:
+                    # Mirror positioned — exit phase
+                    self._mirror_phase = False
+
         # Collect forbidden cells: mirror strip + border-touching obstacles
         forbidden: set[tuple[int, int]] = set()
         for c in gm.components:
@@ -511,22 +535,6 @@ class BeamCoverageSolver(DynamicsSolver):
         else:
             self._shape_stuck_steps = 0
         self._last_player_pos = (px, py)
-
-        # Position the horizontal mirror at the optimal Y for goal coverage.
-        # Compute target once and cache it.
-        if mirror_info["horizontal"] and self._mirror_target_gy is None:
-            goal_grid_ys = [gy // gs for _, gy in gm.goal_positions]
-            if goal_grid_ys:
-                self._mirror_target_gy = (min(goal_grid_ys) + max(goal_grid_ys)) // 2
-        if mirror_info["horizontal"] and self._mirror_target_gy is not None:
-            current_mirror_gy = mirror_info["axis_py"] // gs
-            dy = self._mirror_target_gy - current_mirror_gy
-            if abs(dy) > 0:
-                d = "up" if dy < 0 else "down"
-                return ActionDecision(
-                    DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.65,
-                    reason=f"coverage_position_mirror_{d}",
-                )
 
         # On first activation, do the initial switch to the first shape piece.
         if self._switch_count == 0 and not self._switched:
