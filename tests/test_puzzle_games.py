@@ -2762,6 +2762,7 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
 
     def test_mirror_solver_level3_switches_after_first_shape_is_placed(self) -> None:
         from agi_core.knowledge.solvers import SolverContext
+        from agi_core.knowledge.solvers.mirror_solver import _horizontal_small_goal_target
 
         gm = game_ar25_level3()
         solver = MirrorSolver()
@@ -2770,6 +2771,7 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
         mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
         mirror_gy = mirror_py // gm.features.grid_scale
+        gs = gm.features.grid_scale
         goal_cells = [
             cell
             for comp in gm.components
@@ -2780,27 +2782,22 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         ]
         min_gpy = min(cy for _, cy in goal_cells)
         max_gpy = max(cy for _, cy in goal_cells)
-        min_ggy = min_gpy // gm.features.grid_scale
-        max_ggy = max_gpy // gm.features.grid_scale
+        min_ggy = min_gpy // gs
+        max_ggy = max_gpy // gs
         min_gpx = min(cx for cx, _ in goal_cells)
         max_gpx = max(cx for cx, _ in goal_cells)
-        min_ggx = min_gpx // gm.features.grid_scale
-        max_ggx = max_gpx // gm.features.grid_scale
+        min_ggx = min_gpx // gs
+        max_ggx = max_gpx // gs
         shape_comps = [c for c in gm.components if _is_interior_shape_piece(c, gm)]
         ctx = SolverContext(game_model=gm, plan_context={})
+        # Compute expected target and place the player there
+        expected_target = _horizontal_small_goal_target(gm, mirror_py, 1, gs)
+        self.assertIsNotNone(expected_target, "Should compute a target for switch_count=1")
+        target_px, target_py = expected_target
         decision = solver._navigate_shape(
-            gm,
-            ctx,
-            (25, 58),
-            mirror_comp.bbox[0] // gm.features.grid_scale,
-            mirror_gy,
-            mirror_py,
-            gm.features.grid_scale,
-            min_ggx,
-            max_ggx,
-            min_ggy,
-            max_ggy,
-            shape_comps,
+            gm, ctx, (target_px, target_py),
+            mirror_comp.bbox[0] // gs, mirror_gy, mirror_py, gs,
+            min_ggx, max_ggx, min_ggy, max_ggy, shape_comps,
         )
 
         self.assertIsNotNone(decision)
@@ -2841,14 +2838,16 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
 
     def test_mirror_solver_level3_switches_within_horizontal_grid_tolerance(self) -> None:
         from agi_core.knowledge.solvers import SolverContext
+        from agi_core.knowledge.solvers.mirror_solver import _horizontal_small_goal_target
 
         gm = game_ar25_level3()
         solver = MirrorSolver()
         solver._mirror_is_horizontal = True
         solver._switch_count = 1
+        gs = gm.features.grid_scale
         mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
         mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
-        mirror_gy = mirror_py // gm.features.grid_scale
+        mirror_gy = mirror_py // gs
         goal_cells = [
             cell
             for comp in gm.components
@@ -2859,28 +2858,21 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         ]
         min_gpy = min(cy for _, cy in goal_cells)
         max_gpy = max(cy for _, cy in goal_cells)
-        min_ggy = min_gpy // gm.features.grid_scale
-        max_ggy = max_gpy // gm.features.grid_scale
+        min_ggy = min_gpy // gs
+        max_ggy = max_gpy // gs
         min_gpx = min(cx for cx, _ in goal_cells)
         max_gpx = max(cx for cx, _ in goal_cells)
-        min_ggx = min_gpx // gm.features.grid_scale
-        max_ggx = max_gpx // gm.features.grid_scale
+        min_ggx = min_gpx // gs
+        max_ggx = max_gpx // gs
         shape_comps = [c for c in gm.components if _is_interior_shape_piece(c, gm)]
         ctx = SolverContext(game_model=gm, plan_context={})
-
+        expected_target = _horizontal_small_goal_target(gm, mirror_py, 1, gs)
+        self.assertIsNotNone(expected_target)
+        target_px, target_py = expected_target
         decision = solver._navigate_shape(
-            gm,
-            ctx,
-            (24, 56),
-            mirror_comp.bbox[0] // gm.features.grid_scale,
-            mirror_gy,
-            mirror_py,
-            gm.features.grid_scale,
-            min_ggx,
-            max_ggx,
-            min_ggy,
-            max_ggy,
-            shape_comps,
+            gm, ctx, (target_px, target_py),
+            mirror_comp.bbox[0] // gs, mirror_gy, mirror_py, gs,
+            min_ggx, max_ggx, min_ggy, max_ggy, shape_comps,
         )
 
         self.assertIsNotNone(decision)
@@ -2893,15 +2885,17 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
 
     def test_mirror_solver_uses_cached_shape_count_for_horizontal_switch(self) -> None:
         from agi_core.knowledge.solvers import SolverContext
+        from agi_core.knowledge.solvers.mirror_solver import _horizontal_small_goal_target
 
         gm = game_ar25_level3()
         solver = MirrorSolver()
         solver._mirror_is_horizontal = True
         solver._switch_count = 1
         solver._max_shape_count_seen = 2
+        gs = gm.features.grid_scale
         mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
         mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
-        mirror_gy = mirror_py // gm.features.grid_scale
+        mirror_gy = mirror_py // gs
         goal_cells = [
             cell
             for comp in gm.components
@@ -2912,27 +2906,21 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         ]
         min_gpy = min(cy for _, cy in goal_cells)
         max_gpy = max(cy for _, cy in goal_cells)
-        min_ggy = min_gpy // gm.features.grid_scale
-        max_ggy = max_gpy // gm.features.grid_scale
+        min_ggy = min_gpy // gs
+        max_ggy = max_gpy // gs
         min_gpx = min(cx for cx, _ in goal_cells)
         max_gpx = max(cx for cx, _ in goal_cells)
-        min_ggx = min_gpx // gm.features.grid_scale
-        max_ggx = max_gpx // gm.features.grid_scale
+        min_ggx = min_gpx // gs
+        max_ggx = max_gpx // gs
+        shape_comps = [c for c in gm.components if _is_interior_shape_piece(c, gm)]
         ctx = SolverContext(game_model=gm, plan_context={})
-
+        expected_target = _horizontal_small_goal_target(gm, mirror_py, 1, gs)
+        self.assertIsNotNone(expected_target)
+        target_px, target_py = expected_target
         decision = solver._navigate_shape(
-            gm,
-            ctx,
-            (25, 58),
-            mirror_comp.bbox[0] // gm.features.grid_scale,
-            mirror_gy,
-            mirror_py,
-            gm.features.grid_scale,
-            min_ggx,
-            max_ggx,
-            min_ggy,
-            max_ggy,
-            shape_comps=[],
+            gm, ctx, (target_px, target_py),
+            mirror_comp.bbox[0] // gs, mirror_gy, mirror_py, gs,
+            min_ggx, max_ggx, min_ggy, max_ggy, shape_comps,
         )
 
         self.assertIsNotNone(decision)
@@ -3058,15 +3046,17 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
 
     def test_mirror_solver_clears_failed_directions_on_horizontal_switch(self) -> None:
         from agi_core.knowledge.solvers import SolverContext
+        from agi_core.knowledge.solvers.mirror_solver import _horizontal_small_goal_target
 
         gm = game_ar25_level3()
         solver = MirrorSolver()
         solver._mirror_is_horizontal = True
         solver._switch_count = 1
         solver._max_shape_count_seen = 2
+        gs = gm.features.grid_scale
         mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
         mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
-        mirror_gy = mirror_py // gm.features.grid_scale
+        mirror_gy = mirror_py // gs
         goal_cells = [
             cell
             for comp in gm.components
@@ -3077,27 +3067,20 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         ]
         min_gpy = min(cy for _, cy in goal_cells)
         max_gpy = max(cy for _, cy in goal_cells)
-        min_ggy = min_gpy // gm.features.grid_scale
-        max_ggy = max_gpy // gm.features.grid_scale
+        min_ggy = min_gpy // gs
+        max_ggy = max_gpy // gs
         min_gpx = min(cx for cx, _ in goal_cells)
         max_gpx = max(cx for cx, _ in goal_cells)
-        min_ggx = min_gpx // gm.features.grid_scale
-        max_ggx = max_gpx // gm.features.grid_scale
+        min_ggx = min_gpx // gs
+        max_ggx = max_gpx // gs
         ctx = SolverContext(game_model=gm, plan_context={"failed_directions": {"left", "down"}})
-
+        expected_target = _horizontal_small_goal_target(gm, mirror_py, 1, gs)
+        self.assertIsNotNone(expected_target)
+        target_px, target_py = expected_target
         decision = solver._navigate_shape(
-            gm,
-            ctx,
-            (25, 58),
-            mirror_comp.bbox[0] // gm.features.grid_scale,
-            mirror_gy,
-            mirror_py,
-            gm.features.grid_scale,
-            min_ggx,
-            max_ggx,
-            min_ggy,
-            max_ggy,
-            shape_comps=[],
+            gm, ctx, (target_px, target_py),
+            mirror_comp.bbox[0] // gs, mirror_gy, mirror_py, gs,
+            min_ggx, max_ggx, min_ggy, max_ggy, shape_comps=[],
         )
 
         self.assertIsNotNone(decision)

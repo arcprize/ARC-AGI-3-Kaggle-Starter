@@ -98,19 +98,32 @@ def _horizontal_small_goal_target(gm, mirror_py: int, switch_count: int, gs: int
     ]
     if not goal_components:
         return None
-    if switch_count != 2:
-        return None
-    lower_goal_components = [
-        comp
-        for comp in goal_components
-        if (_component_center(comp)[1] >= mirror_py)
-    ]
-    if not lower_goal_components:
-        return None
-    target_comp = min(lower_goal_components, key=lambda comp: comp.bbox[0])
-    target_px = max(0, min(gm.width - 1, target_comp.bbox[2] - gs))
-    target_py = max(0, min(gm.height - 1, target_comp.bbox[1]))
-    return (target_px, target_py)
+    if switch_count == 1:
+        # First shape: target the upper goal clusters (above mirror)
+        upper = [
+            comp
+            for comp in goal_components
+            if _component_center(comp)[1] < mirror_py
+        ]
+        if not upper:
+            return None
+        target_comp = min(upper, key=lambda comp: comp.bbox[0])
+        target_px = max(0, min(gm.width - 1, target_comp.bbox[2] + gs))
+        target_py = max(0, min(gm.height - 1, target_comp.bbox[1] - gs))
+        return (target_px, target_py)
+    if switch_count == 2:
+        lower_goal_components = [
+            comp
+            for comp in goal_components
+            if (_component_center(comp)[1] >= mirror_py)
+        ]
+        if not lower_goal_components:
+            return None
+        target_comp = min(lower_goal_components, key=lambda comp: comp.bbox[0])
+        target_px = max(0, min(gm.width - 1, target_comp.bbox[2] - gs))
+        target_py = max(0, min(gm.height - 1, target_comp.bbox[1]))
+        return (target_px, target_py)
+    return None
 
 
 def _artifact_stage_target(
@@ -351,36 +364,25 @@ class MirrorSolver(DynamicsSolver):
 
         # ── Player IS mirror: position it or switch ────────────────────
         if player_is_mirror and has_shape:
+            # For horizontal mirrors, skip mirror positioning — the mirror
+            # is a passive reflector. Switch directly to the first shape
+            # piece and navigate it using beam-coverage-aware targets.
+            if self._switch_count == 0 and self._mirror_is_horizontal:
+                self._switch_count = 1
+                self._cached_horizontal_target_key = None
+                self._cached_horizontal_target = None
+                self._clear_failed_directions(ctx)
+                ctx.plan_context["switch_attempted"] = 1
+                return ActionDecision("ACTION5", "solver:mirror", 0.70,
+                                      reason="mirror_switch_horiz")
             # After the first switch (_switch_count > 0) the player should
             # be a shape piece — ignore false mirror detection from stray
             # color-0 cells near the mirror Y.
             if self._switch_count == 0:
-                # For horizontal mirrors, position the mirror at gy=9 so
-                # reflections of shapes (at gy=15-17) reach upper goals
-                # (gy=1-3). Mirror starts at gy=16 → needs to move UP.
-                if self._mirror_is_horizontal:
-                    target_mgy = 9
-                    dy = target_mgy - mirror_gy
-                    if dy < 0:
-                        return ActionDecision("ACTION1", "solver:mirror", 0.70,
-                                              reason="mirror_nav_up")
-                    elif dy > 0:
-                        return ActionDecision("ACTION2", "solver:mirror", 0.70,
-                                              reason="mirror_nav_down")
-                    # Reached target — switch to first shape piece
-                    if self._switch_count == 0:
-                        self._switch_count = 1
-                        self._clear_failed_directions(ctx)
-                        ctx.plan_context["switch_attempted"] = 1
-                        return ActionDecision("ACTION5", "solver:mirror", 0.70,
-                                              reason="mirror_switch_horiz")
-                    return ActionDecision("ACTION6", "solver:mirror", 0.60,
-                                          reason="mirror_positioned_wait")
-                else:
-                    return self._navigate_mirror(
-                        gm, ctx, shape_comps, mirror_gx, mirror_gy,
-                        min_ggx, max_ggx, min_ggy, max_ggy, gs,
-                    )
+                return self._navigate_mirror(
+                    gm, ctx, shape_comps, mirror_gx, mirror_gy,
+                    min_ggx, max_ggx, min_ggy, max_ggy, gs,
+                )
             # Fall through to shape-piece navigation.
             return self._navigate_shape(
                 gm, ctx, (spx, spy), mirror_gx, mirror_gy, mirror_py, gs,
@@ -486,11 +488,14 @@ class MirrorSolver(DynamicsSolver):
                     if small_goal_target is not None:
                         target_px, target_py = small_goal_target
                     else:
+                        # Clamp target to the side of the mirror opposite the goal cluster
+                        # so the shape's beam can reach goals via reflection.
                         if self._switch_count == 1:
-                            target_gy = 2 * mirror_gy - min_ggy
+                            target_gx = (min_ggx + max_ggx) // 2
+                            target_gy = max(0, min(gm.height // gs - 1, mirror_gy - 4))
                         else:
-                            target_gy = 2 * mirror_gy - max_ggy
-                        target_gx = (min_ggx + max_ggx) // 2
+                            target_gx = (min_ggx + max_ggx) // 2
+                            target_gy = max(0, min(gm.height // gs - 1, mirror_gy + 2))
                         target_py = max(0, min(gm.height - 1, target_gy * gs + 1))
                         target_px = max(0, min(gm.width - 1, target_gx * gs + 1))
         else:
