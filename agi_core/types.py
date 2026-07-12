@@ -96,6 +96,21 @@ class EpisodeRecord:
     goal_progress: float = 0.0
 
 
+@dataclass(slots=True, frozen=True)
+class ObservedTransition:
+    """Next-observation feedback for a previously selected action."""
+
+    game_id: str
+    action_name: str = ""
+    decision_source: str = ""
+    decision_subgoal: str | None = None
+    local_outcome: str = "unknown"
+    player_moved: bool = False
+    frame_changed: bool = False
+    boundary: str | None = None
+    record: EpisodeRecord | None = None
+
+
 @dataclass(slots=True)
 class MemoryBundle:
     working_memory: dict[str, Any] = field(default_factory=dict)

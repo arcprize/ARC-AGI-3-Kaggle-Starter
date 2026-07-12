@@ -2600,6 +2600,60 @@ class HyperonBridgeTests(unittest.TestCase):
             self.assertEqual(bundle["action_stats"]["ACTION1"]["stalled"], 1)
             self.assertEqual(bundle["action_stats"]["ACTION2"]["progress"], 1)
 
+    def test_record_transitions_buffer_until_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_db_path = Path(tmpdir) / "memory.sqlite3"
+            bridge = HyperonBridge(enabled=False, memory_db_path=memory_db_path)
+            first_record = EpisodeRecord(
+                game_id="ls20",
+                step_index=1,
+                action_name="ACTION1",
+                outcome="progress",
+                progress_delta=1,
+                game_state="ACTIVE",
+                prior_game_state="ACTIVE",
+                levels_completed=0,
+                prior_frame_signature="sig-loop",
+                next_game_state="ACTIVE",
+                next_frame_signature="sig-next",
+                prior_legal_actions=["ACTION1", "ACTION2"],
+                stagnation_before=0,
+                stagnation_after=0,
+                decision_subgoal=None,
+                decision_source="symbolic",
+            )
+            second_record = EpisodeRecord(
+                game_id="ls20",
+                step_index=2,
+                action_name="ACTION2",
+                outcome="stalled",
+                progress_delta=0,
+                game_state="ACTIVE",
+                prior_game_state="ACTIVE",
+                levels_completed=0,
+                prior_frame_signature="sig-next",
+                next_game_state="ACTIVE",
+                next_frame_signature="sig-next-2",
+                prior_legal_actions=["ACTION1", "ACTION2"],
+                stagnation_before=0,
+                stagnation_after=1,
+                decision_subgoal=None,
+                decision_source="symbolic",
+            )
+
+            bridge.record_transitions([first_record, second_record])
+
+            with patch(
+                "agi_core.knowledge.hyperon_bridge.persist_transition",
+                side_effect=AssertionError("record should remain buffered"),
+            ):
+                bridge.record_transitions([])
+
+            self.assertTrue(bridge._memory_write_available)
+            self.assertEqual(len(bridge._unpersisted_records), 2)
+            self.assertIn(bridge._record_key(first_record), bridge._unpersisted_records)
+            self.assertIn(bridge._record_key(second_record), bridge._unpersisted_records)
+
     def test_record_transition_partial_flush_failure_does_not_replay_persisted_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_db_path = Path(tmpdir) / "memory.sqlite3"
@@ -2893,58 +2947,102 @@ class HyperonBridgeTests(unittest.TestCase):
         self.assertFalse(load_bundle_mock.call_args_list[1].kwargs["touch_retrieved"])
 
     def test_contextual_memory_bundle_does_not_touch_access_counters(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            memory_db_path = Path(tmpdir) / "memory.sqlite3"
-            initialize_memory_schema(memory_db_path)
-            record_transition(
-                memory_db_path,
-                EpisodeRecord(
-                    game_id="ls20",
-                    step_index=3,
-                    action_name="ACTION2",
-                    outcome="progress",
-                    progress_delta=1,
-                    game_state="ACTIVE",
-                    prior_game_state="ACTIVE",
-                    levels_completed=1,
-                    prior_frame_signature="sig-contextual",
-                    next_game_state="ACTIVE",
-                    next_frame_signature="sig-contextual-next",
-                    prior_legal_actions=["ACTION1", "ACTION2"],
-                    stagnation_before=0,
-                    stagnation_after=0,
-                    decision_subgoal="advance-level",
-                    decision_source="symbolic",
-                ),
-            )
-            bridge = HyperonBridge(enabled=False, memory_db_path=memory_db_path)
-            observation = make_observation(
-                step_index=27,
-                game_state="ACTIVE",
-                last_action="ACTION1",
-                legal_actions=["ACTION1", "ACTION2"],
-                derived_features={"frame_signature": "sig-contextual"},
-            )
+        bridge = HyperonBridge(enabled=False, memory_db_path=Path("memory.sqlite3"))
+        observation = make_observation(
+            step_index=27,
+            game_state="ACTIVE",
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-contextual"},
+        )
 
+        with patch(
+            "agi_core.knowledge.hyperon_bridge.load_memory_bundle_from_stores",
+            return_value={
+                "working_memory": {},
+                "episodic_recalls": [],
+                "semantic_memories": [{"retrieval_store": "hot"}],
+                "procedural_memories": [{"retrieval_store": "hot"}],
+                "abstract_memories": [],
+                "retrieval_summary": {},
+                "board_context_summary": {},
+                "board_context_action_stats": {},
+                "pattern_action_stats": {},
+                "sequence_action_stats": {},
+                "board_cluster_action_stats": {},
+                "episode_summaries": [],
+                "recent_records": [],
+                "basin_status": {},
+                "basin_action_stats": {},
+                "action_stats": {},
+                "state_action_stats": {},
+                "frame_action_stats": {},
+                "subgoal_action_stats": {},
+                "trained_prior_bucket": {},
+                "recommended_actions": [],
+                "suppressed_actions": [],
+            },
+        ) as load_bundle_mock:
             bundle = bridge.contextual_memory_bundle(
                 observation,
                 "advance-level",
                 ["ACTION1", "ACTION2"],
             )
+            second_bundle = bridge.contextual_memory_bundle(
+                observation,
+                "advance-level",
+                ["ACTION1", "ACTION2"],
+            )
 
-            self.assertTrue(bundle.semantic_memories)
-            self.assertTrue(bundle.procedural_memories)
-            with closing(sqlite3.connect(memory_db_path)) as connection:
-                semantic_counts = connection.execute(
-                    "SELECT access_count, last_access_step FROM live_semantic_memory"
-                ).fetchall()
-                procedural_counts = connection.execute(
-                    "SELECT access_count, last_access_step FROM live_procedural_memory"
-                ).fetchall()
-            self.assertTrue(all(int(row[0] or 0) == 0 for row in semantic_counts))
-            self.assertTrue(all(int(row[1] or 0) == 0 for row in semantic_counts))
-            self.assertTrue(all(int(row[0] or 0) == 0 for row in procedural_counts))
-            self.assertTrue(all(int(row[1] or 0) == 0 for row in procedural_counts))
+        self.assertTrue(bundle.semantic_memories)
+        self.assertTrue(bundle.procedural_memories)
+        self.assertEqual(load_bundle_mock.call_count, 1)
+        self.assertFalse(load_bundle_mock.call_args.kwargs["touch_retrieved"])
+        self.assertEqual(second_bundle.semantic_memories, bundle.semantic_memories)
+
+    def test_sync_does_not_touch_access_counters_on_hot_path(self) -> None:
+        bridge = HyperonBridge(enabled=False, memory_db_path=Path("memory.sqlite3"))
+        observation = make_observation(
+            step_index=27,
+            game_state="ACTIVE",
+            last_action="ACTION1",
+            legal_actions=["ACTION1", "ACTION2"],
+            derived_features={"frame_signature": "sig-sync"},
+        )
+        memory = EpisodicMemory()
+        goals = [GoalState(name="finish-episode", target_state="WIN", priority=1.0)]
+
+        with patch(
+            "agi_core.knowledge.hyperon_bridge.load_memory_bundle_from_stores",
+            return_value={
+                "working_memory": {},
+                "episodic_recalls": [],
+                "semantic_memories": [],
+                "procedural_memories": [],
+                "abstract_memories": [],
+                "retrieval_summary": {},
+                "board_context_summary": {},
+                "board_context_action_stats": {},
+                "pattern_action_stats": {},
+                "sequence_action_stats": {},
+                "board_cluster_action_stats": {},
+                "episode_summaries": [],
+                "recent_records": [],
+                "basin_status": {},
+                "basin_action_stats": {},
+                "action_stats": {},
+                "state_action_stats": {},
+                "frame_action_stats": {},
+                "subgoal_action_stats": {},
+                "trained_prior_bucket": {},
+                "recommended_actions": [],
+                "suppressed_actions": [],
+            },
+        ) as load_bundle_mock:
+            bridge.sync(observation, memory, goals)
+
+        self.assertEqual(load_bundle_mock.call_count, 1)
+        self.assertFalse(load_bundle_mock.call_args.kwargs["touch_retrieved"])
 
     def test_contextual_memory_bundle_inherits_runtime_failure_context(self) -> None:
         bridge = HyperonBridge(enabled=False)

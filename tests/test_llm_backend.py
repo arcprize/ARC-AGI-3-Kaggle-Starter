@@ -280,6 +280,26 @@ class LLMBackendTests(unittest.TestCase):
 
             self.assertEqual(config.effective_model_path(), model_dir)
 
+    def test_effective_model_path_discovers_gguf_in_model_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model_dir = root / "models"
+            model_dir.mkdir()
+            discovered_model = model_dir / "available.gguf"
+            discovered_model.write_text("stub\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "AGI_LLM_MODEL_DIR": str(model_dir),
+                    "AGI_LLM_MODEL_PATH": str(model_dir / "missing.gguf"),
+                },
+                clear=False,
+            ):
+                config = RuntimeConfig.from_env(project_root=root)
+
+            self.assertEqual(config.effective_model_path(), discovered_model)
+
     def test_coerce_json_recovers_fenced_fragment_missing_final_brace(self) -> None:
         backend = LlamaCppBackend(model_path=None)
         payload = backend._coerce_json(

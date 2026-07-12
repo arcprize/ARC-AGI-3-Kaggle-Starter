@@ -22,8 +22,9 @@ from agi_core.orch_or.parallel import ThreadPoolManager
 from agi_core.orch_or.plan_executor import (
     plan_step_to_proposal,
 )
+from agi_core.runtime_sync import ensure_hyperon_context_synced
 from agi_core.orch_or.plan_generator import generate_plan
-from agi_core.types import ActionDecision, ActionProposal
+from agi_core.types import ActionDecision, ActionProposal, ObservedTransition
 
 if TYPE_CHECKING:
     from agi_core.orch_or.game_model import GameModel, MonitorStatus
@@ -106,8 +107,7 @@ class ObjectiveReduction:
             path_cache[key] = f
 
     def decide(self, context: ExecutiveContext) -> ActionDecision:
-        context.hyperon.sync(context.observation, context.memory, context.goals)
-        context.memory_bundle = context.hyperon.current_memory_bundle()
+        context.memory_bundle = ensure_hyperon_context_synced(context)
         self._load_plan(context)
         board_data = _get_board_data(context.observation)
         if not board_data:
@@ -477,6 +477,46 @@ class ObjectiveReduction:
         self._background_precompute(game_model)
         return decision
 
+    def note_transition(self, transition: ObservedTransition) -> None:
+        """Forward observed feedback to solver learning and base cognition."""
+        if self._solver_selector is not None:
+            self._solver_selector.note_transition(transition)
+        if hasattr(self._executive, "note_transition"):
+            self._executive.note_transition(transition)
+        if transition.boundary == "level":
+            self.reset_level_state()
+        elif transition.boundary in {"win", "game_over", "restart", "game"}:
+            self.reset_episode()
+
+    def reset_level_state(self) -> None:
+        self._active_plan = None
+        self._previous_model = None
+        self._regenerate_count = 0
+        self._skip_monitoring = False
+        self._switch_count = 0
+        self._non_beam_controllers.clear()
+        self._is_switch_back = False
+        self._failed_directions.clear()
+        self._pending_failed_dir = None
+        self._stable_goal = None
+        self._hyperon_priors.clear()
+        self._goal_history.clear()
+        self._entity_tracker.reset()
+        self._action_effect_log.reset()
+        self._cached_model = None
+        self._cached_board_sig = None
+        try:
+            if self._solver_selector is not None:
+                self._solver_selector.reset_level()
+        except Exception:
+            logger.debug("solver level reset failed", exc_info=True)
+
+    def reset_episode(self) -> None:
+        self.reset_level_state()
+        self._solver_selector = None
+        if hasattr(self._executive, "reset_episode"):
+            self._executive.reset_episode()
+
     def _check_previous_action(
         self, game_model: GameModel, context: ExecutiveContext,
     ) -> None:
@@ -824,7 +864,13 @@ class ObjectiveReduction:
     def _fallback_executive_parallel(self, context: ExecutiveContext, timeout: float = 2.0) -> ActionDecision:
         try:
             from agi_core.orch_or.parallel import ThreadPoolManager
-            future = ThreadPoolManager.submit(self._executive.decide, context)
+            future = ThreadPoolManager.submit_unique(
+                f"objective:{id(self)}:fallback-executive",
+                self._executive.decide,
+                context,
+            )
+            if future is None:
+                raise TimeoutError
             return future.result(timeout=timeout)
         except TimeoutError:
             return ActionDecision(

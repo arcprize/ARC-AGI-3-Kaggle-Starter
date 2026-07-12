@@ -10,9 +10,18 @@ from agi_core.image_input import (
     preferred_board_probe_action,
 )
 from agi_core.memory import EpisodicMemory
-from agi_core.types import ActionDecision, ExecutiveContext, GoalState, MemoryBundle
+from agi_core.runtime_sync import ensure_hyperon_context_synced
+from agi_core.types import (
+    ActionDecision,
+    EpisodeRecord,
+    ExecutiveContext,
+    GoalState,
+    MemoryBundle,
+    Observation,
+    ObservedTransition,
+)
 from agi_core.orch_or.parallel import ThreadPoolManager
-from concurrent.futures import TimeoutError
+from concurrent.futures import wait
 import logging
 
 logger = logging.getLogger(__name__)
@@ -51,8 +60,7 @@ class Executive:
             player_pos = getattr(context.observation, 'player_position', None)
             if player_pos is not None:
                 self.attention.mark_visited(player_pos)
-        context.hyperon.sync(context.observation, context.memory, context.goals)
-        context.memory_bundle = context.hyperon.current_memory_bundle()
+        context.memory_bundle = ensure_hyperon_context_synced(context)
         context.llm_memory_bundle = context.memory_bundle
         context.llm_subgoal_hint = None
         context.contextual_memory_bundles = {}
@@ -133,24 +141,41 @@ class Executive:
 
         reactive_proposals = []
         symbolic_proposals = []
-        pool = ThreadPoolManager.executor()
+        specialist_tasks = {}
         if use_reactive:
-            reactive_task = pool.submit(self.reactive.propose, context)
+            reactive_task = ThreadPoolManager.submit_unique(
+                f"executive:{id(self)}:reactive",
+                self.reactive.propose,
+                context,
+            )
         else:
             reactive_task = None
         if use_symbolic:
-            symbolic_task = pool.submit(self.symbolic.propose, context)
+            symbolic_task = ThreadPoolManager.submit_unique(
+                f"executive:{id(self)}:symbolic",
+                self.symbolic.propose,
+                context,
+            )
         else:
             symbolic_task = None
         if reactive_task is not None:
-            try:
-                reactive_proposals = reactive_task.result(timeout=2.0)
-            except Exception:
-                reactive_proposals = []
+            specialist_tasks["reactive"] = reactive_task
         if symbolic_task is not None:
+            specialist_tasks["symbolic"] = symbolic_task
+        done = set()
+        if specialist_tasks:
+            done, _ = wait(set(specialist_tasks.values()), timeout=2.0)
+        if reactive_task is not None and reactive_task in done:
             try:
-                symbolic_proposals = symbolic_task.result(timeout=2.0)
+                reactive_proposals = reactive_task.result()
             except Exception:
+                logger.debug("reactive specialist failed", exc_info=True)
+                reactive_proposals = []
+        if symbolic_task is not None and symbolic_task in done:
+            try:
+                symbolic_proposals = symbolic_task.result()
+            except Exception:
+                logger.debug("symbolic specialist failed", exc_info=True)
                 symbolic_proposals = []
         proposals = list(reactive_proposals) + list(symbolic_proposals)
         score_floor_fallback_cooldown = context.memory.recent_score_floor_fallback(
@@ -245,9 +270,6 @@ class Executive:
         em = self.episodic_memory
         cl = self.chunk_library
         action_name = decision.action_name
-        # Capture previous actions BEFORE recording the current one, so
-        # the outcome override loop below doesn't see the same action.
-        prev_actions = wm.recent_actions(3) if wm is not None else []
         if wm is not None:
             from agi_core.cognition.working_memory import WMItem
             wm.push(WMItem(
@@ -262,30 +284,18 @@ class Executive:
                 self.attention.mark_visited(player_pos)
         if mc is not None:
             mc.note_visit(action_name)
-            # Single outcome determination (most specific wins):
-            #   1. Same action repeated → "failed"
-            #   2. Fallback decision → "stalled"
-            #   3. Otherwise → "progress"
-            repeats = any(a == action_name for a in prev_actions)
-            had_reset = any(a == "RESET" for a in prev_actions)
-            if repeats or had_reset:
-                outcome = "failed"
-            elif decision.source == "fallback" or getattr(decision, 'used_fallback', False):
-                outcome = "stalled"
-            else:
-                outcome = "progress"
-            mc.note_outcome(outcome)
+        self._pending_cognition_decision = {
+            "game_id": str(context.observation.game_id or ""),
+            "action_name": action_name,
+            "source": str(decision.source or ""),
+            "subgoal": decision.subgoal,
+        }
         if gs is not None and decision.subgoal:
             sub = decision.subgoal
             found = gs.find(sub)
             if found is None:
                 gs.push(sub)
             gs.mark_active()
-            # Auto-backtrack if stuck on same goal (only if goal is ACTIVE/PENDING
-            # and there are at least 2 goals on the path — don't backtrack root).
-            if found is not None and found.status.name in ("PENDING", "ACTIVE") and gs.depth > 1:
-                if not gs.check_progress(sub):
-                    gs.backtrack()
         # Forgetting is handled automatically within EpisodicMemory.record()
         # every 10 episodes — no need for a separate frame-level trigger.
         # Periodic episodic consolidation + mid-game recording (every 50 frames)
@@ -293,12 +303,18 @@ class Executive:
         if em is not None and self._episodic_consolidation_counter >= 50:
             # Record a mid-game episode snapshot for consolidation
             recent = wm.recent_actions(15) if wm is not None else []
-            if len(recent) >= 5:
+            observed_outcome = str(
+                getattr(self, "_last_observed_outcome", "unknown") or "unknown"
+            )
+            if len(recent) >= 5 and observed_outcome != "unknown":
                 dyn = getattr(context.observation, 'derived_features', {}).get('primary_dynamics', 'unknown')
                 gc = len(getattr(context.observation, 'goal_positions', []) or [])
                 board_hash = hash(str(getattr(context.observation, 'image_input', None)))
                 player_start = getattr(context.observation, 'player_position', (0, 0)) or (0, 0)
-                em.record(dyn, recent, 'progress', gc, player_start, board_hash)
+                episode_outcome = (
+                    "progress" if observed_outcome == "advanced" else observed_outcome
+                )
+                em.record(dyn, recent, episode_outcome, gc, player_start, board_hash)
             em.consolidate()
             self._episodic_consolidation_counter = 0
         # Frame-level chunk extraction from recent action window
@@ -330,6 +346,68 @@ class Executive:
             if em is not None: attrs.append(f'traces={len(em._traces)}')
             logger.debug('Cognition: %s', ' | '.join(a for a in attrs if a))
         self._cog_log_counter = getattr(self, '_cog_log_counter', 0) + 1
+
+    def note_transition(self, transition: ObservedTransition) -> None:
+        """Apply outcome-sensitive cognition only after the next observation."""
+        outcome = str(transition.local_outcome or "unknown")
+        self._last_observed_outcome = outcome
+        pending = getattr(self, "_pending_cognition_decision", None)
+        if pending is None:
+            return
+        if transition.boundary in {"game", "restart"} and not transition.action_name:
+            self._pending_cognition_decision = None
+            return
+        if transition.action_name and transition.action_name != pending.get("action_name"):
+            if transition.boundary is not None:
+                self._pending_cognition_decision = None
+            return
+        if (
+            transition.decision_source
+            and transition.decision_source != pending.get("source")
+        ):
+            return
+
+        if outcome in {"progress", "advanced"}:
+            cognition_outcome = "progress"
+        elif outcome in {"failed", "stalled"}:
+            cognition_outcome = outcome
+        else:
+            if transition.boundary is not None:
+                self._pending_cognition_decision = None
+            return
+
+        if self.meta_cognition is not None:
+            self.meta_cognition.note_outcome(cognition_outcome)
+        subgoal = pending.get("subgoal")
+        if (
+            self.goal_stack is not None
+            and subgoal
+            and cognition_outcome in {"failed", "stalled"}
+        ):
+            found = self.goal_stack.find(str(subgoal))
+            if (
+                found is not None
+                and found.status.name in ("PENDING", "ACTIVE")
+                and self.goal_stack.depth > 1
+                and not self.goal_stack.check_progress(str(subgoal))
+            ):
+                self.goal_stack.backtrack()
+        self._pending_cognition_decision = None
+
+    def reset_episode(self) -> None:
+        """Clear episode-local cognition without discarding learned traces."""
+        if self.working_memory is not None:
+            self.working_memory.clear()
+        if self.meta_cognition is not None:
+            self.meta_cognition.reset()
+        if self.goal_stack is not None:
+            self.goal_stack.reset()
+        if self.attention is not None and hasattr(self.attention, "reset_visitation"):
+            self.attention.reset_visitation()
+        self._pending_cognition_decision = None
+        self._last_observed_outcome = "unknown"
+        self._last_cog_frame = -1
+        self._cog_log_counter = 0
 
     def _all_legal_proposals_are_score_floor(
         self,
@@ -1405,8 +1483,19 @@ class ExecutiveRuntime:
         self.hyperon = hyperon
         self.llm_backend = llm_backend
         self.config = config
+        self._bound_game_id = ""
+        self._last_observation: Observation | None = None
 
     def bind_game(self, game_id: str) -> None:
+        game_key = str(game_id or "")
+        changed_game = game_key != self._bound_game_id
+        if changed_game:
+            self._bound_game_id = game_key
+            self._last_observation = None
+            if hasattr(self.executive, "reset_agents"):
+                self.executive.reset_agents()
+            elif hasattr(self.executive, "reset_episode"):
+                self.executive.reset_episode()
         self.adapter.bind_game(game_id)
         self.memory.bind_game(game_id)
         if hasattr(self.hyperon, "bind_game"):
@@ -1430,11 +1519,129 @@ class ExecutiveRuntime:
         self._observe_and_persist(frames, latest_frame)
 
     def _observe_and_persist(self, frames, latest_frame):
+        previous = self._last_observation
         observation = self.adapter.observe(frames, latest_frame)
         self.memory.note_observation(observation)
-        for record in self.memory.drain_new_records():
-            self.hyperon.record_transition(record)
+        records = self.memory.drain_new_records()
+        if hasattr(self.hyperon, "record_transitions"):
+            self.hyperon.record_transitions(records)
+        else:
+            for record in records:
+                self.hyperon.record_transition(record)
+        transitions = [
+            self._classify_observed_transition(previous, observation, record)
+            for record in records
+        ]
+        boundary = self._observation_boundary(previous, observation)
+        if not transitions and boundary is not None:
+            transitions.append(
+                ObservedTransition(
+                    game_id=observation.game_id,
+                    local_outcome="unknown",
+                    boundary=boundary,
+                )
+            )
+        if hasattr(self.executive, "note_transition"):
+            for transition in transitions:
+                self.executive.note_transition(transition)
+        self._last_observation = observation
         return observation
+
+    def _classify_observed_transition(
+        self,
+        previous: Observation | None,
+        current: Observation,
+        record: EpisodeRecord,
+    ) -> ObservedTransition:
+        boundary = self._observation_boundary(previous, current)
+        previous_position = self._observation_player_position(previous)
+        current_position = self._observation_player_position(current)
+        player_moved = bool(
+            previous_position is not None
+            and current_position is not None
+            and previous_position != current_position
+        )
+        previous_signature = self._observation_frame_signature(previous)
+        current_signature = self._observation_frame_signature(current)
+        frame_changed = bool(
+            previous_signature
+            and current_signature
+            and previous_signature != current_signature
+        )
+
+        if boundary in {"win", "level"} or int(record.progress_delta or 0) > 0:
+            outcome = "progress"
+        elif boundary == "game_over" or str(record.outcome or "") == "failed":
+            outcome = "failed"
+        elif boundary in {"restart", "game"}:
+            outcome = "unknown"
+        elif player_moved:
+            outcome = "advanced"
+        elif previous_signature and current_signature and not frame_changed:
+            outcome = "stalled"
+        elif frame_changed:
+            outcome = "unknown"
+        else:
+            outcome = "stalled" if str(record.outcome or "") == "stalled" else "unknown"
+
+        return ObservedTransition(
+            game_id=current.game_id,
+            action_name=str(record.action_name or ""),
+            decision_source=str(record.decision_source or ""),
+            decision_subgoal=record.decision_subgoal,
+            local_outcome=outcome,
+            player_moved=player_moved,
+            frame_changed=frame_changed,
+            boundary=boundary,
+            record=record,
+        )
+
+    def _observation_boundary(
+        self,
+        previous: Observation | None,
+        current: Observation,
+    ) -> str | None:
+        if previous is None:
+            return None
+        if str(previous.game_id or "") != str(current.game_id or ""):
+            return "game"
+        state = str(current.game_state or "").upper()
+        if state == str(self.config.win_state_name or "").upper():
+            return "win"
+        if int(current.levels_completed or 0) > int(previous.levels_completed or 0):
+            return "level"
+        reset_states = {
+            str(name or "").upper() for name in self.config.reset_state_names
+        }
+        if state in reset_states:
+            return "game_over"
+        previous_state = str(previous.game_state or "").upper()
+        if previous_state in reset_states and state not in reset_states:
+            return "restart"
+        if (
+            bool(current.derived_features.get("step_index_reliable", True))
+            and bool(previous.derived_features.get("step_index_reliable", True))
+            and int(current.step_index or 0) < int(previous.step_index or 0)
+        ):
+            return "restart"
+        return None
+
+    @staticmethod
+    def _observation_player_position(
+        observation: Observation | None,
+    ) -> tuple[int, int] | None:
+        if observation is None:
+            return None
+        value = observation.derived_features.get("player_position")
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            return int(value[0]), int(value[1])
+        return None
+
+    @staticmethod
+    def _observation_frame_signature(observation: Observation | None) -> str:
+        if observation is None:
+            return ""
+        return str(observation.derived_features.get("frame_signature", "") or "")
 
     def default_goals(self) -> list[GoalState]:
         return [

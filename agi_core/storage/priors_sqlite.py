@@ -238,30 +238,56 @@ def load_best_prior_bucket(
                     legal_actions,
                 )
                 _merge_missing_actions(merged_bucket, subgoal_bucket)
-        for alias in aliases:
-            frame_bucket = _load_bucket(
-                connection,
-                """
-                SELECT action_name, count
-                FROM frame_action_priors
-                WHERE game_id = ? AND frame_signature = ?
-                """,
-                [alias, frame_signature],
-                legal_actions,
-            )
-            _merge_missing_actions(merged_bucket, frame_bucket)
-        for alias in aliases:
-            state_bucket = _load_bucket(
-                connection,
-                """
-                SELECT action_name, count
-                FROM state_action_priors
-                WHERE game_id = ? AND state = ?
-                """,
-                [alias, state],
-                legal_actions,
-            )
-            _merge_missing_actions(merged_bucket, state_bucket)
+        if subgoal:
+            for alias in aliases:
+                state_bucket = _load_bucket(
+                    connection,
+                    """
+                    SELECT action_name, count
+                    FROM state_action_priors
+                    WHERE game_id = ? AND state = ?
+                    """,
+                    [alias, state],
+                    legal_actions,
+                )
+                _merge_missing_actions(merged_bucket, state_bucket)
+            for alias in aliases:
+                frame_bucket = _load_bucket(
+                    connection,
+                    """
+                    SELECT action_name, count
+                    FROM frame_action_priors
+                    WHERE game_id = ? AND frame_signature = ?
+                    """,
+                    [alias, frame_signature],
+                    legal_actions,
+                )
+                _merge_missing_actions(merged_bucket, frame_bucket)
+        else:
+            for alias in aliases:
+                frame_bucket = _load_bucket(
+                    connection,
+                    """
+                    SELECT action_name, count
+                    FROM frame_action_priors
+                    WHERE game_id = ? AND frame_signature = ?
+                    """,
+                    [alias, frame_signature],
+                    legal_actions,
+                )
+                _merge_missing_actions(merged_bucket, frame_bucket)
+            for alias in aliases:
+                state_bucket = _load_bucket(
+                    connection,
+                    """
+                    SELECT action_name, count
+                    FROM state_action_priors
+                    WHERE game_id = ? AND state = ?
+                    """,
+                    [alias, state],
+                    legal_actions,
+                )
+                _merge_missing_actions(merged_bucket, state_bucket)
         for alias in aliases:
             game_bucket = _load_bucket(
                 connection,

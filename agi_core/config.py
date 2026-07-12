@@ -87,6 +87,27 @@ class RuntimeConfig:
             return None
         return self.trained_priors_db_path
 
+    def effective_model_path(self) -> Path:
+        """Resolve the configured local model or discover one in its directory."""
+        if self.llm_model_path.exists():
+            return self.llm_model_path
+        if self.llm_model_dir.is_dir():
+            if (self.llm_model_dir / "config.json").is_file():
+                return self.llm_model_dir
+            gguf_models = sorted(
+                path for path in self.llm_model_dir.glob("*.gguf") if path.is_file()
+            )
+            if gguf_models:
+                return gguf_models[0]
+            transformer_models = sorted(
+                path
+                for path in self.llm_model_dir.iterdir()
+                if path.is_dir() and (path / "config.json").is_file()
+            )
+            if transformer_models:
+                return transformer_models[0]
+        return self.llm_model_path
+
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> "RuntimeConfig":
         root = project_root or Path(__file__).resolve().parents[1]

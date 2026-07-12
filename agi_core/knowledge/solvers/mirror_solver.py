@@ -504,7 +504,9 @@ class MirrorSolver(DynamicsSolver):
         else:
             max_switches_override = 0
             artifact_target = _plan_stage_target(ctx.plan_context, self._switch_count)
-            if artifact_target is not None:
+            if artifact_target is not None and (
+                max(0, len(shape_comps or [])) > 0 or artifact_target[1] > 1
+            ):
                 (target_px, target_py), max_switches_override = artifact_target
             else:
                 target_gx = 2 * mirror_gx - max_ggx

@@ -34,6 +34,20 @@ from agi_core.specialists.reactive import ReactiveSpecialist
 from agi_core.specialists.symbolic import SymbolicSpecialist
 
 
+def _resolve_parallel_thread_workers(config: RuntimeConfig) -> int:
+    try:
+        planner_workers = int(getattr(config, "planner_workers", 0) or 0)
+    except Exception:
+        planner_workers = 0
+    try:
+        multi_agent_workers = int(getattr(config, "multi_agent_workers", 0) or 0)
+    except Exception:
+        multi_agent_workers = 0
+    if not getattr(config, "multi_agent_enabled", True):
+        return planner_workers
+    return max(planner_workers, multi_agent_workers)
+
+
 class MyAgent(Agent):
     """ARC-facing wrapper around the reusable executive runtime."""
 
@@ -73,7 +87,10 @@ class MyAgent(Agent):
         )
         llm_backend = build_llm_backend(config) if config.llm_enabled else None
         from agi_core.orch_or.parallel import ProcessPoolManager, ThreadPoolManager, sync_pool_worker_counts
-        sync_pool_worker_counts(config.planner_workers)
+        sync_pool_worker_counts(
+            config.planner_workers,
+            thread_workers=_resolve_parallel_thread_workers(config),
+        )
         # Pre-warm SQLite caches only when live gameplay explicitly allows disk I/O.
         if config.gameplay_disk_io_enabled:
             from agi_core.storage.memory_cache import get_cache

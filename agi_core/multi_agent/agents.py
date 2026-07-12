@@ -9,7 +9,9 @@ from agi_core.types import ExecutiveContext
 def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
     """Precompute shared per-frame agent features once per observation."""
     cache = context.multi_agent_frame_cache
-    if cache:
+    # Other frame-scoped systems (notably Hyperon synchronization) may seed
+    # this dictionary before the strategy-agent fields are prepared.
+    if "legal_set" in cache and "legal_actions" in cache:
         return cache
     observation = context.observation
     legal_actions = tuple(getattr(observation, "legal_actions", ()) or ())
@@ -24,7 +26,7 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
         stage_index = min(active_stage - 1, len(stage_targets) - 1)
         active_target = tuple(stage_targets[stage_index].get("target_anchor", ())) or None
     player = features.get("player_position")
-    if not player:
+    if player is None:
         active_anchor = shape_recognition.get("active_anchor")
         player = tuple(active_anchor) if isinstance(active_anchor, list) and len(active_anchor) == 2 else None
     goals = features.get("goal_positions", [])
@@ -36,14 +38,14 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
         ]
     goal_direction = None
     target_for_direction = active_target
-    if player and target_for_direction:
+    if player is not None and target_for_direction is not None:
         px, py = player
         gx, gy = target_for_direction
         if abs(gx - px) > abs(gy - py):
             goal_direction = "ACTION4" if gx > px else "ACTION3"
         else:
             goal_direction = "ACTION2" if gy > py else "ACTION1"
-    elif player and goals:
+    elif player is not None and goals:
         px, py = player
         gx = sum(g[0] for g in goals) / len(goals)
         gy = sum(g[1] for g in goals) / len(goals)
@@ -57,7 +59,7 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
     has_mirror = bool(shape_recognition.get("mirror", {}).get("present"))
     target_distance = None
     ready_to_switch = False
-    if player and active_target:
+    if player is not None and active_target is not None:
         dx = abs(int(active_target[0]) - int(player[0]))
         dy = abs(int(active_target[1]) - int(player[1]))
         target_distance = dx + dy
@@ -119,7 +121,7 @@ def _goal_direction(context: ExecutiveContext) -> str | None:
 def _target_metadata(context: ExecutiveContext) -> dict[str, Any]:
     cache = prepare_frame_cache(context)
     target = cache.get("active_shape_target")
-    if not target:
+    if target is None:
         return {}
     return {
         "target_anchor": [int(target[0]), int(target[1])],

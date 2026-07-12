@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agi_core.orch_or.analyzer import _extract_features, _find_goals, build_game_model
+from agi_core.orch_or.analyzer import _extract_features, _find_goals, _find_walkable, build_game_model
 from agi_core.orch_or.game_model import (
     ADVANCE,
     ESCALATE,
@@ -262,6 +262,47 @@ class AnalyzerTests(unittest.TestCase):
         goals = _find_goals(components, player_pos, board, color_freq={5: 1, 11: 2, 1: 7})
 
         self.assertEqual(goals, [(1, 1)])
+
+    def test_goal_detection_treats_interior_components_as_passable(self) -> None:
+        board = [[0] * 10 for _ in range(7)]
+        for y in range(7):
+            board[y][3] = 1
+        board[3][3] = 2
+        for y in range(2, 5):
+            for x in range(6, 9):
+                board[y][x] = 11
+
+        player_pos = (1, 3)
+        goal_cells = [(x, y) for y in range(2, 5) for x in range(6, 9)]
+        components = [
+            Component(cells=[(3, 3)], bbox=(3, 3, 3, 3), size=1, dominant_color=2, touches_border=False, confidence=1.0),
+            Component(cells=goal_cells, bbox=(6, 2, 8, 4), size=len(goal_cells), dominant_color=11, touches_border=False, confidence=1.0),
+        ]
+
+        goals = _find_goals(components, player_pos, board, color_freq={0: 44, 1: 6, 2: 1, 11: len(goal_cells)})
+
+        self.assertEqual(goals, [(7, 3)])
+
+    def test_walkable_keeps_origin_player_color_cells(self) -> None:
+        board = [
+            [7, 7, 0],
+            [7, 7, 0],
+            [0, 0, 0],
+        ]
+
+        walkable = _find_walkable(
+            board,
+            width=3,
+            height=3,
+            bg_color=0,
+            obstacles=[],
+            player_pos=(0, 0),
+            goal_positions=None,
+            components=None,
+        )
+
+        self.assertIn((0, 1), walkable)
+        self.assertIn((1, 0), walkable)
 
     def test_board_classified_as_puzzle(self) -> None:
         board = [[0] * 10 for _ in range(10)]
@@ -926,9 +967,13 @@ class SerializationTests(unittest.TestCase):
 
 class ThreadPoolManagerTests(unittest.TestCase):
     def test_set_max_workers(self) -> None:
-        ThreadPoolManager.set_max_workers(2)
-        exec = ThreadPoolManager.executor()
-        self.assertIsNotNone(exec)
+        previous = ThreadPoolManager._max_workers
+        try:
+            ThreadPoolManager.set_max_workers(2)
+            exec = ThreadPoolManager.executor()
+            self.assertIsNotNone(exec)
+        finally:
+            ThreadPoolManager.set_max_workers(previous)
 
     def test_run_in_parallel_returns_results(self) -> None:
         def returns_42():
@@ -972,27 +1017,48 @@ class ThreadPoolManagerTests(unittest.TestCase):
         self.assertIsNone(results[0][0])
 
     def test_run_in_parallel_timeout(self) -> None:
+        import threading
         import time
+        release = threading.Event()
+
         def slow():
-            time.sleep(10)
+            release.wait(timeout=1.0)
             return 99
-        results = ThreadPoolManager.run_in_parallel([(slow, "slow")], timeout=0.01)
-        self.assertEqual(len(results), 0)
+        try:
+            results = ThreadPoolManager.run_in_parallel([(slow, "slow")], timeout=0.01)
+            self.assertEqual(len(results), 0)
+        finally:
+            release.set()
+            for _ in range(50):
+                if ThreadPoolManager.active_worker_count() == 0:
+                    break
+                time.sleep(0.01)
 
     def test_run_all_timeout(self) -> None:
+        import threading
         import time
+        release = threading.Event()
+
         def slow():
-            time.sleep(10)
+            release.wait(timeout=1.0)
             return 99
         def fast():
             return 1
-        results = ThreadPoolManager.run_all([(slow, "slow"), (fast, "fast")], timeout=0.01)
-        result_map = {name: val for val, name in results}
-        self.assertEqual(result_map.get("fast"), 1)
+        try:
+            results = ThreadPoolManager.run_all([(slow, "slow"), (fast, "fast")], timeout=0.01)
+            result_map = {name: val for val, name in results}
+            self.assertEqual(result_map.get("fast"), 1)
+        finally:
+            release.set()
+            for _ in range(50):
+                if ThreadPoolManager.active_worker_count() == 0:
+                    break
+                time.sleep(0.01)
 
     def test_run_all_timeout_keeps_running_tasks_tracked(self) -> None:
         import time
         import threading
+        previous = ThreadPoolManager._max_workers
         ThreadPoolManager.set_max_workers(1)
         started = threading.Event()
         release = threading.Event()
@@ -1014,6 +1080,35 @@ class ThreadPoolManagerTests(unittest.TestCase):
                     break
                 time.sleep(0.01)
             self.assertEqual(ThreadPoolManager.active_worker_count(), 0)
+            ThreadPoolManager.set_max_workers(previous)
+
+    def test_submit_unique_deduplicates_in_flight_name(self) -> None:
+        import threading
+
+        release = threading.Event()
+        started = threading.Event()
+        calls = 0
+
+        def slow():
+            nonlocal calls
+            calls += 1
+            started.set()
+            release.wait(timeout=1.0)
+            return 1
+
+        first = ThreadPoolManager.submit_unique("dedup-probe", slow)
+        second = ThreadPoolManager.submit_unique("dedup-probe", slow)
+        try:
+            self.assertIsNotNone(first)
+            self.assertIsNone(second)
+            self.assertTrue(started.wait(timeout=0.2))
+            self.assertEqual(calls, 1)
+            self.assertTrue(ThreadPoolManager.is_name_pending("dedup-probe"))
+        finally:
+            release.set()
+            if first is not None:
+                first.result(timeout=1.0)
+        self.assertFalse(ThreadPoolManager.is_name_pending("dedup-probe"))
 
 
 class ParallelPlanGeneratorTests(unittest.TestCase):
@@ -1071,22 +1166,33 @@ class ParallelPlanGeneratorTests(unittest.TestCase):
 
 class ParallelOrchestratorTests(unittest.TestCase):
     def test_fallback_executive_parallel_timeout_uses_deterministic(self) -> None:
+        import threading
+        import time
+
+        release = threading.Event()
+
         class FakeCfg:
             deterministic_fallback_action = "ACTION1"
         class FakeExec:
             def decide(self, context):
-                import time
-                time.sleep(10)
+                release.wait(timeout=1.0)
                 return None
         class FakeContext:
             config = FakeCfg()
         reducer = ObjectiveReduction.__new__(ObjectiveReduction)
         reducer._config = FakeCfg()
         reducer._executive = FakeExec()
-        decision = reducer._fallback_executive_parallel(FakeContext(), timeout=0.001)
-        self.assertEqual(decision.action_name, "ACTION1")
-        self.assertEqual(decision.source, "orch_or:parallel_timeout")
-        self.assertTrue(decision.used_fallback)
+        try:
+            decision = reducer._fallback_executive_parallel(FakeContext(), timeout=0.001)
+            self.assertEqual(decision.action_name, "ACTION1")
+            self.assertEqual(decision.source, "orch_or:parallel_timeout")
+            self.assertTrue(decision.used_fallback)
+        finally:
+            release.set()
+            for _ in range(50):
+                if ThreadPoolManager.active_worker_count() == 0:
+                    break
+                time.sleep(0.01)
 
 
 if __name__ == "__main__":

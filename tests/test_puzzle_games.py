@@ -3337,6 +3337,72 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         self.assertEqual(artifact_a["active_anchor"], [1, 1])
         self.assertEqual(artifact_b["active_anchor"], [5, 5])
 
+    def test_shape_recognition_legacy_cache_recomputes_instead_of_reusing(self) -> None:
+        features: dict[str, Any] = {
+            "shape_recognition": {
+                "frame_signature": None,
+                "player_hint": None,
+                "legacy_only": True,
+            }
+        }
+
+        artifact = ensure_shape_recognition(None, features)
+
+        self.assertEqual(artifact["version"], 2)
+        self.assertIn("mirror_puzzle", artifact)
+        self.assertNotIn("legacy_only", artifact)
+
+    def test_shape_recognition_v2_cache_reuses_without_image_input(self) -> None:
+        cached = {
+            "version": 2,
+            "frame_signature": None,
+            "player_hint": None,
+            "goal_clusters": [],
+            "shape_entities": [],
+            "equivalence_classes": [],
+            "mirror": {"present": False},
+            "mirror_puzzle": {"active": False},
+        }
+        features: dict[str, Any] = {"shape_recognition": cached}
+
+        artifact = ensure_shape_recognition(None, features)
+
+        self.assertIs(artifact, cached)
+
+    def test_shape_recognition_v2_cache_reuses_without_image_input_even_with_hint(self) -> None:
+        cached = {
+            "version": 2,
+            "frame_signature": None,
+            "player_hint": [2, 2],
+            "goal_clusters": [],
+            "shape_entities": [],
+            "equivalence_classes": [],
+            "mirror": {"present": False},
+            "mirror_puzzle": {"active": False},
+        }
+        features: dict[str, Any] = {"shape_recognition": cached}
+
+        artifact = ensure_shape_recognition(None, features)
+
+        self.assertIs(artifact, cached)
+
+    def test_shape_recognition_v2_cache_reuses_without_image_input_with_frame_signature(self) -> None:
+        cached = {
+            "version": 2,
+            "frame_signature": "frame-sig",
+            "player_hint": [2, 2],
+            "goal_clusters": [],
+            "shape_entities": [],
+            "equivalence_classes": [],
+            "mirror": {"present": False},
+            "mirror_puzzle": {"active": False},
+        }
+        features: dict[str, Any] = {"shape_recognition": cached}
+
+        artifact = ensure_shape_recognition(None, features)
+
+        self.assertIs(artifact, cached)
+
     def test_shape_recognition_marks_mirror_puzzle_inactive_without_stage_targets(self) -> None:
         from agi_core.perception.shape_recognition import _ColorComponent
 

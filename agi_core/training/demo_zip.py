@@ -1592,7 +1592,7 @@ def _consensus_filter_actions(actions: dict[str, int]) -> dict[str, int]:
     runner_up_count = int(ranked[1][1])
     margin = int(leader_count) - runner_up_count
     if margin <= 0:
-        margin = 0
+        return {}
     return {str(leader_name): max(1, margin)}
 
 

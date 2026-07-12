@@ -26,6 +26,7 @@ from agi_core.storage import (
     load_memory_bundle_from_stores,
     record_transition as persist_transition,
 )
+from agi_core.storage.memory_cache import drop_cache
 from agi_core.storage.priors_sqlite import game_id_aliases
 from agi_core.storage.memory_sqlite import (
     _compact_trained_prior_focus,
@@ -238,6 +239,7 @@ class HyperonBridge:
         self._unpersisted_records: dict[tuple[Any, ...], EpisodeRecord] = {}
         self._unpersisted_count: int = 0
         self._unpersisted_flush_threshold: int = 30
+        self._contextual_bundle_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._last_observation_step_by_game: dict[str, int] = {}
         self._last_observation_state_by_game: dict[str, str] = {}
         self._current_memory_bundle = MemoryBundle()
@@ -260,6 +262,7 @@ class HyperonBridge:
 
     def sync(self, observation: Observation, memory: Any, goals: list[GoalState]) -> None:
         self._note_observation_boundary(observation)
+        self._contextual_bundle_cache.clear()
         runtime_working = self._runtime_working_memory_seed(memory)
         active_subgoal = str(runtime_working.get("active_subgoal") or "").strip() or None
         bundle = self._load_memory_bundle(
@@ -267,6 +270,7 @@ class HyperonBridge:
             subgoal=active_subgoal,
             legal_actions=list(observation.legal_actions),
             memory=memory,
+            touch_retrieved=False,
         )
         self._current_memory_bundle = MemoryBundle(**bundle)
         image_input = observation.image_input
@@ -353,6 +357,33 @@ class HyperonBridge:
     ) -> MemoryBundle:
         if not subgoal:
             return self._current_memory_bundle
+        board_context = board_context_summary(
+            observation.image_input,
+            derived_features=observation.derived_features,
+        )
+        cache_key = (
+            str(observation.game_id or ""),
+            str(observation.game_state or ""),
+            str(observation.derived_features.get("frame_signature", "") or ""),
+            str(subgoal or ""),
+            tuple(str(action_name or "") for action_name in legal_actions),
+            json.dumps(board_context or {}, sort_keys=True, separators=(",", ":")),
+            tuple(
+                str(tag or "")
+                for tag in extract_board_motif_tags(
+                    observation.image_input,
+                    board_context=board_context,
+                    legal_actions=legal_actions,
+                    levels_completed=observation.levels_completed,
+                )
+            ),
+            repr(dict(self.current_memory_bundle().working_memory or {})),
+            str(observation.last_action or ""),
+            int(observation.step_index or 0),
+        )
+        cached = self._contextual_bundle_cache.get(cache_key)
+        if cached is not None:
+            return MemoryBundle(**dict(cached))
         bundle = self._load_memory_bundle(
             observation=observation,
             subgoal=subgoal,
@@ -360,6 +391,7 @@ class HyperonBridge:
             memory=None,
             touch_retrieved=False,
         )
+        self._contextual_bundle_cache[cache_key] = dict(bundle)
         return MemoryBundle(**bundle)
 
     def record_transition(self, record: EpisodeRecord) -> None:
@@ -367,15 +399,33 @@ class HyperonBridge:
         self._unpersisted_records[record_key] = record
         if not self._ensure_memory_write_available():
             return
-        self._unpersisted_count += 1
-        if self._unpersisted_count >= self._unpersisted_flush_threshold:
-            try:
-                self._flush_unpersisted_records()
-                self._memory_error = None
-            except Exception as exc:
-                self._memory_store_available = True
-                self._memory_write_available = False
-                self._memory_error = repr(exc)
+        try:
+            self._flush_unpersisted_records()
+            self._memory_error = None
+            self._memory_write_available = True
+        except Exception as exc:
+            self._memory_store_available = True
+            self._memory_write_available = False
+            self._memory_error = repr(exc)
+
+    def record_transitions(self, records: list[EpisodeRecord]) -> None:
+        if not records:
+            return
+        for record in records:
+            self._unpersisted_records[self._record_key(record)] = record
+        if not self._ensure_memory_write_available():
+            return
+        self._unpersisted_count = len(self._unpersisted_records)
+        if self._unpersisted_count < self._unpersisted_flush_threshold:
+            return
+        try:
+            self._flush_unpersisted_records()
+            self._memory_error = None
+            self._memory_write_available = True
+        except Exception as exc:
+            self._memory_store_available = True
+            self._memory_write_available = False
+            self._memory_error = repr(exc)
 
     def _flush_unpersisted_records(self) -> None:
         if self.memory_db_path is None and self.trained_priors_db_path is None:
@@ -390,6 +440,7 @@ class HyperonBridge:
                 except Exception:
                     logger.debug("failed to persist to trained DB", exc_info=True)
             self._unpersisted_records.pop(pending_key, None)
+            self._unpersisted_count = len(self._unpersisted_records)
         self._unpersisted_count = 0
 
     def update_proposals(self, proposals: list[ActionProposal]) -> None:
@@ -1239,6 +1290,7 @@ class HyperonBridge:
             self._memory_write_available = True
             self._memory_error = None
         except Exception as exc:
+            drop_cache(self.memory_db_path)
             self._memory_store_available = False
             self._memory_write_available = False
             self._memory_error = repr(exc)
@@ -1342,6 +1394,7 @@ class HyperonBridge:
                 )
             except Exception:
                 self._memory_store_available = False
+                self._memory_write_available = False
                 self._memory_error = repr(exc)
                 return self._augment_memory_layers(
                     bundle=self._fallback_memory_bundle(
@@ -1433,6 +1486,7 @@ class HyperonBridge:
             subgoal=current_subgoal,
             legal_actions=legal_actions,
             memory=None,
+            touch_retrieved=False,
         )
         return bundle
 
@@ -1721,21 +1775,11 @@ class HyperonBridge:
         legal_actions: list[str],
         memory: Any | None,
     ) -> dict[str, Any]:
-        # Parallel: load memory records + trained priors (independent resources)
-        try:
-            _rec_future = ThreadPoolManager.submit(self._fallback_memory_records, memory)
-            _trained_future = ThreadPoolManager.submit(
-                self._load_trained_prior_bucket, observation,
-                subgoal=subgoal,
-            )
-            records = _rec_future.result()
-            trained_prior_bucket = _trained_future.result()
-        except Exception:
-            records = self._fallback_memory_records(memory)
-            trained_prior_bucket = self._load_trained_prior_bucket(
-                observation,
-                subgoal=subgoal,
-            )
+        records = self._fallback_memory_records(memory)
+        trained_prior_bucket = self._load_trained_prior_bucket(
+            observation,
+            subgoal=subgoal,
+        )
         if memory is not None:
             self._ingest_episode_records(records)
             learned = self._summarize_learned_knowledge(observation.game_id)
@@ -2132,6 +2176,7 @@ class HyperonBridge:
                 recent_records=recent_records,
                 semantic_memories=semantic_memories,
                 procedural_memories=procedural_memories,
+                abstract_memories=[],
                 recommended_actions=recommended_actions,
                 trained_prior_bucket=trained_prior_bucket,
                 suppressed_actions=suppressed_actions,

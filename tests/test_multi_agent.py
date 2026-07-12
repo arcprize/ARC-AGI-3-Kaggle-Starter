@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import MagicMock
+import time
+from unittest.mock import MagicMock, patch
 
 from agi_core.config import RuntimeConfig
 from agi_core.multi_agent import (
@@ -12,10 +13,18 @@ from agi_core.multi_agent import (
     MovementAgent,
     PuzzleAgent,
 )
-from agi_core.multi_agent.agents import StrategyAgent, _ordered_mirror_actions, prepare_frame_cache
+from agi_core.multi_agent.agents import StrategyAgent, _ordered_mirror_actions, _target_metadata, prepare_frame_cache
 from agi_core.multi_agent.consensus import _consensus_context_signals
+from agi_core.memory import EpisodicMemory
 from agi_core.perception.shape_recognition import recognize_shape_recognition
-from agi_core.types import ActionDecision, AgentProposal, ExecutiveContext, Observation
+from agi_core.runtime_sync import ensure_hyperon_context_synced
+from agi_core.types import (
+    ActionDecision,
+    AgentProposal,
+    ExecutiveContext,
+    Observation,
+    ObservedTransition,
+)
 
 
 class TestMultiAgent(unittest.TestCase):
@@ -122,7 +131,322 @@ class TestMultiAgent(unittest.TestCase):
         self.assertIn("interaction", sup._agent_map)
         self.assertIn("puzzle", sup._agent_map)
 
-    def test_finalize_cognition_only_penalizes_participating_agents(self):
+    def test_supervisor_preserves_bootstrapped_thread_pool_worker_budget(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 6
+        executive = MagicMock()
+        with patch("agi_core.multi_agent.supervisor.ThreadPoolManager.set_max_workers") as set_workers:
+            supervisor = AgentSupervisor(executive=executive, config=config)
+
+        self.assertEqual(supervisor._workers, 6)
+        set_workers.assert_not_called()
+
+    def test_run_agents_keeps_parallel_partial_results_without_serial_rerun(self):
+        import threading
+        import time
+
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = 0.01
+        config.cuda_enabled = False
+        executive = MagicMock()
+        fast_agent = MagicMock()
+        fast_agent.agent_id = "fast"
+        fast_proposal = AgentProposal(
+            action_name="ACTION1",
+            source="agent-fast",
+            confidence=0.9,
+            reason="fast",
+            agent_id="fast",
+            subgoal="navigate",
+        )
+        slow_agent = MagicMock()
+        slow_agent.agent_id = "slow"
+        started = threading.Barrier(2)
+        release = threading.Event()
+        fast_calls: list[float] = []
+        slow_calls: list[float] = []
+
+        def fast_produce(context):
+            fast_calls.append(time.monotonic())
+            started.wait(timeout=0.2)
+            return [fast_proposal]
+
+        def slow_produce(context):
+            slow_calls.append(time.monotonic())
+            started.wait(timeout=0.2)
+            release.wait(timeout=0.2)
+            return []
+
+        fast_agent.produce.side_effect = fast_produce
+        slow_agent.produce.side_effect = slow_produce
+        sup = AgentSupervisor(
+            executive=executive,
+            config=config,
+            agents=[fast_agent, slow_agent],
+        )
+        sup._agent_timeout = 0.02
+        ctx = self._mock_context(legal=["ACTION1"])
+
+        t0 = time.monotonic()
+        try:
+            proposals = sup._run_agents([fast_agent, slow_agent], ctx)
+        finally:
+            release.set()
+            pending = sup._agent_futures.get("slow")
+            if pending is not None:
+                pending[0].result(timeout=1.0)
+        elapsed = time.monotonic() - t0
+
+        self.assertIn("fast", proposals)
+        self.assertNotIn("slow", proposals)
+        self.assertEqual(len(fast_calls), 1)
+        self.assertEqual(len(slow_calls), 1)
+        self.assertLess(abs(fast_calls[0] - slow_calls[0]), 0.05)
+        self.assertLess(elapsed, 0.15)
+
+    def test_run_agents_empty_result_does_not_trip_circuit_breaker(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        agent = MagicMock()
+        agent.agent_id = "idle"
+        agent.produce.return_value = []
+        sup = AgentSupervisor(
+            executive=MagicMock(),
+            config=config,
+            agents=[agent],
+        )
+        sup._agent_health["idle"] = {"consecutive_failures": 2}
+
+        proposals = sup._run_agents([agent], self._mock_context())
+
+        self.assertEqual(proposals, {})
+        self.assertNotIn("idle", sup._agent_health)
+
+    def test_run_agents_does_not_duplicate_in_flight_agent(self):
+        import threading
+
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        release = threading.Event()
+        agent = MagicMock()
+        agent.agent_id = "slow"
+
+        def slow_produce(context):
+            release.wait(timeout=0.5)
+            return []
+
+        agent.produce.side_effect = slow_produce
+        supervisor = AgentSupervisor(
+            executive=MagicMock(),
+            config=config,
+            agents=[agent],
+        )
+        supervisor._agent_timeout = 0.01
+        context = self._mock_context()
+
+        try:
+            self.assertEqual(supervisor._run_agents([agent], context), {})
+            self.assertEqual(supervisor._run_agents([agent], context), {})
+            self.assertEqual(agent.produce.call_count, 1)
+        finally:
+            release.set()
+            pending = supervisor._agent_futures.get("slow")
+            if pending is not None:
+                pending[0].result(timeout=1.0)
+
+    def test_circuit_breaker_allows_half_open_recovery_probe(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        supervisor = AgentSupervisor(executive=MagicMock(), config=config)
+
+        for _ in range(3):
+            supervisor._record_failure("movement")
+        self.assertTrue(supervisor._is_circuit_open("movement"))
+
+        supervisor._agent_health["movement"]["open_until"] = time.monotonic() - 1.0
+        self.assertFalse(supervisor._is_circuit_open("movement"))
+        self.assertEqual(supervisor._agent_health["movement"]["half_open"], 1.0)
+
+        supervisor._record_success("movement", [])
+        self.assertFalse(supervisor._is_circuit_open("movement"))
+
+    def test_game_over_transition_resets_episode_state_after_feedback(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        executive = MagicMock()
+        supervisor = AgentSupervisor(executive=executive, config=config)
+        supervisor._agent_health["movement"] = {"consecutive_failures": 3}
+        supervisor._solver_cooldown = 7
+        supervisor._sticky_shape_target = {"target": [3, 4]}
+
+        supervisor.note_transition(
+            ObservedTransition(
+                game_id="ls20",
+                action_name="ACTION1",
+                decision_source="agent-movement",
+                local_outcome="failed",
+                boundary="game_over",
+            )
+        )
+
+        self.assertEqual(supervisor._agent_health, {})
+        self.assertEqual(supervisor._solver_cooldown, 0)
+        self.assertIsNone(supervisor._sticky_shape_target)
+        executive.note_transition.assert_called_once()
+        executive.reset_episode.assert_called_once()
+
+    def test_solver_and_agents_share_consensus_and_critic_path(self):
+        import threading
+
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        executive = MagicMock()
+        overlap_confirmed = threading.Event()
+        active_lock = threading.Lock()
+        active_count = 0
+
+        def make_agent(agent_id: str, action_name: str):
+            agent = MagicMock()
+            agent.agent_id = agent_id
+            proposal = AgentProposal(
+                action_name=action_name,
+                source=f"agent-{agent_id}",
+                confidence=0.7,
+                reason="parallel-probe",
+                agent_id=agent_id,
+            )
+
+            def produce(context):
+                nonlocal active_count
+                with active_lock:
+                    active_count += 1
+                    if active_count == 2:
+                        overlap_confirmed.set()
+                overlap_confirmed.wait(timeout=0.2)
+                with active_lock:
+                    active_count -= 1
+                return [proposal]
+
+            agent.produce.side_effect = produce
+            return agent
+
+        agents = [
+            make_agent("movement", "ACTION1"),
+            make_agent("exploration", "ACTION2"),
+        ]
+        solver_decision = ActionDecision(
+            action_name="ACTION3",
+            source="solver:mirror",
+            confidence=0.8,
+            reason="solver remains authoritative",
+        )
+        sup = AgentSupervisor(
+            executive=executive,
+            config=config,
+            agents=agents,
+        )
+        sup._try_solver_direct = MagicMock(return_value=solver_decision)
+        sup._finalize_cognition = MagicMock()
+        executive.critic.rescore.side_effect = lambda context, proposals: proposals
+        executive._all_legal_proposals_are_score_floor.return_value = False
+        executive._probe_dead_end_escape.return_value = None
+        executive._finalize_decision_metadata.side_effect = (
+            lambda context, action_name, metadata: metadata
+        )
+        executive._finalize_decision_subgoal.side_effect = (
+            lambda context, action_name, subgoal: subgoal
+        )
+        ctx = self._mock_context(legal=["ACTION1", "ACTION2", "ACTION3"])
+        ctx.goals = []
+        ctx.memory.pending_score_floor_reopen.return_value = None
+        ctx.hyperon.current_memory_bundle.return_value = None
+
+        decision = sup.decide(ctx)
+
+        self.assertEqual(decision.action_name, "ACTION3")
+        self.assertEqual(decision.source, "solver:mirror")
+        self.assertTrue(overlap_confirmed.is_set())
+        for agent in agents:
+            agent.produce.assert_called_once_with(ctx)
+        sup._try_solver_direct.assert_called_once_with(ctx)
+        combined = executive.critic.rescore.call_args.args[1]
+        self.assertEqual(
+            {proposal.source for proposal in combined},
+            {"agent-movement", "agent-exploration", "solver:mirror"},
+        )
+        ctx.hyperon.update_proposals.assert_called_once()
+        self.assertEqual(sup._agent_health, {})
+
+    def test_illegal_solver_proposal_cannot_bypass_legal_agent(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        config.reset_state_names = ("NOT_PLAYED", "GAME_OVER")
+        executive = MagicMock()
+        agent = MagicMock()
+        agent.agent_id = "movement"
+        agent.produce.return_value = [
+            AgentProposal(
+                action_name="ACTION1",
+                source="agent-movement",
+                confidence=0.7,
+                reason="legal move",
+                agent_id="movement",
+            )
+        ]
+        supervisor = AgentSupervisor(
+            executive=executive,
+            config=config,
+            agents=[agent],
+        )
+        supervisor._try_solver_direct = MagicMock(
+            return_value=ActionDecision(
+                action_name="ACTION3",
+                source="solver:probe",
+                confidence=0.99,
+                reason="illegal probe",
+            )
+        )
+        supervisor._finalize_cognition = MagicMock()
+        executive.critic.rescore.side_effect = lambda context, proposals: proposals
+        executive._all_legal_proposals_are_score_floor.return_value = False
+        executive._probe_dead_end_escape.return_value = None
+        executive._finalize_decision_metadata.side_effect = (
+            lambda context, action_name, metadata: metadata
+        )
+        executive._finalize_decision_subgoal.side_effect = (
+            lambda context, action_name, subgoal: subgoal
+        )
+        context = self._mock_context(legal=["ACTION1"])
+        context.memory.pending_score_floor_reopen.return_value = None
+
+        decision = supervisor.decide(context)
+
+        self.assertEqual(decision.action_name, "ACTION1")
+        self.assertEqual(decision.source, "agent-movement")
+        solver_proposal = next(
+            proposal
+            for proposal in decision.proposals
+            if proposal.source == "solver:probe"
+        )
+        self.assertNotIn(
+            solver_proposal.action_name,
+            context.observation.legal_actions,
+        )
+
+    def test_finalize_cognition_defers_credit_until_observed_transition(self):
         config = MagicMock(spec=RuntimeConfig)
         executive = MagicMock()
         sup = AgentSupervisor(executive=executive, config=config)
@@ -142,13 +466,27 @@ class TestMultiAgent(unittest.TestCase):
             participating_agent_ids={"movement", "interaction"},
         )
 
+        self.assertEqual(sup._agent_map["movement"]._total_count, 0)
+        self.assertEqual(sup._agent_map["interaction"]._total_count, 0)
+        sup.note_transition(
+            ObservedTransition(
+                game_id=ctx.observation.game_id,
+                action_name="ACTION1",
+                decision_source="agent-movement",
+                decision_subgoal="navigate",
+                local_outcome="advanced",
+                player_moved=True,
+            )
+        )
+
         self.assertEqual(sup._agent_map["movement"]._total_count, 1)
         self.assertEqual(sup._agent_map["movement"]._success_count, 1)
-        self.assertEqual(sup._agent_map["interaction"]._total_count, 1)
+        self.assertEqual(sup._agent_map["interaction"]._total_count, 0)
         self.assertEqual(sup._agent_map["interaction"]._success_count, 0)
         self.assertEqual(sup._agent_map["exploration"]._total_count, 0)
         self.assertEqual(sup._agent_map["puzzle"]._total_count, 0)
         executive._finalize_cognition.assert_called_once_with(ctx, decision)
+        executive.note_transition.assert_called_once()
 
     def test_finalize_cognition_solver_does_not_penalize_agents(self):
         config = MagicMock(spec=RuntimeConfig)
@@ -211,6 +549,44 @@ class TestMultiAgent(unittest.TestCase):
         self.assertTrue(tripped)
         self.assertGreaterEqual(sup._solver_stall_count, 10)
 
+    def test_generic_solver_stall_enters_cooldown(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        supervisor = AgentSupervisor(executive=MagicMock(), config=config)
+        context = self._mock_context(legal=["ACTION1", "ACTION2"])
+        game_model = MagicMock()
+        game_model.player_pos = (4, 5)
+        game_model.features.board_type = "puzzle"
+        game_model.features.primary_dynamics = "beam"
+        game_model.features.dynamics = ["beam"]
+        solver = MagicMock()
+        solver.dynamics = "beam"
+        solver.should_activate.return_value = True
+        solver.decide.return_value = ActionDecision(
+            action_name="ACTION1",
+            source="solver:beam",
+            confidence=0.8,
+            reason="repeat",
+        )
+        supervisor._solver_selector = MagicMock()
+        supervisor._solver_selector.select_solver.return_value = solver
+        supervisor._update_solver_stall = MagicMock(return_value=True)
+
+        with (
+            patch("agi_core.multi_agent.supervisor._get_board_data", return_value=[[0]]),
+            patch("agi_core.multi_agent.supervisor.build_game_model", return_value=game_model),
+            patch("agi_core.multi_agent.supervisor._board_has_mirror", return_value=False),
+            patch("agi_core.multi_agent.supervisor._build_solver_context", return_value=MagicMock()),
+            patch("agi_core.multi_agent.supervisor.ensure_shape_recognition"),
+        ):
+            decision = supervisor._try_solver_direct(context)
+
+        self.assertIsNone(decision)
+        self.assertEqual(supervisor._solver_cooldown, 10)
+        supervisor._update_solver_stall.assert_called_once_with((4, 5), "ACTION1")
+
     def test_strategy_agent_make_proposal(self):
         agent = MovementAgent()
         p = agent._make_proposal(
@@ -264,6 +640,117 @@ class TestMultiAgent(unittest.TestCase):
         self.assertEqual(decision.action_name, "ACTION1")
         sup._finalize_cognition.assert_called_once()
 
+    def test_supervisor_score_floor_fallback_notes_and_finalizes_decision(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 4
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        executive = MagicMock()
+        agent = MagicMock()
+        agent.agent_id = "movement"
+        proposal = AgentProposal(
+            action_name="ACTION1",
+            source="agent-movement",
+            confidence=0.7,
+            reason="move",
+            agent_id="movement",
+            subgoal="navigate",
+        )
+        fallback = ActionDecision(
+            action_name="ACTION2",
+            source="fallback",
+            confidence=0.05,
+            reason="score-floor",
+        )
+        agent.produce.return_value = [proposal]
+        executive.critic.rescore.return_value = [proposal]
+        executive._all_legal_proposals_are_score_floor.return_value = True
+        executive._score_floor_fallback.return_value = fallback
+        sup = AgentSupervisor(executive=executive, config=config, agents=[agent])
+        sup._try_solver_direct = MagicMock(return_value=None)
+        sup._finalize_cognition = MagicMock()
+        ctx = self._mock_context(legal=["ACTION1", "ACTION2"])
+        ctx.memory.pending_score_floor_reopen.return_value = None
+
+        decision = sup.decide(ctx)
+
+        self.assertIs(decision, fallback)
+        self.assertIs(decision.proposals, executive.critic.rescore.return_value)
+        ctx.memory.note_decision.assert_called_once_with(fallback)
+        sup._finalize_cognition.assert_called_once_with(ctx, fallback)
+
+    def test_supervisor_pending_reopen_reset_does_not_delegate_to_base_executive(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 4
+        config.planner_parallel_timeout = None
+        config.cuda_enabled = False
+        executive = MagicMock()
+        sup = AgentSupervisor(executive=executive, config=config)
+        sup._finalize_cognition = MagicMock()
+        ctx = self._mock_context(legal=["RESET"])
+        ctx.goals = []
+        ctx.hyperon.current_memory_bundle.return_value = None
+        ctx.memory.pending_score_floor_reopen.return_value = {
+            "score_floor_debug": {"pending_reset": True}
+        }
+
+        decision = sup.decide(ctx)
+
+        self.assertEqual(decision.action_name, "RESET")
+        self.assertEqual(decision.metadata["score_floor_debug"]["pending_reset"], True)
+        ctx.memory.clear_pending_score_floor_reopen.assert_called_once()
+        ctx.memory.note_decision.assert_called_once_with(decision)
+        sup._finalize_cognition.assert_called_once_with(ctx, decision)
+        executive.decide.assert_not_called()
+
+    def test_runtime_sync_resyncs_when_memory_changes_on_same_observation(self):
+        ctx = self._mock_context()
+        ctx.memory = EpisodicMemory()
+        ctx.goals = []
+        ctx.observation.game_id = "ls20"
+        ctx.hyperon.current_memory_bundle.side_effect = ["bundle-a", "bundle-b"]
+        ctx.memory_bundle = None
+
+        first = ensure_hyperon_context_synced(ctx)
+        ctx.memory.note_observation(ctx.observation)
+        ctx.memory.note_decision(
+            ActionDecision(
+                action_name="ACTION1",
+                source="symbolic",
+                confidence=0.6,
+                reason="same-frame-update",
+            )
+        )
+        second = ensure_hyperon_context_synced(ctx)
+
+        self.assertEqual(first, "bundle-a")
+        self.assertEqual(second, "bundle-b")
+        self.assertEqual(ctx.hyperon.sync.call_count, 2)
+
+    def test_runtime_sync_resyncs_when_goals_change_on_same_observation(self):
+        ctx = self._mock_context()
+        goal_a = MagicMock()
+        goal_a.name = "goal-a"
+        goal_a.target_state = "WIN"
+        goal_a.priority = 1
+        goal_a.metadata = {}
+        goal_b = MagicMock()
+        goal_b.name = "goal-b"
+        goal_b.target_state = "LOSE"
+        goal_b.priority = 2
+        goal_b.metadata = {"mode": "fallback"}
+        ctx.goals = [goal_a]
+        ctx.hyperon.current_memory_bundle.side_effect = ["bundle-a", "bundle-b"]
+        ctx.memory_bundle = None
+
+        first = ensure_hyperon_context_synced(ctx)
+        ctx.goals = [goal_b]
+        second = ensure_hyperon_context_synced(ctx)
+
+        self.assertEqual(first, "bundle-a")
+        self.assertEqual(second, "bundle-b")
+        self.assertEqual(ctx.hyperon.sync.call_count, 2)
+
     def test_prepare_frame_cache_precomputes_shared_features(self):
         ctx = self._mock_context(
             legal=["ACTION2", "ACTION4", "ACTION6"],
@@ -286,6 +773,17 @@ class TestMultiAgent(unittest.TestCase):
         self.assertEqual(cache["goal_direction"], "ACTION4")
         self.assertIn("shape_recognition", cache)
         self.assertIs(cache, prepare_frame_cache(ctx))
+
+    def test_prepare_frame_cache_fills_agent_fields_after_hyperon_sync(self):
+        ctx = self._mock_context(legal=["ACTION1", "ACTION5"])
+        sync_token = ("ar25", 3, "PLAYING")
+        ctx.multi_agent_frame_cache["__hyperon_sync_token__"] = sync_token
+
+        cache = prepare_frame_cache(ctx)
+
+        self.assertEqual(cache["__hyperon_sync_token__"], sync_token)
+        self.assertEqual(cache["legal_actions"], ("ACTION1", "ACTION5"))
+        self.assertEqual(cache["legal_set"], {"ACTION1", "ACTION5"})
 
     def test_prepare_frame_cache_respects_explicit_false_beam_hint(self):
         ctx = self._mock_context(
@@ -496,6 +994,37 @@ class TestMultiAgent(unittest.TestCase):
 
         self.assertEqual(cache["active_shape_target_distance"], 2)
         self.assertFalse(cache["ready_to_switch"])
+
+    def test_prepare_frame_cache_preserves_origin_coordinates(self):
+        ctx = self._mock_context(
+            legal=["ACTION1", "ACTION3", "ACTION5"],
+            derived_features={
+                "player_position": (0, 0),
+                "shape_recognition": {
+                    "version": 2,
+                    "frame_signature": "sig-origin",
+                    "player_hint": [0, 0],
+                    "active_anchor": [0, 0],
+                    "goal_clusters": [{"center": [0, 0]}],
+                    "mirror": {"present": True},
+                    "mirror_puzzle": {
+                        "active": True,
+                        "active_stage": 1,
+                        "stage_targets": [{"target_anchor": [0, 0]}],
+                    },
+                },
+            },
+        )
+        ctx.observation.levels_completed = 2
+
+        cache = prepare_frame_cache(ctx)
+        target_metadata = _target_metadata(ctx)
+
+        self.assertEqual(cache["active_shape_target"], (0, 0))
+        self.assertEqual(cache["active_shape_target_distance"], 0)
+        self.assertTrue(cache["ready_to_switch"])
+        self.assertEqual(target_metadata["target_anchor"], [0, 0])
+        self.assertEqual(target_metadata["shape_stage"], 1)
 
     def test_supervisor_reuses_sticky_shape_target_when_stage_targets_disappear(self):
         config = MagicMock(spec=RuntimeConfig)

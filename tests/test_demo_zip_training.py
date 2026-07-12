@@ -55,6 +55,14 @@ def make_line(
 
 
 class DemoZipTrainingTests(unittest.TestCase):
+    def test_consensus_filter_actions_drops_tied_leaders(self) -> None:
+        self.assertEqual(
+            demo_zip_module._consensus_filter_actions(
+                {"ACTION2": 3, "ACTION1": 3}
+            ),
+            {},
+        )
+
     def _build_zip(self, root: Path) -> Path:
         zip_path = root / "demo.zip"
         with zipfile.ZipFile(zip_path, "w") as archive:

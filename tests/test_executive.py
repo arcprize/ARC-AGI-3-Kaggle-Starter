@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from agi_core.config import RuntimeConfig
-from agi_core.executive import Executive
+from agi_core.executive import Executive, ExecutiveRuntime
 from agi_core.image_input import BoardImageInput, compute_board_signature
 from agi_core.knowledge.hyperon_bridge import HyperonBridge
 from agi_core.memory import EpisodicMemory
@@ -19,6 +19,7 @@ from agi_core.types import (
     GoalState,
     MemoryBundle,
     Observation,
+    ObservedTransition,
 )
 
 
@@ -1694,6 +1695,7 @@ class ExecutiveTests(unittest.TestCase):
         proposals = self.executive.reactive.propose(context)
 
         self.assertEqual(proposals, [])
+
 
     def test_reactive_yields_immediately_when_persistent_memory_marks_basin_exhausted(self) -> None:
         memory = EpisodicMemory()
@@ -9129,3 +9131,89 @@ class ExecutiveTests(unittest.TestCase):
         proposals = LLMSpecialist().propose(context)
 
         self.assertEqual(proposals, [])
+
+
+class ExecutiveRuntimeOutcomeTests(unittest.TestCase):
+    def test_next_observation_dispatches_movement_before_next_decision(self) -> None:
+        observations = [
+            Observation(
+                game_id="ls20",
+                step_index=0,
+                game_state="ACTIVE",
+                levels_completed=0,
+                last_action=None,
+                legal_actions=["ACTION1"],
+                derived_features={
+                    "frame_signature": "frame-a",
+                    "player_position": (1, 1),
+                },
+            ),
+            Observation(
+                game_id="ls20",
+                step_index=1,
+                game_state="ACTIVE",
+                levels_completed=0,
+                last_action="ACTION1",
+                legal_actions=["ACTION1"],
+                derived_features={
+                    "frame_signature": "frame-b",
+                    "player_position": (2, 1),
+                },
+            ),
+        ]
+
+        class Adapter:
+            def bind_game(self, game_id):
+                return None
+
+            def observe(self, frames, latest_frame):
+                return observations.pop(0)
+
+        class Hyperon:
+            def bind_game(self, game_id):
+                return None
+
+            def record_transitions(self, records):
+                return None
+
+        class RuntimeExecutive:
+            def __init__(self):
+                self.transitions: list[ObservedTransition] = []
+                self.events: list[str] = []
+
+            def decide(self, context):
+                self.events.append("decide")
+                decision = ActionDecision(
+                    action_name="ACTION1",
+                    source="agent-movement",
+                    confidence=0.8,
+                    reason="move",
+                )
+                context.memory.note_decision(decision)
+                return decision
+
+            def note_transition(self, transition):
+                self.events.append("transition")
+                self.transitions.append(transition)
+
+        executive = RuntimeExecutive()
+        runtime = ExecutiveRuntime(
+            adapter=Adapter(),
+            executive=executive,
+            memory=EpisodicMemory(),
+            hyperon=Hyperon(),
+            llm_backend=None,
+            config=RuntimeConfig.from_env(),
+        )
+        runtime.bind_game("ls20")
+
+        runtime.decide([], None)
+        self.assertEqual(executive.transitions, [])
+        runtime.decide([], None)
+
+        self.assertEqual(executive.events, ["decide", "transition", "decide"])
+        self.assertEqual(len(executive.transitions), 1)
+        transition = executive.transitions[0]
+        self.assertEqual(transition.local_outcome, "advanced")
+        self.assertTrue(transition.player_moved)
+        self.assertEqual(transition.action_name, "ACTION1")

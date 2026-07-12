@@ -619,7 +619,7 @@ def _find_goals(
     player_pos: tuple[int, int] | None,
     board: list[list[int]] | None = None,
     color_freq: dict[int, int] | None = None,
-) -> list[tuple[int, int]]:
+    ) -> list[tuple[int, int]]:
     candidates = [c for c in components if not c.touches_border and c.size >= 1]
     if player_pos is not None:
         px, py = player_pos
@@ -675,17 +675,21 @@ def _find_goals(
         h, w = len(board), len(board[0])
         bg = _detect_background_color(board, w, h)
         simple_walk = {(x, y) for y in range(h) for x in range(w) if board[y][x] == bg}
+        passable_walk = _expand_walkable_cells(simple_walk, components)
         px, py = player_pos
         reachable = []
         for gx, gy in primary_goals:
-            passable = simple_walk | {player_pos, (gx, gy)}
+            passable = passable_walk | {player_pos, (gx, gy)}
             path = astar(player_pos, (gx, gy), passable, w, h, max_steps=1000)
             if path is not None:
                 reachable.append((gx, gy))
         if reachable:
             return reachable
         if not reachable and scored:
-            fallback = sorted([c for _, c in scored if not (_in_bbox(player_pos, c.bbox) if player_pos else False)], key=lambda c: abs(c.bbox[0] - px) + abs(c.bbox[1] - py))
+            fallback = sorted(
+                [c for _, c in scored if not (_in_bbox(player_pos, c.bbox) if player_pos is not None else False)],
+                key=lambda c: abs(c.bbox[0] - px) + abs(c.bbox[1] - py),
+            )
             if fallback:
                 return [_component_center(fallback[0])]
     return primary_goals
@@ -701,6 +705,18 @@ def _component_center(c: Component) -> tuple[int, int]:
     xs = [p[0] for p in c.cells]
     ys = [p[1] for p in c.cells]
     return (sum(xs) // len(xs), sum(ys) // len(ys))
+
+
+def _expand_walkable_cells(
+    walkable: set[tuple[int, int]],
+    components: list[Component] | None,
+) -> set[tuple[int, int]]:
+    expanded_walkable = set(walkable)
+    if components:
+        for c in components:
+            if not c.touches_border:
+                expanded_walkable.update(c.cells)
+    return expanded_walkable
 
 
 def _find_obstacles(
@@ -741,10 +757,10 @@ def _find_walkable(
     goal_positions: list[tuple[int, int]] | None = None,
     components: list[Component] | None = None,
     attention=None,
-) -> set[tuple[int, int]]:
+    ) -> set[tuple[int, int]]:
     passable: set[tuple[int, int]] = set()
     obs_set = set((ox, oy) for ox, oy, otype in obstacles if otype == "wall")
-    player_color = board[player_pos[1]][player_pos[0]] if player_pos else -1
+    player_color = board[player_pos[1]][player_pos[0]] if player_pos is not None else -1
     goal_colors = set()
     if goal_positions:
         for gx, gy in goal_positions:
@@ -936,11 +952,7 @@ def _extract_features(
 ) -> GameFeatures:
     path_possible = False
     if player_pos is not None and goal_positions and walkable:
-        expanded_walkable = set(walkable)
-        for c in components:
-            if not c.touches_border:
-                for cx, cy in c.cells:
-                    expanded_walkable.add((cx, cy))
+        expanded_walkable = _expand_walkable_cells(walkable, components)
         a_star_passable = expanded_walkable | {player_pos} | set(goal_positions)
         path = astar(player_pos, goal_positions[0], a_star_passable, width, height)
         path_possible = path is not None

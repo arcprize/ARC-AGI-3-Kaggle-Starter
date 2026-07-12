@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agi_core.image_input import board_context_match_score, extract_board_motif_tags
-from agi_core.storage.memory_cache import get_cache
+from agi_core.storage.memory_cache import drop_cache, get_cache
 from agi_core.storage.priors_sqlite import (
     game_id_aliases,
     initialize_schema,
@@ -31,6 +31,12 @@ def _refresh_cache(path: str | Path) -> None:
         cache.refresh()
 
 
+def _drop_read_cache(path: str | Path) -> None:
+    resolved = str(Path(path).resolve())
+    _MEM_CACHE.pop(resolved, None)
+    drop_cache(resolved)
+
+
 def _connect(path: str | Path, *, write: bool = False) -> sqlite3.Connection:
     """Return an SQLite connection.
 
@@ -46,17 +52,13 @@ def _connect(path: str | Path, *, write: bool = False) -> sqlite3.Connection:
     cache = _MEM_CACHE.get(resolved) or get_cache(resolved)
     if cache is not None:
         _MEM_CACHE[resolved] = cache
-        return cache.connect(write=False)
+        return cache.connect_or_fallback(write=False)
     return sqlite3.connect(str(path))
 
 
 def initialize_memory_schema(db_path: str | Path) -> None:
     path = Path(db_path)
     initialize_schema(path)
-    # Refresh in-memory cache so subsequent reads see the created tables.
-    cache = get_cache(str(path))
-    if cache is not None:
-        cache.refresh()
     with closing(_connect(path, write=True)) as connection:
         connection.execute(
             """
@@ -492,6 +494,8 @@ def initialize_memory_schema(db_path: str | Path) -> None:
             """
         )
         connection.commit()
+    # Publish the complete schema only after every live-memory table exists.
+    _refresh_cache(path)
 
 
 def import_legacy_learning_json(db_path: str | Path, json_path: str | Path) -> None:
@@ -566,6 +570,7 @@ def import_legacy_learning_json(db_path: str | Path, json_path: str | Path) -> N
             """
         )
         connection.commit()
+    _refresh_cache(db)
 
 
 def record_transition(db_path: str | Path, record: EpisodeRecord) -> None:
@@ -865,46 +870,54 @@ def load_memory_bundle(
         return bundle
     with closing(_connect(path)) as connection:
         lookup_game_id = _resolve_memory_lookup_game_id(connection, game_id)
-        action_stats = _query_action_stats(
-            connection,
-            """
-            SELECT action_name, progress, failed, stalled, total, last_outcome
-            FROM live_action_stats
-            WHERE game_id = ?
-            ORDER BY action_name
-            """,
-            [lookup_game_id],
-        )
-        state_stats = _query_action_stats(
-            connection,
-            """
-            SELECT action_name, progress, failed, stalled, total, last_outcome
-            FROM live_state_action_stats
-            WHERE game_id = ? AND state = ?
-            ORDER BY action_name
-            """,
-            [lookup_game_id, state],
-        )
-        frame_stats = _query_action_stats(
-            connection,
-            """
-            SELECT action_name, progress, failed, stalled, total, last_outcome
-            FROM live_frame_action_stats
-            WHERE game_id = ? AND frame_signature = ?
-            ORDER BY action_name
-            """,
-            [lookup_game_id, frame_signature],
-        )
-        subgoal_stats = _query_action_stats(
-            connection,
-            """
-            SELECT action_name, progress, failed, stalled, total, last_outcome
-            FROM live_subgoal_action_stats
-            WHERE game_id = ? AND subgoal = ?
-            ORDER BY action_name
-            """,
-            [lookup_game_id, str(subgoal or "")],
-        )
+        action_stats = {}
+        if _table_exists(connection, "live_action_stats"):
+            action_stats = _query_action_stats(
+                connection,
+                """
+                SELECT action_name, progress, failed, stalled, total, last_outcome
+                FROM live_action_stats
+                WHERE game_id = ?
+                ORDER BY action_name
+                """,
+                [lookup_game_id],
+            )
+        state_stats = {}
+        if _table_exists(connection, "live_state_action_stats"):
+            state_stats = _query_action_stats(
+                connection,
+                """
+                SELECT action_name, progress, failed, stalled, total, last_outcome
+                FROM live_state_action_stats
+                WHERE game_id = ? AND state = ?
+                ORDER BY action_name
+                """,
+                [lookup_game_id, state],
+            )
+        frame_stats = {}
+        if _table_exists(connection, "live_frame_action_stats"):
+            frame_stats = _query_action_stats(
+                connection,
+                """
+                SELECT action_name, progress, failed, stalled, total, last_outcome
+                FROM live_frame_action_stats
+                WHERE game_id = ? AND frame_signature = ?
+                ORDER BY action_name
+                """,
+                [lookup_game_id, frame_signature],
+            )
+        subgoal_stats = {}
+        if _table_exists(connection, "live_subgoal_action_stats"):
+            subgoal_stats = _query_action_stats(
+                connection,
+                """
+                SELECT action_name, progress, failed, stalled, total, last_outcome
+                FROM live_subgoal_action_stats
+                WHERE game_id = ? AND subgoal = ?
+                ORDER BY action_name
+                """,
+                [lookup_game_id, str(subgoal or "")],
+            )
         basin_status = load_basin_status(path, lookup_game_id, state, frame_signature)
         basin_action_stats = dict(basin_status.get("action_outcomes", {}))
         pattern_stats = _load_pattern_action_stats(
@@ -966,20 +979,33 @@ def load_memory_bundle(
             board_context=board_context,
             last_action=last_action,
         )
-        if touch_retrieved:
-            _touch_retrieved_memory_rows(
+        touch_retrieved_rows = touch_retrieved and any(
+            int(memory.get("_rowid", 0) or 0) > 0
+            for memories in (semantic_memories, procedural_memories, abstract_memories)
+            for memory in memories
+        )
+        retrieval_step_hint = (
+            _resolve_retrieval_step(
+                retrieval_step=retrieval_step,
+                semantic_memories=semantic_memories,
+                procedural_memories=procedural_memories,
+                abstract_memories=abstract_memories,
+                recent_records=recent_records,
+            )
+            if touch_retrieved_rows
+            else 0
+        )
+    if touch_retrieved_rows:
+        with closing(_connect(path, write=True)) as connection:
+            touched = _touch_retrieved_memory_rows(
                 connection,
                 semantic_memories=semantic_memories,
                 procedural_memories=procedural_memories,
                 abstract_memories=abstract_memories,
-                step_index_hint=_resolve_retrieval_step(
-                    retrieval_step=retrieval_step,
-                    semantic_memories=semantic_memories,
-                    procedural_memories=procedural_memories,
-                    abstract_memories=abstract_memories,
-                    recent_records=recent_records,
-                ),
+                step_index_hint=retrieval_step_hint,
             )
+        if touched:
+            _refresh_cache(path)
     trained_prior_bucket = load_best_prior_bucket(
         path,
         game_id=game_id,
@@ -1121,7 +1147,7 @@ def _touch_retrieved_memory_rows(
     procedural_memories: list[dict[str, Any]],
     abstract_memories: list[dict[str, Any]],
     step_index_hint: int,
-) -> None:
+) -> bool:
     semantic_rowids = [
         int(memory.get("_rowid", 0) or 0)
         for memory in semantic_memories
@@ -1138,7 +1164,7 @@ def _touch_retrieved_memory_rows(
         if int(memory.get("_rowid", 0) or 0) > 0
     ]
     if not semantic_rowids and not procedural_rowids and not abstract_rowids:
-        return
+        return False
     try:
         if semantic_rowids:
             placeholders = ",".join("?" for _ in semantic_rowids)
@@ -1174,8 +1200,10 @@ def _touch_retrieved_memory_rows(
                 [int(step_index_hint), *abstract_rowids],
             )
         connection.commit()
+        return True
     except sqlite3.Error:
         connection.rollback()
+        return False
 
 
 def _resolve_retrieval_step(
@@ -1246,30 +1274,9 @@ def load_memory_bundle_from_stores(
         include_retrieval_metadata=False,
         retrieval_store="trained",
     )
-    try:
-        from agi_core.orch_or.parallel import ThreadPoolManager
-        _futures = {
-            ThreadPoolManager.submit(
-                _safe_load_memory_bundle, hot_db_path, **_hot_kw,
-            ): "hot",
-            ThreadPoolManager.submit(
-                _safe_load_memory_bundle, archive_db_path, **_archive_kw,
-            ): "archive",
-            ThreadPoolManager.submit(
-                _safe_load_memory_bundle, trained_db_path, **_trained_kw,
-            ): "trained",
-        }
-        _results: dict[str, tuple] = {}
-        from concurrent.futures import as_completed
-        for _f in as_completed(_futures):
-            _results[_futures[_f]] = _f.result()
-        hot_bundle, hot_error = _results.get("hot", (None, None))
-        archive_bundle, archive_error = _results.get("archive", (None, None))
-        trained_bundle, trained_error = _results.get("trained", (None, None))
-    except Exception:
-        hot_bundle, hot_error = _safe_load_memory_bundle(hot_db_path, **_hot_kw)
-        archive_bundle, archive_error = _safe_load_memory_bundle(archive_db_path, **_archive_kw)
-        trained_bundle, trained_error = _safe_load_memory_bundle(trained_db_path, **_trained_kw)
+    hot_bundle, hot_error = _safe_load_memory_bundle(hot_db_path, **_hot_kw)
+    archive_bundle, archive_error = _safe_load_memory_bundle(archive_db_path, **_archive_kw)
+    trained_bundle, trained_error = _safe_load_memory_bundle(trained_db_path, **_trained_kw)
     if hot_bundle is None and archive_bundle is None and trained_bundle is None:
         if hot_error is not None:
             raise hot_error
@@ -1480,7 +1487,17 @@ def _safe_load_memory_bundle(
         if isinstance(exc, sqlite3.OperationalError) and "no such table:" in str(exc):
             bundle = _empty_bundle()
             bundle["board_context_summary"] = _normalized_board_context(board_context)
+            bundle["trained_prior_bucket"] = load_best_prior_bucket(
+                path,
+                game_id=game_id,
+                state=state,
+                frame_signature=frame_signature,
+                legal_actions=legal_actions,
+                subgoal=subgoal,
+            )
             return bundle, None
+        if "not a database" in str(exc).lower():
+            _drop_read_cache(path)
         return None, exc
 
 
@@ -1528,7 +1545,7 @@ def _touch_bundle_memory_rows(
     if not path.exists():
         return
     with closing(_connect(path, write=True)) as connection:
-        _touch_retrieved_memory_rows(
+        touched = _touch_retrieved_memory_rows(
             connection,
             semantic_memories=semantic_memories,
             procedural_memories=procedural_memories,
@@ -1541,6 +1558,8 @@ def _touch_bundle_memory_rows(
                 recent_records=[],
             ),
         )
+    if touched:
+        _refresh_cache(path)
 
 
 def _merge_memory_bundles(
@@ -1727,6 +1746,8 @@ def _load_recent_records(
     last_action: str | None = None,
     limit: int = DEFAULT_RECENT_RECORD_LIMIT,
 ) -> list[dict[str, Any]]:
+    if not _table_exists(connection, "live_episode_records"):
+        return []
     select_clause = """
         SELECT
             id,
@@ -1881,6 +1902,8 @@ def _load_episode_summaries(
     last_action: str | None = None,
     limit: int = DEFAULT_EPISODE_SUMMARY_LIMIT,
 ) -> list[dict[str, Any]]:
+    if not _table_exists(connection, "live_episode_summaries"):
+        return []
     select_clause = """
         SELECT
             game_id,
@@ -3198,7 +3221,12 @@ def _query_action_stats(
     last_outcome_query: str | None = None,
     last_outcome_scope: list[Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    rows = connection.execute(query, parameters).fetchall()
+    try:
+        rows = connection.execute(query, parameters).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {}
+        raise
     stats: dict[str, dict[str, Any]] = {}
     for row in rows:
         action_name = str(row[0])
@@ -3459,6 +3487,8 @@ def _load_basin_row(
     state: str,
     frame_signature: str,
 ):
+    if not _table_exists(connection, "live_basin_stats"):
+        return None
     return connection.execute(
         """
         SELECT

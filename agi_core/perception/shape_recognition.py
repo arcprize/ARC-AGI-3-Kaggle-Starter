@@ -36,6 +36,14 @@ class _Placement:
     goal_cluster_ids: list[str]
 
 
+def _is_compatible_shape_recognition_cache(cached: Any) -> bool:
+    if not isinstance(cached, dict):
+        return False
+    if cached.get("version") == 2:
+        return True
+    return "mirror_puzzle" in cached
+
+
 def ensure_shape_recognition(
     image_input: BoardImageInput | None,
     derived_features: dict[str, Any] | None,
@@ -46,14 +54,12 @@ def ensure_shape_recognition(
     player_hint = _coerce_player_hint(features.get("player_position"))
     cached_player_hint = _coerce_player_hint(cached.get("player_hint")) if isinstance(cached, dict) else None
     if (
-        isinstance(cached, dict)
-        and         cached.get("version") == 2
-        and cached.get("frame_signature") == current_signature
+        _is_compatible_shape_recognition_cache(cached)
         and (
-            cached_player_hint == player_hint
+            image_input is None
             or (
-                cached_player_hint is None
-                and image_input is None
+                cached.get("frame_signature") == current_signature
+                and cached_player_hint == player_hint
             )
         )
     ):

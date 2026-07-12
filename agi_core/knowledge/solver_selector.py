@@ -6,14 +6,16 @@ from typing import TYPE_CHECKING, Any
 
 from agi_core.knowledge.puzzle_memory import (
     PuzzleBoardState,
+    initialize_puzzle_schema,
     store_board_state,
+    update_solver_outcome,
 )
 from agi_core.knowledge.solvers import (
     DynamicsSolver,
     SolverContext,
     get_solver,
 )
-from agi_core.types import ActionDecision
+from agi_core.types import ActionDecision, ObservedTransition
 
 if TYPE_CHECKING:
     from agi_core.knowledge.hyperon_bridge import HyperonBridge
@@ -40,6 +42,16 @@ class SolverSelector:
         self._active_solver: DynamicsSolver | None = None
         self._active_name: str = ""
         self._solver_history: list[tuple[str, str]] = []
+        self._pending_feedback: tuple[
+            DynamicsSolver,
+            SolverContext,
+            GameModel,
+            ActionDecision,
+        ] | None = None
+        self._attempt_steps = 0
+        self._attempt_game_id = ""
+        self._attempt_dynamics = ""
+        self._attempt_solver_name = ""
 
     @property
     def active_solver(self) -> DynamicsSolver | None:
@@ -80,15 +92,15 @@ class SolverSelector:
             if type(self._active_solver) is solver_cls:
                 self._active_name = solver_name
                 return self._active_solver
-            # Don't switch a known solver away mid-level — dynamics can oscillate
-            # between "puzzle", "sliding", "beam" etc. within the same level,
-            # BUT only if the solver name hasn't changed (genuine level boundary).
-            if solver_name == self._active_name:
-                from agi_core.knowledge.solvers.mirror_solver import MirrorSolver
-                from agi_core.knowledge.solvers.navigation_solver import NavigationSolver
-                from agi_core.knowledge.solvers.beam_coverage_solver import BeamCoverageSolver
-                if isinstance(self._active_solver, (MirrorSolver, NavigationSolver, BeamCoverageSolver)):
-                    return self._active_solver
+            # Recommendations can oscillate as perception changes within a
+            # level. Explicit boundary/cooldown hooks clear the active solver;
+            # until then preserve its state rather than silently replacing it.
+            logger.debug(
+                "SELECTOR: retaining active solver %s over mid-level recommendation %s",
+                self._active_name,
+                solver_name,
+            )
+            return self._active_solver
         self._active_solver = solver_cls(memory_db_path=self._memory_db_path)
         self._active_name = solver_name
         return self._active_solver
@@ -124,28 +136,132 @@ class SolverSelector:
         decision: ActionDecision,
         plan_context: dict[str, Any],
     ) -> None:
-        """Record solver outcome for learning."""
+        """Register a solver decision for feedback from the next observation."""
         if self._active_solver is None:
             return
+        solver_context = self.build_solver_context(game_model, plan_context, context)
+        self._pending_feedback = (
+            self._active_solver,
+            solver_context,
+            game_model,
+            decision,
+        )
+        self._attempt_steps += 1
+        self._attempt_game_id = str(context.observation.game_id or "")
+        self._attempt_dynamics = str(
+            getattr(self._active_solver, "dynamics", "unknown") or "unknown"
+        )
+        self._attempt_solver_name = self._active_name or self._attempt_dynamics
+
+    def note_transition(self, transition: ObservedTransition) -> None:
+        """Apply one registered solver decision's observed result."""
+        pending = self._pending_feedback
+        if pending is not None:
+            solver, solver_context, game_model, decision = pending
+            matches = (
+                (not transition.action_name or transition.action_name == decision.action_name)
+                and (
+                    not transition.decision_source
+                    or transition.decision_source == decision.source
+                )
+            )
+            outcome = str(transition.local_outcome or "unknown")
+            if matches and outcome != "unknown":
+                try:
+                    solver.learn(solver_context, outcome)
+                except Exception:
+                    logger.debug("solver learning failed", exc_info=True)
+                self._store_observed_board_state(
+                    transition,
+                    game_model,
+                    decision,
+                    outcome,
+                )
+            if matches or transition.boundary is not None:
+                self._pending_feedback = None
+
+        if transition.boundary in {"win", "level"}:
+            self._close_attempt(succeeded=True, game_id=transition.game_id)
+        elif transition.boundary in {"game_over", "restart", "game"}:
+            self._close_attempt(succeeded=False, game_id=transition.game_id)
+
+    def on_boundary(self, boundary: str, *, game_id: str = "") -> None:
+        if boundary in {"win", "level"}:
+            self._close_attempt(succeeded=True, game_id=game_id)
+        elif boundary in {"game_over", "restart", "game", "stalled"}:
+            self._close_attempt(succeeded=False, game_id=game_id)
+        self._pending_feedback = None
+        self.reset_level()
+
+    def reset_level(self) -> None:
+        if self._active_solver is not None:
+            try:
+                self._active_solver.reset_level()
+            except Exception:
+                logger.debug("active solver reset failed", exc_info=True)
+        self._active_solver = None
+        self._active_name = ""
+
+    def _store_observed_board_state(
+        self,
+        transition: ObservedTransition,
+        game_model: GameModel,
+        decision: ActionDecision,
+        outcome: str,
+    ) -> None:
+        if self._memory_db_path is None:
+            return
         try:
-            if self._memory_db_path is not None:
-                self._memory_db_path.parent.mkdir(parents=True, exist_ok=True)
-                player = game_model.player_pos
-                state = PuzzleBoardState(
-                    game_id=context.observation.game_id,
-                    step=context.observation.step_index,
+            initialize_puzzle_schema(self._memory_db_path)
+            player = game_model.player_pos
+            store_board_state(
+                self._memory_db_path,
+                PuzzleBoardState(
+                    game_id=transition.game_id,
+                    step=(
+                        int(transition.record.step_index)
+                        if transition.record is not None
+                        else 0
+                    ),
+                    frame_signature=(
+                        str(transition.record.prior_frame_signature or "")
+                        if transition.record is not None
+                        else ""
+                    ),
                     player_x=player[0] if player else -1,
                     player_y=player[1] if player else -1,
-                    goal_positions=game_model.goal_positions,
-                    beam_cells=[],
-                    mirror_x=player[0] if player else -1,
+                    goal_positions=list(game_model.goal_positions),
                     goals_lit=game_model.features.goals_lit_by_beam,
                     action_taken=decision.action_name,
-                    outcome=self._active_name,
-                )
-                store_board_state(self._memory_db_path, state)
+                    outcome=outcome,
+                    progress_delta=(
+                        int(transition.record.progress_delta or 0)
+                        if transition.record is not None
+                        else 0
+                    ),
+                ),
+            )
         except Exception:
-            pass
+            logger.debug("solver board-state persistence failed", exc_info=True)
+
+    def _close_attempt(self, *, succeeded: bool, game_id: str) -> None:
+        if self._memory_db_path is None or self._attempt_steps <= 0:
+            self._attempt_steps = 0
+            return
+        try:
+            initialize_puzzle_schema(self._memory_db_path)
+            update_solver_outcome(
+                self._memory_db_path,
+                game_id=game_id or self._attempt_game_id,
+                dynamics=self._attempt_dynamics or "unknown",
+                solver_name=self._attempt_solver_name or self._attempt_dynamics or "unknown",
+                succeeded=succeeded,
+                steps_taken=self._attempt_steps,
+            )
+        except Exception:
+            logger.debug("solver outcome persistence failed", exc_info=True)
+        finally:
+            self._attempt_steps = 0
 
     def _query_memory_for_solver(self, game_model: GameModel) -> str | None:
         """Check memory for a solver that succeeded on similar boards."""

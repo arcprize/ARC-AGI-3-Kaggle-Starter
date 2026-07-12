@@ -12,7 +12,7 @@ from concurrent.futures import (
     as_completed,
 )
 from multiprocessing import cpu_count
-from threading import Lock
+from threading import RLock
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -27,10 +27,11 @@ logger = logging.getLogger(__name__)
 
 class ThreadPoolManager:
     _instance: ThreadPoolExecutor | None = None
-    _lock: Lock = Lock()
+    _lock: RLock = RLock()
     _max_workers: int = 0  # 0 = auto (resolved to min(4, cpu_count))
     _pending_futures: set[Future] = set()
     _pending_names: dict[Future, str] = {}
+    _pending_by_name: dict[str, Future] = {}
 
     _atexit_registered = False
 
@@ -46,9 +47,15 @@ class ThreadPoolManager:
 
     @classmethod
     def set_max_workers(cls, n: int) -> None:
-        cls._max_workers = n
-        cls._shutdown()
-        cls._instance = None
+        requested = max(0, int(n))
+        with cls._lock:
+            if cls._max_workers == requested and cls._instance is not None:
+                return
+            cls._max_workers = requested
+            inst = cls._instance
+            cls._instance = None
+        if inst is not None:
+            inst.shutdown(wait=False, cancel_futures=True)
 
     @classmethod
     def executor(cls) -> ThreadPoolExecutor:
@@ -68,24 +75,77 @@ class ThreadPoolManager:
 
     @classmethod
     def _shutdown(cls) -> None:
-        inst = cls._instance
-        if inst is not None:
-            inst.shutdown(wait=False)
+        with cls._lock:
+            inst = cls._instance
             cls._instance = None
-        cls._pending_futures.clear()
-        cls._pending_names.clear()
+        if inst is not None:
+            inst.shutdown(wait=False, cancel_futures=True)
 
     @classmethod
     def active_worker_count(cls) -> int:
         cls._collect_done_pending()
-        return len(cls._pending_futures)
+        with cls._lock:
+            return len(cls._pending_futures)
+
+    @classmethod
+    def pending_names(cls) -> set[str]:
+        """Return names for work that is still queued or running."""
+        cls._collect_done_pending()
+        with cls._lock:
+            return set(cls._pending_by_name)
+
+    @classmethod
+    def is_name_pending(cls, name: str) -> bool:
+        cls._collect_done_pending()
+        with cls._lock:
+            future = cls._pending_by_name.get(str(name))
+            return future is not None and not future.done()
 
     @classmethod
     def _collect_done_pending(cls) -> None:
-        done = {f for f in cls._pending_futures if f.done()}
-        cls._pending_futures -= done
-        for f in done:
-            cls._pending_names.pop(f, None)
+        with cls._lock:
+            done = [future for future in cls._pending_futures if future.done()]
+        for future in done:
+            cls._forget_future(future)
+
+    @classmethod
+    def _track_future(cls, future: Future, name: str) -> Future:
+        task_name = str(name or "task")
+        with cls._lock:
+            cls._pending_futures.add(future)
+            cls._pending_names[future] = task_name
+            cls._pending_by_name[task_name] = future
+        future.add_done_callback(cls._forget_future)
+        return future
+
+    @classmethod
+    def _forget_future(cls, future: Future) -> None:
+        with cls._lock:
+            cls._pending_futures.discard(future)
+            name = cls._pending_names.pop(future, None)
+            if name is not None and cls._pending_by_name.get(name) is future:
+                cls._pending_by_name.pop(name, None)
+
+    @classmethod
+    def _submit_named(
+        cls,
+        fn: Callable[..., Any],
+        name: str,
+        *,
+        unique: bool,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Future | None:
+        task_name = str(name or "task")
+        with cls._lock:
+            existing = cls._pending_by_name.get(task_name)
+            if existing is not None:
+                if unique and not existing.done():
+                    return None
+                if existing.done():
+                    cls._forget_future(existing)
+            future = cls.executor().submit(fn, *args, **dict(kwargs or {}))
+            return cls._track_future(future, task_name)
 
     @classmethod
     def _cancel_pending_future(cls, future: Future) -> bool:
@@ -95,12 +155,10 @@ class ThreadPoolManager:
         from tracking. Returns False when the work is still running.
         """
         if future.done():
-            cls._pending_futures.discard(future)
-            cls._pending_names.pop(future, None)
+            cls._forget_future(future)
             return True
         if future.cancel():
-            cls._pending_futures.discard(future)
-            cls._pending_names.pop(future, None)
+            cls._forget_future(future)
             return True
         return False
 
@@ -109,17 +167,23 @@ class ThreadPoolManager:
         cls,
         tasks: list[tuple[Callable[[], Any], str]],
         timeout: float | None = None,
+        *,
+        deduplicate_names: bool = False,
     ) -> list[tuple[Any, str]]:
         if not tasks:
             cls._collect_done_pending()
             return []
-        exec = cls.executor()
         futures: dict[Future, str] = {}
         for fn, name in tasks:
-            f = exec.submit(fn)
-            futures[f] = name
-        cls._pending_futures.update(futures.keys())
-        cls._pending_names.update(futures)
+            future = cls._submit_named(
+                fn,
+                name,
+                unique=deduplicate_names,
+            )
+            if future is not None:
+                futures[future] = name
+        if not futures:
+            return []
 
         done_set = set()
         if timeout is not None and timeout > 0:
@@ -133,10 +197,9 @@ class ThreadPoolManager:
             wait(done_set)
 
         results: list[tuple[Any, str]] = []
-        for f in done_set:
-            name = futures[f]
-            cls._pending_futures.discard(f)
-            cls._pending_names.pop(f, None)
+        for f, name in futures.items():
+            if f not in done_set:
+                continue
             try:
                 results.append((f.result(), name))
             except Exception as exc:
@@ -169,17 +232,19 @@ class ThreadPoolManager:
     ) -> list[tuple[Any, str]]:
         if not tasks:
             return []
-        exec = cls.executor()
-        futures: dict[Future, str] = {exec.submit(fn): name for fn, name in tasks}
-        cls._pending_futures.update(futures.keys())
-        cls._pending_names.update(futures)
+        futures: dict[Future, str] = {}
+        for fn, name in tasks:
+            future = cls._submit_named(fn, name, unique=True)
+            if future is not None:
+                futures[future] = name
+        if not futures:
+            return []
 
         done, _ = wait(futures.keys(), timeout=timeout, return_when=FIRST_COMPLETED)
         results: list[tuple[Any, str]] = []
-        for f in done:
-            name = futures[f]
-            cls._pending_futures.discard(f)
-            cls._pending_names.pop(f, None)
+        for f, name in futures.items():
+            if f not in done:
+                continue
             try:
                 results.append((f.result(), name))
             except Exception as exc:
@@ -193,9 +258,33 @@ class ThreadPoolManager:
     @classmethod
     def submit(cls, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         """Submit a task and track it in pending futures."""
-        f = cls.executor().submit(fn, *args, **kwargs)
-        cls._pending_futures.add(f)
-        return f
+        name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", "task")
+        future = cls._submit_named(
+            fn,
+            str(name),
+            unique=False,
+            args=args,
+            kwargs=kwargs,
+        )
+        assert future is not None
+        return future
+
+    @classmethod
+    def submit_unique(
+        cls,
+        name: str,
+        fn: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future | None:
+        """Submit named work only when the same name is not already active."""
+        return cls._submit_named(
+            fn,
+            name,
+            unique=True,
+            args=args,
+            kwargs=kwargs,
+        )
 
     @classmethod
     def map(cls, fn, *iterables, timeout=None):
@@ -213,7 +302,7 @@ class ThreadPoolManager:
 
 class ProcessPoolManager:
     _instance: ProcessPoolExecutor | None = None
-    _lock: Lock = Lock()
+    _lock: RLock = RLock()
     _max_workers: int = 0
     _pending_futures: set[Future] = set()
     _pending_names: dict[Future, str] = {}
@@ -231,9 +320,15 @@ class ProcessPoolManager:
 
     @classmethod
     def set_max_workers(cls, n: int) -> None:
-        cls._max_workers = n
-        cls._shutdown()
-        cls._instance = None
+        requested = max(0, int(n))
+        with cls._lock:
+            if cls._max_workers == requested and cls._instance is not None:
+                return
+            cls._max_workers = requested
+            inst = cls._instance
+            cls._instance = None
+        if inst is not None:
+            inst.shutdown(wait=False, cancel_futures=True)
 
     @classmethod
     def executor(cls) -> ProcessPoolExecutor:
@@ -252,30 +347,41 @@ class ProcessPoolManager:
 
     @classmethod
     def _shutdown(cls) -> None:
-        inst = cls._instance
-        if inst is not None:
-            inst.shutdown(wait=False)
+        with cls._lock:
+            inst = cls._instance
             cls._instance = None
-        cls._pending_futures.clear()
-        cls._pending_names.clear()
+        if inst is not None:
+            inst.shutdown(wait=False, cancel_futures=True)
+
+    @classmethod
+    def _track_future(cls, future: Future, name: str) -> Future:
+        with cls._lock:
+            cls._pending_futures.add(future)
+            cls._pending_names[future] = str(name or "process-task")
+        future.add_done_callback(cls._forget_future)
+        return future
+
+    @classmethod
+    def _forget_future(cls, future: Future) -> None:
+        with cls._lock:
+            cls._pending_futures.discard(future)
+            cls._pending_names.pop(future, None)
 
     @classmethod
     def _cancel_pending_future(cls, future: Future) -> bool:
         if future.done():
-            cls._pending_futures.discard(future)
-            cls._pending_names.pop(future, None)
+            cls._forget_future(future)
             return True
         if future.cancel():
-            cls._pending_futures.discard(future)
-            cls._pending_names.pop(future, None)
+            cls._forget_future(future)
             return True
         return False
 
     @classmethod
     def submit(cls, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
-        f = cls.executor().submit(fn, *args, **kwargs)
-        cls._pending_futures.add(f)
-        return f
+        future = cls.executor().submit(fn, *args, **kwargs)
+        name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", "process-task")
+        return cls._track_future(future, str(name))
 
     @classmethod
     def run_all(
@@ -290,8 +396,7 @@ class ProcessPoolManager:
         for fn, name in tasks:
             f = exec.submit(fn)
             futures[f] = name
-        cls._pending_futures.update(futures.keys())
-        cls._pending_names.update(futures)
+            cls._track_future(f, name)
         done_set = set()
         if timeout is not None and timeout > 0:
             try:
@@ -303,10 +408,9 @@ class ProcessPoolManager:
             done_set = set(futures.keys())
             wait(done_set)
         results: list[tuple[Any, str]] = []
-        for f in done_set:
-            name = futures[f]
-            cls._pending_futures.discard(f)
-            cls._pending_names.pop(f, None)
+        for f, name in futures.items():
+            if f not in done_set:
+                continue
             try:
                 results.append((f.result(), name))
             except Exception as exc:

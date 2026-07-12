@@ -89,6 +89,58 @@ class FakeHyperonBridge:
 
 
 class MyAgentIntegrationTests(unittest.TestCase):
+    def test_my_agent_resolves_thread_workers_for_multi_agent_parallelism(self) -> None:
+        arcengine_module = types.ModuleType("arcengine")
+        arcengine_module.FrameData = StubFrameData
+        arcengine_module.GameAction = StubGameAction
+        arcengine_module.GameState = StubGameState
+
+        agents_module = types.ModuleType("agents")
+        agents_agent_module = types.ModuleType("agents.agent")
+        agents_agent_module.Agent = StubAgent
+
+        module_overrides = {
+            "arcengine": arcengine_module,
+            "agents": agents_module,
+            "agents.agent": agents_agent_module,
+        }
+
+        with patch.dict(sys.modules, module_overrides, clear=False):
+            sys.modules.pop("agent.my_agent", None)
+            module = importlib.import_module("agent.my_agent")
+            module = importlib.reload(module)
+
+        self.assertEqual(
+            module._resolve_parallel_thread_workers(
+                types.SimpleNamespace(
+                    planner_workers=2,
+                    multi_agent_workers=6,
+                    multi_agent_enabled=True,
+                )
+            ),
+            6,
+        )
+        self.assertEqual(
+            module._resolve_parallel_thread_workers(
+                types.SimpleNamespace(
+                    planner_workers=5,
+                    multi_agent_workers=3,
+                    multi_agent_enabled=True,
+                )
+            ),
+            5,
+        )
+        self.assertEqual(
+            module._resolve_parallel_thread_workers(
+                types.SimpleNamespace(
+                    planner_workers=4,
+                    multi_agent_workers=8,
+                    multi_agent_enabled=False,
+                )
+            ),
+            4,
+        )
+
     def test_my_agent_uses_executive_runtime(self) -> None:
         arcengine_module = types.ModuleType("arcengine")
         arcengine_module.FrameData = StubFrameData
