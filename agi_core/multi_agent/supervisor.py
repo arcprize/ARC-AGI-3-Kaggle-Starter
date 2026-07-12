@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import Future, wait
 from typing import Any
 
 from agi_core.multi_agent.agents import (
@@ -14,11 +15,17 @@ from agi_core.multi_agent.agents import (
 from agi_core.multi_agent.consensus import ConsensusModule
 from agi_core.multi_agent.strategy_agent import StrategyAgent
 from agi_core.perception.shape_recognition import ensure_shape_recognition
+from agi_core.runtime_sync import ensure_hyperon_context_synced
 from agi_core.cuda import is_enabled as _cuda_is_enabled, init_cuda
 from agi_core.orch_or.analyzer import build_game_model
 from agi_core.orch_or.orchestrator import ObjectiveReduction
 from agi_core.orch_or.parallel import ThreadPoolManager
-from agi_core.types import ActionDecision, AgentProposal, ExecutiveContext
+from agi_core.types import (
+    ActionDecision,
+    AgentProposal,
+    ExecutiveContext,
+    ObservedTransition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +64,19 @@ class AgentSupervisor(ObjectiveReduction):
         self._agent_map: dict[str, StrategyAgent] = {
             a.agent_id: a for a in self._agents
         }
-        self._workers = getattr(config, 'multi_agent_workers', 4)
+        try:
+            self._workers = int(getattr(config, 'multi_agent_workers', 4) or 4)
+        except Exception:
+            self._workers = 4
         self._agent_timeout = max(0.5, float(getattr(config, 'planner_parallel_timeout', None) or 2.0))
         self._agent_health: dict[str, dict[str, float]] = {}
         self._agent_metrics: dict[str, dict[str, float]] = {}
+        self._agent_futures: dict[str, tuple[Future, int]] = {}
+        self._circuit_cooldown_seconds = max(1.0, self._agent_timeout * 2.0)
+        self._pending_agent_credit: dict[str, Any] | None = None
+        self._solver_candidate_feedback: tuple[Any, Any, Any, ActionDecision] | None = None
+        self._pending_solver_feedback: tuple[Any, Any, Any, ActionDecision] | None = None
+        self._solver_attempt_steps = 0
         # Persistent solver selector (preserves state across frames)
         self._solver_selector = None
         self._last_solver_action: str = ""
@@ -88,134 +104,94 @@ class AgentSupervisor(ObjectiveReduction):
 
         # Log health if any stale tasks remain from previous frame
         stale_count = ThreadPoolManager.active_worker_count()
-        if stale_count > self._workers:
-            logger.debug("AgentSupervisor: %d active workers from previous frame", stale_count)
+        if self._workers > 0 and stale_count >= self._workers:
+            logger.warning(
+                "AgentSupervisor: pool saturated by %d queued/running tasks (budget=%d)",
+                stale_count,
+                self._workers,
+            )
 
         # Let the base Executive handle early exits first
-        context.hyperon.sync(context.observation, context.memory, context.goals)
-        context.memory_bundle = context.hyperon.current_memory_bundle()
+        context.memory_bundle = ensure_hyperon_context_synced(context)
 
         # Check score-floor reopen before running agents
         pending_reopen = context.memory.pending_score_floor_reopen(context.observation)
         if pending_reopen is not None and "RESET" in context.observation.legal_actions:
-            decision = self._fallback_executive(context)
+            context.score_floor_debug = dict(pending_reopen.get("score_floor_debug") or {})
+            context.memory.clear_pending_score_floor_reopen()
+            decision = ActionDecision(
+                action_name="RESET",
+                source="fallback",
+                confidence=0.05,
+                reason="score-floor pending frontier reopen reset",
+                metadata={"score_floor_debug": dict(context.score_floor_debug)},
+                used_fallback=True,
+            )
+            context.memory.note_decision(decision)
             self._finalize_cognition(context, decision)
             return decision
 
         self._stabilize_shape_frame_cache(context, prepare_frame_cache(context))
 
+        # Fan out the strategy agents before checking the direct solver.  The
+        # solver remains authoritative, but it must not bypass the multi-agent
+        # pool on every solver-active frame.
+        active_agents = [a for a in self._agents if not self._is_circuit_open(a.agent_id)]
+        if len(active_agents) < len(self._agents):
+            logger.debug("AgentSupervisor: %d agents circuit-broken", len(self._agents) - len(active_agents))
+        agent_proposals = self._run_agents(active_agents, context)
+        participating_agents = set(agent_proposals)
+
         # Try solver system first (respect cooldown after stagnation)
         solver_decision = None
+        self._solver_candidate_feedback = None
         if self._solver_cooldown <= 0:
             solver_decision = self._try_solver_direct(context)
         else:
             self._solver_cooldown -= 1
         if solver_decision is not None:
+            # The solver's decision takes priority over agent proposals.
+            # Return directly without going through agent consensus.
             return solver_decision
 
-        frame_cache = prepare_frame_cache(context)
-        if frame_cache.get("shape_agent_mode") and frame_cache.get("active_shape_target"):
-            agent_first = self._decide_from_agents(context)
-            if agent_first is not None:
-                return agent_first
+        selected = self._decide_from_agents(
+            context,
+            agent_proposals=agent_proposals,
+            participating_agent_ids=participating_agents,
+        )
+        if selected is not None:
+            return selected
 
-        # Check circuit breakers — skip agents that have failed repeatedly
-        active_agents = [a for a in self._agents if not self._is_circuit_open(a.agent_id)]
-        if len(active_agents) < len(self._agents):
-            logger.debug("AgentSupervisor: %d agents circuit-broken", len(self._agents) - len(active_agents))
-        if not active_agents:
-            return super().decide(context)
-
-        prepare_frame_cache(context)
-
-        # Run all agents in parallel with sync fallback for timed-out agents
-        agent_proposals = self._run_agents(active_agents, context)
-        participating_agents = set(agent_proposals)
-
-        # Periodic pool health check (every 100 frames)
-        self._health_counter = getattr(self, '_health_counter', 0) + 1
-        if self._health_counter >= 100:
-            active = ThreadPoolManager.active_worker_count()
-            if active > self._workers * 2:
-                logger.warning("AgentSupervisor: %d active pool workers (expected ≤%d)", active, self._workers)
-            # Log agent health summary
-            for aid, h in self._agent_health.items():
-                if h.get("consecutive_failures", 0) >= 2:
-                    logger.debug("AgentSupervisor: %s health: %s", aid, h)
-            self._health_counter = 0
-
-        if not agent_proposals:
-            logger.debug("AgentSupervisor: no agent proposals, falling back")
-            return super().decide(context)
-
-        # Consensus: collect, weight, diversify
-        combined = self._consensus.collect(agent_proposals, context)
-        if not combined:
-            return super().decide(context)
-
-        # AgentProposal already satisfies the shared ActionProposal contract used
-        # by Hyperon and the critic, so reuse the same objects here.
-        context.hyperon.update_proposals(combined)
-        rescored = self._executive.critic.rescore(context, combined)
-
-        # Score-floor and probe-escape checks from the base executive
-        if self._executive._all_legal_proposals_are_score_floor(context, rescored):
-            return self._executive._score_floor_fallback(context, rescored)
-        probe_escape = self._executive._probe_dead_end_escape(context, rescored)
-        if probe_escape is not None:
-            return probe_escape
-
-        # Pick the best rescored legal proposal directly; AgentProposal retains
-        # agent_id so we no longer need a second lookup map.
-        for rp in rescored:
-            if getattr(rp, "legal", True):
-                agent_id = getattr(rp, "agent_id", "")
-                metadata = self._executive._finalize_decision_metadata(
-                    context,
-                    rp.action_name,
-                    dict(rp.metadata),
-                )
-                subgoal = self._executive._finalize_decision_subgoal(
-                    context,
-                    rp.action_name,
-                    rp.subgoal,
-                )
-                decision = ActionDecision(
-                    action_name=rp.action_name,
-                    source=rp.source,
-                    confidence=rp.confidence,
-                    reason=rp.reason,
-                    subgoal=subgoal,
-                    metadata=metadata,
-                    proposals=rescored,
-                )
-                context.memory.note_decision(decision)
-                self._finalize_cognition(
-                    context,
-                    decision,
-                    winning_agent_id=agent_id,
-                    participating_agent_ids=participating_agents,
-                )
-                return decision
-
+        logger.debug("AgentSupervisor: no legal consensus decision, falling back")
         return super().decide(context)
 
-    def _decide_from_agents(self, context: ExecutiveContext) -> ActionDecision | None:
-        active_agents = [a for a in self._agents if not self._is_circuit_open(a.agent_id)]
-        if len(active_agents) < len(self._agents):
-            logger.debug("AgentSupervisor: %d agents circuit-broken", len(self._agents) - len(active_agents))
-        if not active_agents:
-            return None
+    def _decide_from_agents(
+        self,
+        context: ExecutiveContext,
+        *,
+        agent_proposals: dict[str, list[AgentProposal]] | None = None,
+        participating_agent_ids: set[str] | None = None,
+    ) -> ActionDecision | None:
+        if agent_proposals is None:
+            active_agents = [a for a in self._agents if not self._is_circuit_open(a.agent_id)]
+            if len(active_agents) < len(self._agents):
+                logger.debug("AgentSupervisor: %d agents circuit-broken", len(self._agents) - len(active_agents))
+            if not active_agents:
+                return None
 
-        prepare_frame_cache(context)
-        agent_proposals = self._run_agents(active_agents, context)
-        participating_agents = set(agent_proposals)
+            prepare_frame_cache(context)
+            agent_proposals = self._run_agents(active_agents, context)
+        participating_agents = (
+            set(participating_agent_ids)
+            if participating_agent_ids is not None
+            else set(agent_proposals).intersection(self._agent_map)
+        )
 
         self._health_counter = getattr(self, '_health_counter', 0) + 1
         if self._health_counter >= 100:
             active = ThreadPoolManager.active_worker_count()
-            if active > self._workers * 2:
-                logger.warning("AgentSupervisor: %d active pool workers (expected <=%d)", active, self._workers)
+            if self._workers > 0 and active >= self._workers:
+                logger.warning("AgentSupervisor: %d active pool tasks (budget=%d)", active, self._workers)
             for aid, h in self._agent_health.items():
                 if h.get("consecutive_failures", 0) >= 2:
                     logger.debug("AgentSupervisor: %s health: %s", aid, h)
@@ -233,13 +209,17 @@ class AgentSupervisor(ObjectiveReduction):
         rescored = self._executive.critic.rescore(context, combined)
 
         if self._executive._all_legal_proposals_are_score_floor(context, rescored):
-            return self._executive._score_floor_fallback(context, rescored)
+            return self._finalize_fallback_decision(
+                context,
+                self._executive._score_floor_fallback(context, rescored),
+                rescored,
+            )
         probe_escape = self._executive._probe_dead_end_escape(context, rescored)
         if probe_escape is not None:
-            return probe_escape
+            return self._finalize_fallback_decision(context, probe_escape, rescored)
 
         for rp in rescored:
-            if getattr(rp, "legal", True):
+            if self._proposal_is_legal(context, rp):
                 agent_id = getattr(rp, "agent_id", "")
                 metadata = self._executive._finalize_decision_metadata(
                     context,
@@ -260,6 +240,8 @@ class AgentSupervisor(ObjectiveReduction):
                     metadata=metadata,
                     proposals=rescored,
                 )
+                if str(decision.source).startswith("solver:"):
+                    self._seed_sticky_shape_target(context, decision)
                 context.memory.note_decision(decision)
                 self._finalize_cognition(
                     context,
@@ -269,6 +251,38 @@ class AgentSupervisor(ObjectiveReduction):
                 )
                 return decision
         return None
+
+    @staticmethod
+    def _solver_decision_as_proposal(decision: ActionDecision) -> AgentProposal:
+        """Expose a solver decision to the same consensus/critic path as agents."""
+        return AgentProposal(
+            action_name=decision.action_name,
+            source=decision.source,
+            confidence=decision.confidence,
+            reason=decision.reason,
+            agent_id="solver",
+            agent_confidence=1.0,
+            subgoal=decision.subgoal,
+            metadata=dict(decision.metadata),
+        )
+
+    @staticmethod
+    def _proposal_is_legal(
+        context: ExecutiveContext,
+        proposal: AgentProposal,
+    ) -> bool:
+        """Fail closed even if a critic or solver incorrectly marks a proposal legal."""
+        action_name = str(proposal.action_name or "")
+        legal_actions = {
+            str(name or "") for name in context.observation.legal_actions
+        }
+        if action_name in legal_actions:
+            return bool(getattr(proposal, "legal", True))
+        return bool(
+            action_name == "RESET"
+            and str(context.observation.game_state or "")
+            in set(context.config.reset_state_names)
+        )
 
     def _try_solver_direct(self, context: ExecutiveContext) -> ActionDecision | None:
         """Try the solver system and return its decision directly if it activates.
@@ -311,16 +325,20 @@ class AgentSupervisor(ObjectiveReduction):
                 if solver.should_activate(sctx):
                     decision = solver.decide(sctx)
                     if decision is not None:
-                        self._seed_sticky_shape_target(context, decision)
                         if self._update_solver_stall(game_model.player_pos, decision.action_name):
                             logger.debug("AgentSupervisor: solver %s stalled (%d), cooling down for 10 frames",
                                         solver.dynamics, self._solver_stall_count)
                             self._solver_stall_count = 0
                             self._solver_cooldown = 10
+                            self._close_solver_attempt(context, solver, succeeded=False)
                             return None  # fall through to agents
                         logger.debug("AgentSupervisor: solver mirror -> %s", decision.action_name)
-                        context.memory.note_decision(decision)
-                        self._finalize_cognition(context, decision)
+                        self._solver_candidate_feedback = (
+                            solver,
+                            sctx,
+                            game_model,
+                            decision,
+                        )
                         return decision
 
             # Priority 2: SolverSelector (from hyperon / dynamics)
@@ -336,10 +354,23 @@ class AgentSupervisor(ObjectiveReduction):
                 if solver.should_activate(sctx):
                     decision = solver.decide(sctx)
                     if decision is not None:
-                        self._seed_sticky_shape_target(context, decision)
+                        if self._update_solver_stall(game_model.player_pos, decision.action_name):
+                            logger.debug(
+                                "AgentSupervisor: solver %s stalled (%d), cooling down for 10 frames",
+                                solver.dynamics,
+                                self._solver_stall_count,
+                            )
+                            self._solver_stall_count = 0
+                            self._solver_cooldown = 10
+                            self._close_solver_attempt(context, solver, succeeded=False)
+                            return None
                         logger.debug("AgentSupervisor: solver %s -> %s", solver.dynamics, decision.action_name)
-                        context.memory.note_decision(decision)
-                        self._finalize_cognition(context, decision)
+                        self._solver_candidate_feedback = (
+                            solver,
+                            sctx,
+                            game_model,
+                            decision,
+                        )
                         return decision
         except Exception:
             logger.debug("AgentSupervisor: solver system failed", exc_info=True)
@@ -352,37 +383,108 @@ class AgentSupervisor(ObjectiveReduction):
         agents: list[StrategyAgent],
         context: ExecutiveContext,
     ) -> dict[str, list[AgentProposal]]:
-        """Execute all agents in parallel, then sync-fallback for timed-out ones.
-        
-        Returns a dict mapping agent_id → list[AgentProposal].
-        """
+        """Run one current-frame call per idle agent and discard late results."""
         proposals: dict[str, list[AgentProposal]] = {}
-        tasks = [(lambda a=a: a.produce(context), a.agent_id) for a in agents]
+        completed_agents: set[str] = set()
+        step_index = int(getattr(context.observation, "step_index", 0) or 0)
+
+        # Reap work from older frames. Its execution health is useful, but its
+        # proposals are stale and must never be applied to the current frame.
+        for agent in agents:
+            pending = self._agent_futures.get(agent.agent_id)
+            if pending is None:
+                continue
+            future, submitted_step = pending
+            if not future.done():
+                continue
+            self._agent_futures.pop(agent.agent_id, None)
+            try:
+                late_result = future.result()
+            except Exception:
+                logger.debug(
+                    "AgentSupervisor: late agent %s failed",
+                    agent.agent_id,
+                    exc_info=True,
+                )
+                self._record_failure(agent.agent_id)
+            else:
+                if late_result is None:
+                    self._record_failure(agent.agent_id)
+                else:
+                    self._record_success(agent.agent_id, late_result)
+                logger.debug(
+                    "AgentSupervisor: discarded stale %s result from step %d",
+                    agent.agent_id,
+                    submitted_step,
+                )
+
+        current: dict[str, Future] = {}
+        for agent in agents:
+            if agent.agent_id in self._agent_futures:
+                continue
+            future = ThreadPoolManager.submit_unique(
+                f"agent:{agent.agent_id}",
+                agent.produce,
+                context,
+            )
+            if future is None:
+                continue
+            self._agent_futures[agent.agent_id] = (future, step_index)
+            current[agent.agent_id] = future
+
         t0 = time.monotonic()
-        results = ThreadPoolManager.run_all(tasks, timeout=self._agent_timeout)
+        done: set[Future] = set()
+        if current:
+            done, _ = wait(set(current.values()), timeout=self._agent_timeout)
         elapsed = time.monotonic() - t0
         self._record_agent_metric("supervisor", "exec_time_ms", elapsed * 1000)
-        if elapsed > 0.5:
-            logger.debug("AgentSupervisor: agents took %.2fs", elapsed)
-        for result, agent_id in results:
+
+        for agent in agents:
+            agent_id = agent.agent_id
+            future = current.get(agent_id)
+            if future is None or future not in done:
+                continue
+            completed_agents.add(agent_id)
+            pending = self._agent_futures.get(agent_id)
+            if pending is not None and pending[0] is future:
+                self._agent_futures.pop(agent_id, None)
+            try:
+                result = future.result()
+            except Exception:
+                logger.debug(
+                    "AgentSupervisor: agent %s failed",
+                    agent_id,
+                    exc_info=True,
+                )
+                self._record_failure(agent_id)
+                continue
+            if result is None:
+                self._record_failure(agent_id)
+                continue
             if result:
                 proposals[agent_id] = result
-                self._record_success(agent_id, result)
-            else:
-                self._record_failure(agent_id)
-        # Sync fallback for timed-out agents
-        missing = [a for a in agents if a.agent_id not in proposals]
-        for agent in missing:
-            try:
-                result = agent.produce(context)
-                if result:
-                    proposals[agent.agent_id] = result
-                    self._record_success(agent.agent_id, result)
-                else:
-                    self._record_failure(agent.agent_id)
-            except Exception:
-                logger.debug("AgentSupervisor: agent %s sync fallback failed", agent.agent_id)
-                self._record_failure(agent.agent_id)
+            self._record_success(agent_id, result)
+        logger.debug(
+            "AgentSupervisor: parallel agent batch finished %d/%d in %.2fms (workers=%d)",
+            len(completed_agents),
+            len(agents),
+            elapsed * 1000,
+            self._workers,
+        )
+        # Running calls stay registered and are not resubmitted on later frames.
+        # A timeout is scheduling pressure, not proof that an agent is broken.
+        running = [
+            agent_id
+            for agent_id, future in current.items()
+            if future not in done
+        ]
+        if running:
+            logger.debug(
+                "AgentSupervisor: %d agents still running after %.2fms: %s",
+                len(running),
+                elapsed * 1000,
+                ", ".join(running),
+            )
         return proposals
 
     def _record_success(self, agent_id: str, result: list[AgentProposal]) -> None:
@@ -406,7 +508,15 @@ class AgentSupervisor(ObjectiveReduction):
         health = self._agent_health.get(agent_id)
         if health is None:
             return False
-        return health.get("consecutive_failures", 0) >= 3
+        if health.get("consecutive_failures", 0) < 3:
+            return False
+        open_until = float(health.get("open_until", 0.0) or 0.0)
+        if time.monotonic() < open_until:
+            return True
+        # Half-open: allow one deduplicated probe. Success clears the breaker;
+        # another failure reopens it for a fresh cooldown.
+        health["half_open"] = 1.0
+        return False
 
     def _record_agent_metric(self, agent_id: str, key: str, value: float) -> None:
         """Record a numeric metric for an agent (decayed moving average)."""
@@ -418,6 +528,9 @@ class AgentSupervisor(ObjectiveReduction):
         """Record an agent failure for circuit breaker tracking."""
         health = self._agent_health.setdefault(agent_id, {"consecutive_failures": 0})
         health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
+        if health["consecutive_failures"] >= 3:
+            health["open_until"] = time.monotonic() + self._circuit_cooldown_seconds
+            health["half_open"] = 0.0
 
     def _reset_circuit_breaker(self, agent_id: str) -> None:
         """Reset circuit breaker on successful agent execution."""
@@ -430,6 +543,9 @@ class AgentSupervisor(ObjectiveReduction):
         self._consensus._agent_stats.clear()
         self._agent_health.clear()
         self._agent_metrics.clear()
+        for agent_id, (future, _) in list(self._agent_futures.items()):
+            if future.done() or future.cancel():
+                self._agent_futures.pop(agent_id, None)
         self._mirror_solver = None
         self._solver_selector = None
         self._solver_stall_count = 0
@@ -438,6 +554,11 @@ class AgentSupervisor(ObjectiveReduction):
         self._last_solver_player_pos = None
         self._solver_recent_states = []
         self._sticky_shape_target = None
+        self._pending_agent_credit = None
+        self._solver_candidate_feedback = None
+        self._pending_solver_feedback = None
+        self._solver_attempt_steps = 0
+        super().reset_episode()
 
     # ── internal ──────────────────────────────────────────────────────
 
@@ -448,26 +569,223 @@ class AgentSupervisor(ObjectiveReduction):
         winning_agent_id: str = "",
         participating_agent_ids: set[str] | None = None,
     ) -> None:
-        """Run cognition finalization for all agents.
-        
-        The winning agent gets the actual outcome; all other agents that
-        submitted proposals get a failed outcome (their proposal wasn't chosen).
-        """
-        success = "fallback" not in decision.source
-        participants = set(participating_agent_ids or ())
-        for agent_id in participants:
-            agent = self._agent_map.get(agent_id)
-            if agent is None:
-                continue
-            if agent_id == winning_agent_id:
-                outcome = "progress" if success else "stalled"
-                agent.apply_cognition(decision.action_name, outcome, decision.subgoal)
-                agent.note_outcome(success)
-                self._consensus.note_outcome(agent_id, success, None)
+        """Record attribution now; apply outcome feedback on the next frame."""
+        if winning_agent_id and winning_agent_id in self._agent_map:
+            self._pending_agent_credit = {
+                "game_id": str(context.observation.game_id or ""),
+                "agent_id": winning_agent_id,
+                "action_name": decision.action_name,
+                "source": decision.source,
+                "subgoal": decision.subgoal,
+            }
+        else:
+            self._pending_agent_credit = None
+        if (
+            str(decision.source or "").startswith("solver:")
+            and self._solver_candidate_feedback is not None
+        ):
+            solver, solver_context, game_model, solver_decision = (
+                self._solver_candidate_feedback
+            )
+            if (
+                self._solver_selector is not None
+                and self._solver_selector.active_solver is solver
+            ):
+                self._solver_selector.record_outcome(
+                    context,
+                    game_model,
+                    solver_decision,
+                    dict(getattr(solver_context, "plan_context", {}) or {}),
+                )
+                self._pending_solver_feedback = None
             else:
-                agent.note_outcome(False)
-                self._consensus.note_outcome(agent_id, False, None)
+                self._pending_solver_feedback = self._solver_candidate_feedback
+        else:
+            self._pending_solver_feedback = None
+        self._solver_candidate_feedback = None
         self._executive._finalize_cognition(context, decision)
+
+    def note_transition(self, transition: ObservedTransition) -> None:
+        """Credit only the selected contributor after observing the result."""
+        pending = self._pending_agent_credit
+        if pending is not None:
+            matches = (
+                (not transition.action_name or transition.action_name == pending["action_name"])
+                and (
+                    not transition.decision_source
+                    or transition.decision_source == pending["source"]
+                )
+            )
+            outcome = str(transition.local_outcome or "unknown")
+            if matches and outcome in {"progress", "advanced", "failed", "stalled"}:
+                agent_id = str(pending["agent_id"])
+                agent = self._agent_map.get(agent_id)
+                success = outcome in {"progress", "advanced"}
+                if agent is not None:
+                    agent.apply_cognition(
+                        str(pending["action_name"]),
+                        "progress" if success else outcome,
+                        pending.get("subgoal"),
+                    )
+                    agent.note_outcome(success)
+                    self._consensus.note_outcome(agent_id, success, None)
+                self._pending_agent_credit = None
+            elif transition.boundary is not None:
+                self._pending_agent_credit = None
+
+        if self._solver_selector is not None:
+            self._solver_selector.note_transition(transition)
+        self._note_solver_transition(transition)
+        if hasattr(self._executive, "note_transition"):
+            self._executive.note_transition(transition)
+        if transition.boundary == "level":
+            self.reset_level_state()
+            self._mirror_solver = None
+            self._solver_stall_count = 0
+            self._solver_cooldown = 0
+            self._sticky_shape_target = None
+        elif transition.boundary in {"win", "game_over", "restart", "game"}:
+            self.reset_agents()
+
+    def _note_solver_transition(self, transition: ObservedTransition) -> None:
+        pending = self._pending_solver_feedback
+        if pending is None:
+            return
+        solver, solver_context, game_model, decision = pending
+        matches = (
+            (not transition.action_name or transition.action_name == decision.action_name)
+            and (
+                not transition.decision_source
+                or transition.decision_source == decision.source
+            )
+        )
+        outcome = str(transition.local_outcome or "unknown")
+        if matches and outcome != "unknown":
+            try:
+                solver.learn(solver_context, outcome)
+            except Exception:
+                logger.debug("AgentSupervisor: solver learning failed", exc_info=True)
+            self._solver_attempt_steps += 1
+            try:
+                from agi_core.knowledge.puzzle_memory import (
+                    PuzzleBoardState,
+                    initialize_puzzle_schema,
+                    store_board_state,
+                )
+
+                db_path = getattr(solver, "_memory_db_path", None)
+                if db_path is not None:
+                    initialize_puzzle_schema(db_path)
+                    player = game_model.player_pos
+                    store_board_state(
+                        db_path,
+                        PuzzleBoardState(
+                            game_id=transition.game_id,
+                            step=(
+                                int(transition.record.step_index)
+                                if transition.record is not None
+                                else 0
+                            ),
+                            frame_signature=(
+                                str(transition.record.prior_frame_signature or "")
+                                if transition.record is not None
+                                else ""
+                            ),
+                            player_x=player[0] if player else -1,
+                            player_y=player[1] if player else -1,
+                            goal_positions=list(game_model.goal_positions),
+                            action_taken=decision.action_name,
+                            outcome=outcome,
+                            progress_delta=(
+                                int(transition.record.progress_delta or 0)
+                                if transition.record is not None
+                                else 0
+                            ),
+                        ),
+                    )
+            except Exception:
+                logger.debug("AgentSupervisor: solver board-state persistence failed", exc_info=True)
+
+        if transition.boundary in {"win", "level"}:
+            self._persist_solver_attempt(
+                transition.game_id,
+                solver,
+                succeeded=True,
+            )
+        elif transition.boundary in {"game_over", "restart", "game"}:
+            self._persist_solver_attempt(
+                transition.game_id,
+                solver,
+                succeeded=False,
+            )
+        if matches or transition.boundary is not None:
+            self._pending_solver_feedback = None
+
+    def _close_solver_attempt(
+        self,
+        context: ExecutiveContext,
+        solver: Any,
+        *,
+        succeeded: bool,
+    ) -> None:
+        if (
+            self._solver_selector is not None
+            and self._solver_selector.active_solver is solver
+        ):
+            self._solver_selector.on_boundary(
+                "level" if succeeded else "stalled",
+                game_id=str(context.observation.game_id or ""),
+            )
+            self._pending_solver_feedback = None
+            return
+        self._persist_solver_attempt(
+            str(context.observation.game_id or ""),
+            solver,
+            succeeded=succeeded,
+        )
+        self._pending_solver_feedback = None
+
+    def _persist_solver_attempt(
+        self,
+        game_id: str,
+        solver: Any,
+        *,
+        succeeded: bool,
+    ) -> None:
+        db_path = getattr(solver, "_memory_db_path", None)
+        if db_path is None:
+            self._solver_attempt_steps = 0
+            return
+        try:
+            from agi_core.knowledge.puzzle_memory import (
+                initialize_puzzle_schema,
+                update_solver_outcome,
+            )
+
+            initialize_puzzle_schema(db_path)
+            update_solver_outcome(
+                db_path,
+                game_id=game_id,
+                dynamics=str(getattr(solver, "dynamics", "unknown") or "unknown"),
+                solver_name=str(getattr(solver, "dynamics", "unknown") or "unknown"),
+                succeeded=succeeded,
+                steps_taken=max(1, self._solver_attempt_steps),
+            )
+        except Exception:
+            logger.debug("AgentSupervisor: solver outcome persistence failed", exc_info=True)
+        finally:
+            self._solver_attempt_steps = 0
+
+    def _finalize_fallback_decision(
+        self,
+        context: ExecutiveContext,
+        decision: ActionDecision,
+        rescored: list[AgentProposal],
+    ) -> ActionDecision:
+        decision.proposals = rescored
+        context.memory.note_decision(decision)
+        self._finalize_cognition(context, decision)
+        return decision
 
     def _update_solver_stall(
         self,
