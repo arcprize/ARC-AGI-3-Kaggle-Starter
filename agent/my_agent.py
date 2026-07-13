@@ -20,6 +20,7 @@ from typing import Any
 from arcengine import FrameData, GameAction, GameState
 
 from agents.agent import Agent
+from agi_core.agent_debug import format_decision_debug, normalize_state_name
 from agi_core.adapters.arc import ArcAdapter
 from agi_core.config import RuntimeConfig
 from agi_core.executive import Executive, ExecutiveRuntime
@@ -169,7 +170,7 @@ class MyAgent(Agent):
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         # Stop once we win. Do not stop on GAME_OVER because reset is a valid recovery action.
-        if self._normalize_state_name(latest_frame.state) == self.runtime.config.win_state_name:
+        if normalize_state_name(latest_frame.state) == self.runtime.config.win_state_name:
             self.runtime.bind_game(self.game_id)
             self.runtime.note_terminal_observation(frames, latest_frame)
             # Record episode in consolidated memory / extract chunks
@@ -209,138 +210,17 @@ class MyAgent(Agent):
         return self.runtime.adapter.to_game_action(decision)
 
     def _log_decision(self, decision) -> None:
-        top_proposals = []
-        for proposal in list(decision.proposals or [])[:3]:
-            top_proposals.append(
-                f"{proposal.action_name}:{proposal.score:.3f}/{proposal.source}"
-            )
-        subgoal = f" subgoal={decision.subgoal}" if decision.subgoal else ""
-        reason = f" reason={decision.reason}" if decision.reason else ""
-        proposals = f" top=[{', '.join(top_proposals)}]" if top_proposals else ""
-        metadata = self._format_debug_metadata(getattr(decision, "metadata", {}) or {})
         print(
-            f"decision action={decision.action_name} source={decision.source}"
-            f" conf={decision.confidence:.3f}{subgoal}{reason}{proposals}{metadata}"
-            ,
+            format_decision_debug(
+                decision,
+                getattr(decision, "metadata", {}) or {},
+                memory_summary_loader=self._debug_memory_summary,
+            ),
             flush=True,
         )
 
-    def _normalize_state_name(self, value: Any) -> str:
-        if value is None:
-            return ""
-        if hasattr(value, "name"):
-            return str(value.name).upper()
-        return str(value).strip().upper()
-
-    def _format_debug_metadata(self, metadata: dict[str, Any]) -> str:
-        extras: list[str] = []
-        target = self._format_debug_target(metadata)
-        if target:
-            extras.append(target)
-        board_context = self._format_debug_board_context()
-        if board_context:
-            extras.append(board_context)
-        score_floor_debug = dict(metadata.get("score_floor_debug") or {})
-        if not score_floor_debug:
-            return "".join(extras)
-        candidate_actions = ",".join(
-            str(action_name) for action_name in list(score_floor_debug.get("candidate_actions") or [])
-        )
-        frame_signatures = ",".join(
-            str(frame_signature) for frame_signature in list(score_floor_debug.get("frame_signatures") or [])
-        )
-        action_counts = dict(score_floor_debug.get("action_counts") or {})
-        count_pairs = ",".join(
-            f"{action_name}:{action_counts[action_name]}"
-            for action_name in sorted(action_counts)
-        )
-        extras.append(
-            (
-            " meta[score_floor"
-            f" reopened={int(bool(score_floor_debug.get('is_reopened')))}"
-            f" matches={int(score_floor_debug.get('recent_match_count', 0) or 0)}"
-            f" candidates={candidate_actions or '-'}"
-            f" frames={frame_signatures or '-'}"
-            f" counts={count_pairs or '-'}]"
-            )
-        )
-        active = self._format_active_score_floor_debug(score_floor_debug)
-        if active:
-            extras.append(active)
-        return "".join(extras)
-
-    def _format_active_score_floor_debug(self, score_floor_debug: dict[str, Any]) -> str:
-        active_reopen = dict(score_floor_debug.get("active_reopen") or {})
-        if not active_reopen:
-            return ""
-        active_candidates = ",".join(
-            str(action_name) for action_name in list(active_reopen.get("candidate_actions") or [])
-        )
-        active_counts = dict(active_reopen.get("action_counts") or {})
-        active_count_pairs = ",".join(
-            f"{action_name}:{active_counts[action_name]}"
-            for action_name in sorted(active_counts)
-        )
-        return (
-            " meta[score_floor_active"
-            f" reopened={int(bool(active_reopen.get('is_reopened')))}"
-            f" matches={int(active_reopen.get('recent_match_count', 0) or 0)}"
-            f" candidates={active_candidates or '-'}"
-            f" counts={active_count_pairs or '-'}]"
-        )
-
-    def _format_debug_target(self, metadata: dict[str, Any]) -> str:
-        target_anchor = metadata.get("target_anchor")
-        if isinstance(target_anchor, (list, tuple)) and len(target_anchor) == 2:
-            try:
-                stage = metadata.get("shape_stage")
-                return (
-                    f" meta[target_anchor={int(target_anchor[0])},{int(target_anchor[1])}"
-                    f" stage={int(stage) if stage is not None else '-'}]"
-                )
-            except (TypeError, ValueError):
-                pass
-        if "x" not in metadata or "y" not in metadata:
-            return ""
-        try:
-            x = int(metadata.get("x"))
-            y = int(metadata.get("y"))
-        except (TypeError, ValueError):
-            return ""
-        return f" meta[target={x},{y}]"
-
-    def _format_debug_board_context(self) -> str:
+    def _debug_memory_summary(self) -> dict[str, Any]:
         summary_fn = getattr(self.runtime.memory, "summarize_for_hyperon", None)
         if summary_fn is None:
-            return ""
-        try:
-            summary = dict(summary_fn() or {})
-        except Exception:
-            return ""
-        board_context = dict(summary.get("current_board_context") or {})
-        board_height = int(board_context.get("board_height", 0) or 0)
-        board_width = int(board_context.get("board_width", 0) or 0)
-        board_active_cells = int(board_context.get("board_active_cells", 0) or 0)
-        board_source_attr = str(board_context.get("board_source_attr", "") or "")
-        board_default_probe = dict(board_context.get("board_default_probe") or {})
-        if (
-            board_height <= 0
-            and board_width <= 0
-            and board_active_cells <= 0
-            and not board_source_attr
-            and not board_default_probe
-        ):
-            return ""
-        target = ""
-        try:
-            if "x" in board_default_probe and "y" in board_default_probe:
-                target = f"{int(board_default_probe['x'])},{int(board_default_probe['y'])}"
-        except (TypeError, ValueError):
-            target = ""
-        return (
-            " meta[board"
-            f" size={board_width}x{board_height}"
-            f" active={board_active_cells}"
-            f" source={board_source_attr or '-'}"
-            f" default_probe={target or '-'}]"
-        )
+            return {}
+        return dict(summary_fn() or {})

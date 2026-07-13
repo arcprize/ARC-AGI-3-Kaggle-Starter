@@ -69,10 +69,14 @@ step 8 is the deliberate moment when you spend a daily submission.
 
 ---
 
-## The one file you edit: `agent/my_agent.py`
+## The runtime entrypoint: `agent/my_agent.py`
 
-This is the only file you normally touch. It defines a class called `MyAgent`
-with two methods:
+`agent/my_agent.py` is still the ARC framework entrypoint, but the live agent
+runtime is intentionally split across `agi_core/`. `MyAgent` wires together
+the adapter, executive runtime, Hyperon bridge, ORCH-OR planner, and optional
+multi-agent supervisor, then delegates per-frame decisions into that runtime.
+
+The framework contract remains:
 
 ```python
 class MyAgent(Agent):
@@ -89,6 +93,24 @@ The starter version picks random actions — a baseline that proves your whole
 pipeline works end-to-end. Replace the body of `choose_action` with your
 strategy. Everything else (Kaggle plumbing, submission file format, game
 orchestration) is handled for you.
+
+### Runtime architecture
+
+```text
+agent/my_agent.py
+  -> agi_core.adapters.arc.ArcAdapter
+  -> agi_core.executive.ExecutiveRuntime
+  -> agi_core.multi_agent.AgentSupervisor or agi_core.orch_or.ObjectiveReduction
+  -> agi_core.executive.Executive
+  -> agi_core.knowledge.hyperon_bridge.HyperonBridge
+```
+
+- `agent/my_agent.py`: ARC-facing bootstrap and framework contract.
+- `agi_core/executive.py`: observation persistence, specialist orchestration, fallback selection.
+- `agi_core/multi_agent/`: parallel strategy agents, consensus, and solver coordination.
+- `agi_core/orch_or/`: planning, board analysis, search, and plan execution.
+- `agi_core/knowledge/`: Hyperon facts, symbolic rules, solver selection, and memory-backed priors.
+- `agi_core/perception/`: shape and board artifact extraction consumed by the runtime.
 
 ---
 
@@ -221,12 +243,25 @@ Three reasons:
    same game engine the Kaggle gateway runs. If it works locally, it works on
    Kaggle.
 3. **Your code stays in git.** Notebooks are awful for diffs and code review.
-   Here your real work lives in [`agent/my_agent.py`](agent/my_agent.py); the
-   notebook is just an auto-generated deployment artifact.
+   Your ARC entrypoint lives in [`agent/my_agent.py`](agent/my_agent.py), while
+   the reusable runtime lives in `agi_core/`; the notebook is just an
+   auto-generated deployment artifact.
 
 ---
 
 ## Project layout
+
+| Path | Purpose |
+|---|---|
+| `agent/my_agent.py` | ARC framework entrypoint and runtime bootstrap |
+| `agi_core/` | Live runtime: executive, multi-agent, ORCH-OR, perception, knowledge, storage glue |
+| `scripts/play_local.py` | Runs the agent against real games locally |
+| `scripts/build_notebook.py` | Packages `agent/my_agent.py` plus `agi_core/` into the Kaggle notebook |
+| `notebooks/kernel-metadata.json` | One-time Kaggle username configuration |
+| `notebooks/submission.ipynb` | Auto-generated deployment artifact |
+| `vendor/` | Cloned framework checkout |
+| `.venv/` | Local Python 3.12 virtualenv |
+| `.kaggle/` | Project-local Kaggle token |
 
 ```
 .

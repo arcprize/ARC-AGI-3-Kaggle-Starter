@@ -11,6 +11,11 @@ from agi_core.image_input import (
 )
 from agi_core.memory import EpisodicMemory
 from agi_core.runtime_sync import ensure_hyperon_context_synced
+from agi_core.runtime_observation import (
+    boundary_transition,
+    classify_observed_transition,
+    observation_boundary,
+)
 from agi_core.types import (
     ActionDecision,
     EpisodeRecord,
@@ -1529,119 +1534,17 @@ class ExecutiveRuntime:
             for record in records:
                 self.hyperon.record_transition(record)
         transitions = [
-            self._classify_observed_transition(previous, observation, record)
+            classify_observed_transition(previous, observation, record, self.config)
             for record in records
         ]
-        boundary = self._observation_boundary(previous, observation)
+        boundary = observation_boundary(previous, observation, self.config)
         if not transitions and boundary is not None:
-            transitions.append(
-                ObservedTransition(
-                    game_id=observation.game_id,
-                    local_outcome="unknown",
-                    boundary=boundary,
-                )
-            )
+            transitions.append(boundary_transition(observation, boundary))
         if hasattr(self.executive, "note_transition"):
             for transition in transitions:
                 self.executive.note_transition(transition)
         self._last_observation = observation
         return observation
-
-    def _classify_observed_transition(
-        self,
-        previous: Observation | None,
-        current: Observation,
-        record: EpisodeRecord,
-    ) -> ObservedTransition:
-        boundary = self._observation_boundary(previous, current)
-        previous_position = self._observation_player_position(previous)
-        current_position = self._observation_player_position(current)
-        player_moved = bool(
-            previous_position is not None
-            and current_position is not None
-            and previous_position != current_position
-        )
-        previous_signature = self._observation_frame_signature(previous)
-        current_signature = self._observation_frame_signature(current)
-        frame_changed = bool(
-            previous_signature
-            and current_signature
-            and previous_signature != current_signature
-        )
-
-        if boundary in {"win", "level"} or int(record.progress_delta or 0) > 0:
-            outcome = "progress"
-        elif boundary == "game_over" or str(record.outcome or "") == "failed":
-            outcome = "failed"
-        elif boundary in {"restart", "game"}:
-            outcome = "unknown"
-        elif player_moved:
-            outcome = "advanced"
-        elif previous_signature and current_signature and not frame_changed:
-            outcome = "stalled"
-        elif frame_changed:
-            outcome = "unknown"
-        else:
-            outcome = "stalled" if str(record.outcome or "") == "stalled" else "unknown"
-
-        return ObservedTransition(
-            game_id=current.game_id,
-            action_name=str(record.action_name or ""),
-            decision_source=str(record.decision_source or ""),
-            decision_subgoal=record.decision_subgoal,
-            local_outcome=outcome,
-            player_moved=player_moved,
-            frame_changed=frame_changed,
-            boundary=boundary,
-            record=record,
-        )
-
-    def _observation_boundary(
-        self,
-        previous: Observation | None,
-        current: Observation,
-    ) -> str | None:
-        if previous is None:
-            return None
-        if str(previous.game_id or "") != str(current.game_id or ""):
-            return "game"
-        state = str(current.game_state or "").upper()
-        if state == str(self.config.win_state_name or "").upper():
-            return "win"
-        if int(current.levels_completed or 0) > int(previous.levels_completed or 0):
-            return "level"
-        reset_states = {
-            str(name or "").upper() for name in self.config.reset_state_names
-        }
-        if state in reset_states:
-            return "game_over"
-        previous_state = str(previous.game_state or "").upper()
-        if previous_state in reset_states and state not in reset_states:
-            return "restart"
-        if (
-            bool(current.derived_features.get("step_index_reliable", True))
-            and bool(previous.derived_features.get("step_index_reliable", True))
-            and int(current.step_index or 0) < int(previous.step_index or 0)
-        ):
-            return "restart"
-        return None
-
-    @staticmethod
-    def _observation_player_position(
-        observation: Observation | None,
-    ) -> tuple[int, int] | None:
-        if observation is None:
-            return None
-        value = observation.derived_features.get("player_position")
-        if isinstance(value, (list, tuple)) and len(value) >= 2:
-            return int(value[0]), int(value[1])
-        return None
-
-    @staticmethod
-    def _observation_frame_signature(observation: Observation | None) -> str:
-        if observation is None:
-            return ""
-        return str(observation.derived_features.get("frame_signature", "") or "")
 
     def default_goals(self) -> list[GoalState]:
         return [

@@ -19,6 +19,14 @@ from agi_core.multi_agent.runtime import (
     ProcessMultiAgentExecutor,
     build_multi_agent_executor,
 )
+from agi_core.multi_agent.solver_runtime import (
+    board_has_mirror as _solver_board_has_mirror,
+    build_solver_context as _solver_build_solver_context,
+    get_board_data as _solver_get_board_data,
+    seed_sticky_shape_target as _solver_seed_sticky_shape_target,
+    stabilize_shape_frame_cache as _solver_stabilize_shape_frame_cache,
+    sync_solver_episode_facts,
+)
 from agi_core.multi_agent.strategy_agent import StrategyAgent
 from agi_core.perception.shape_recognition import ensure_shape_recognition
 from agi_core.runtime_sync import ensure_hyperon_context_synced
@@ -315,14 +323,7 @@ class AgentSupervisor(ObjectiveReduction):
             game_model = build_game_model(board_data)
             if game_model is None:
                 return None
-            # Sync hyperon episode facts for solver selection
-            try:
-                ep = context.hyperon.facts.setdefault("episode", {})
-                ep["board_type"] = game_model.features.board_type
-                ep["primary_dynamics"] = game_model.features.primary_dynamics
-                ep["dynamics"] = list(game_model.features.dynamics)
-            except Exception:
-                pass
+            sync_solver_episode_facts(context, game_model)
             ensure_shape_recognition(
                 getattr(context.observation, "image_input", None),
                 getattr(context.observation, "derived_features", {}),
@@ -875,57 +876,11 @@ class AgentSupervisor(ObjectiveReduction):
         context: ExecutiveContext,
         frame_cache: dict[str, Any],
     ) -> dict[str, Any]:
-        levels_completed = int(getattr(context.observation, "levels_completed", 0) or 0)
-        mirror_active = bool(frame_cache.get("mirror_puzzle_active"))
-        active_target = frame_cache.get("active_shape_target")
-        active_stage = int(frame_cache.get("active_shape_stage", 0) or 0)
-        player_position = (
-            getattr(context.observation, "derived_features", {}) or {}
-        ).get("player_position")
-        if mirror_active and active_target:
-            sticky = self._sticky_shape_target
-            if (
-                sticky is not None
-                and sticky.get("levels_completed") == levels_completed
-                and sticky.get("orientation") == frame_cache.get("mirror_orientation")
-                and int(sticky.get("stage", 0) or 0) == active_stage
-                and isinstance(sticky.get("target"), tuple)
-            ):
-                sticky_target = sticky["target"]
-                target_shift = (
-                    abs(int(active_target[0]) - int(sticky_target[0]))
-                    + abs(int(active_target[1]) - int(sticky_target[1]))
-                )
-                sticky_distance = None
-                if isinstance(player_position, tuple) and len(player_position) == 2:
-                    sticky_distance = (
-                        abs(int(sticky_target[0]) - int(player_position[0]))
-                        + abs(int(sticky_target[1]) - int(player_position[1]))
-                    )
-                if target_shift >= 6 and (sticky_distance is None or sticky_distance > 2):
-                    frame_cache["active_shape_target"] = sticky_target
-                    active_target = sticky_target
-            self._sticky_shape_target = {
-                "levels_completed": levels_completed,
-                "target": active_target,
-                "stage": active_stage,
-                "orientation": frame_cache.get("mirror_orientation"),
-            }
-            return frame_cache
-        sticky = self._sticky_shape_target
-        if (
-            mirror_active
-            and not active_target
-            and sticky is not None
-            and sticky.get("levels_completed") == levels_completed
-            and sticky.get("orientation") == frame_cache.get("mirror_orientation")
-        ):
-            frame_cache["active_shape_target"] = sticky["target"]
-            frame_cache["active_shape_stage"] = sticky["stage"]
-            frame_cache["shape_agent_mode"] = levels_completed >= 2
-            return frame_cache
-        if not mirror_active:
-            self._sticky_shape_target = None
+        frame_cache, self._sticky_shape_target = _solver_stabilize_shape_frame_cache(
+            self._sticky_shape_target,
+            context,
+            frame_cache,
+        )
         return frame_cache
 
     def _seed_sticky_shape_target(
@@ -933,34 +888,19 @@ class AgentSupervisor(ObjectiveReduction):
         context: ExecutiveContext,
         decision: ActionDecision,
     ) -> None:
-        metadata = getattr(decision, "metadata", {}) or {}
-        target = metadata.get("target_anchor")
-        if not isinstance(target, list) or len(target) != 2:
-            return
-        frame_cache = getattr(context, "multi_agent_frame_cache", {}) or {}
-        shape_recognition = frame_cache.get("shape_recognition")
-        if not isinstance(shape_recognition, dict):
-            shape_recognition = ensure_shape_recognition(
-                getattr(context.observation, "image_input", None),
-                getattr(context.observation, "derived_features", {}),
-            )
-        mirror_puzzle = shape_recognition.get("mirror_puzzle", {}) if isinstance(shape_recognition, dict) else {}
-        if not isinstance(mirror_puzzle, dict) or not mirror_puzzle.get("active"):
-            return
-        self._sticky_shape_target = {
-            "levels_completed": int(getattr(context.observation, "levels_completed", 0) or 0),
-            "target": (int(target[0]), int(target[1])),
-            "stage": int(metadata.get("shape_stage", 0) or 0),
-            "orientation": mirror_puzzle.get("orientation"),
-        }
+        self._sticky_shape_target = _solver_seed_sticky_shape_target(
+            self._sticky_shape_target,
+            context,
+            decision,
+        )
 
 
 # ── Module-level helpers for solver integration ────────────────────────
 
 
 def _board_has_mirror(board: list[list[int]]) -> bool:
-    """Quick check for mirror cells (color 10) on the board."""
-    return any(val == 10 for row in board for val in row)
+    """Compatibility wrapper for solver-runtime helper patching in tests."""
+    return _solver_board_has_mirror(board)
 
 
 def _get_board_data(observation: Any) -> list[list[int]] | None:
@@ -1006,3 +946,24 @@ def _build_solver_context(solver: Any, game_model: Any, context: ExecutiveContex
         memory_db_path=_gameplay_memory_db_path(context.config),
     )
     return sel.build_solver_context(game_model, pctx, context)
+
+
+def _get_board_data(observation: Any) -> list[list[int]] | None:
+    """Compatibility wrapper for solver-runtime helper patching in tests."""
+    return _solver_get_board_data(observation)
+
+
+def _build_solver_context(
+    solver: Any,
+    game_model: Any,
+    context: ExecutiveContext,
+    supervisor: AgentSupervisor,
+) -> Any:
+    """Compatibility wrapper for solver-runtime helper patching in tests."""
+    return _solver_build_solver_context(
+        solver,
+        game_model,
+        context,
+        supervisor,
+        memory_db_path=_gameplay_memory_db_path(context.config),
+    )
