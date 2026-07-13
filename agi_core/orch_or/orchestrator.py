@@ -871,7 +871,7 @@ class ObjectiveReduction:
                     decision = solver.decide(ctx)
                     if decision is not None:
                         self._solver_selector.record_outcome(context, game_model, decision, pctx)
-                        logger.info("solver %s decision: %s", solver.dynamics, decision.action_name)
+                        logger.debug("solver %s decision: %s", solver.dynamics, decision.action_name)
                         return (decision, pctx)
         except Exception:
             logger.debug("solver system failed", exc_info=True)

@@ -10,6 +10,8 @@ from agi_core.knowledge.solvers.beam_coverage_solver import (
     get_goal_cells,
     predict_beam_coverage,
     predict_beam_cells,
+    reflected_visibility,
+    reflection_recovery_direction,
     covered_goal_cells,
     _base_forbidden_cells,
     _forbidden_cells_for_mirror_row,
@@ -125,6 +127,45 @@ class TestPredictBeamCoverage(unittest.TestCase):
         self.assertEqual(
             _forbidden_cells_for_mirror_row({(1, 1)}, 63, 27),
             {(1, 1)},
+        )
+
+    def test_offscreen_reflection_requests_vertical_recovery(self) -> None:
+        # A source at logical row 20 reflected over row 9 lands above row 0.
+        visibility = reflected_visibility(
+            [(3, 60), (3, 63), (6, 63)],
+            _make_mirror_info(True, 27),
+            63,
+            63,
+        )
+        self.assertTrue(visibility["offscreen"])
+        self.assertEqual(visibility["visible_cells"], set())
+        self.assertEqual(
+            reflection_recovery_direction(visibility, _make_mirror_info(True, 27)),
+            "up",
+        )
+
+    def test_partial_reflection_keeps_only_in_bounds_cells(self) -> None:
+        visibility = reflected_visibility(
+            [(3, 27), (3, 30), (3, 33), (3, 36)],
+            _make_mirror_info(True, 27),
+            63,
+            63,
+        )
+        self.assertEqual(visibility["reflected_cells"], {(1, 9), (1, 8), (1, 7), (1, 6)})
+        self.assertEqual(visibility["visible_cells"], visibility["reflected_cells"])
+        self.assertFalse(visibility["offscreen"])
+
+    def test_down_recovery_is_selected_for_reflection_below_board(self) -> None:
+        visibility = reflected_visibility(
+            [(3, 0), (3, 3), (6, 3)],
+            _make_mirror_info(True, 57),
+            63,
+            63,
+        )
+        self.assertTrue(visibility["offscreen"])
+        self.assertEqual(
+            reflection_recovery_direction(visibility, _make_mirror_info(True, 57)),
+            "down",
         )
 
 

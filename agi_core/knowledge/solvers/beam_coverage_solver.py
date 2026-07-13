@@ -267,6 +267,72 @@ def predict_beam_cells(
     return beam
 
 
+def reflected_visibility(
+    shape_cells: list[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    goal_cells: set[tuple[int, int]] | list[tuple[int, int]] = (),
+    gs: int = 3,
+) -> dict[str, Any]:
+    """Describe the first reflected sprite image using engine cell rules.
+
+    AR25 seeds reflection from occupied source cells that are on-screen.  A
+    reflected cell is useful only when its logical cell is on-screen; the
+    source sprite itself may still be partially outside the viewport.
+    """
+    grid_w = board_width // max(1, gs)
+    grid_h = board_height // max(1, gs)
+    source_cells = {(x // gs, y // gs) for x, y in shape_cells}
+    source_cells = {
+        (x, y) for x, y in source_cells
+        if 0 <= x < grid_w and 0 <= y < grid_h
+    }
+    horizontal = bool(mirror_info.get("horizontal", True))
+    axis_gx = int(mirror_info.get("axis_px", 0)) // max(1, gs)
+    axis_gy = int(mirror_info.get("axis_py", 0)) // max(1, gs)
+    reflected_all: set[tuple[int, int]] = set()
+    for gx, gy in source_cells:
+        if horizontal:
+            reflected_all.add((gx, 2 * axis_gy - gy))
+        else:
+            reflected_all.add((2 * axis_gx - gx, gy))
+    visible = {
+        cell for cell in reflected_all
+        if 0 <= cell[0] < grid_w and 0 <= cell[1] < grid_h
+    }
+    goals = {(x // max(1, gs), y // max(1, gs)) for x, y in goal_cells}
+    return {
+        "source_cells": source_cells,
+        "reflected_cells": reflected_all,
+        "visible_cells": visible,
+        "visible_goal_cells": visible & goals,
+        "offscreen": bool(reflected_all) and not visible,
+        "grid_height": grid_h,
+        "grid_width": grid_w,
+    }
+
+
+def reflection_recovery_direction(
+    visibility: dict[str, Any],
+    mirror_info: dict[str, Any],
+) -> str | None:
+    """Return the vertical direction that brings an off-screen image back."""
+    if not mirror_info.get("horizontal") or visibility.get("visible_cells"):
+        return None
+    reflected = set(visibility.get("reflected_cells", ()))
+    if not reflected:
+        return None
+    ys = [cell[1] for cell in reflected]
+    grid_h = int(visibility.get("grid_height", 21))
+    if max(ys) < 0:
+        return "up"
+    if min(ys) >= grid_h:
+        return "down"
+    # A mixed out-of-bounds image is nearest to the closer board edge.
+    return "up" if abs(max(ys) + 1) <= abs(min(ys) - grid_h) else "down"
+
+
 def covered_goal_cells(
     beam_cells: set[tuple[int, int]],
     goal_cells: set[tuple[int, int]] | list[tuple[int, int]],
@@ -634,6 +700,13 @@ class BeamCoverageSolver(DynamicsSolver):
         self._tune_budget: int = 12
         self._final_tuning: bool = False
         self._last_decision_player_pos: tuple[int, int] | None = None
+        self._reflection_recovery: bool = False
+        self._recovery_direction: str | None = None
+        self._recovery_step: int = 0
+        self._recovery_budget: int = 24
+        self._reflected_visible_count: int = 0
+        self._reflected_goal_count: int = 0
+        self._reflection_offscreen: bool = False
 
     @property
     def has_active_attempt(self) -> bool:
@@ -646,6 +719,7 @@ class BeamCoverageSolver(DynamicsSolver):
         )
 
     def reset_level(self) -> None:
+        logger.debug("beam solver reset_level attempt=%s stage=%s cached=%s", self._attempt_id, self._active_stage_index, bool(self._cached_targets))
         self._cached_targets = None
         self._cached_mirror_info = None
         self._cached_frame = -1
@@ -678,11 +752,20 @@ class BeamCoverageSolver(DynamicsSolver):
         self._tune_step = 0
         self._final_tuning = False
         self._last_decision_player_pos = None
+        self._reset_reflection_recovery()
 
     def _invalidate_target_cache(self) -> None:
         self._cached_targets = None
         self._cached_frame = -1
         self._cached_target_key = None
+
+    def _reset_reflection_recovery(self) -> None:
+        self._reflection_recovery = False
+        self._recovery_direction = None
+        self._recovery_step = 0
+        self._reflected_visible_count = 0
+        self._reflected_goal_count = 0
+        self._reflection_offscreen = False
 
     def _goal_cells(self, ctx: SolverContext, board: list[list[int]] | None) -> list[tuple[int, int]]:
         """Prefer the complete perception goal set over reduced GameModel centers."""
@@ -734,6 +817,12 @@ class BeamCoverageSolver(DynamicsSolver):
             ),
             "active_stage_index": self._active_stage_index,
             "switch_pending": self._switch_pending,
+            "reflection_recovery": self._reflection_recovery,
+            "recovery_direction": self._recovery_direction,
+            "reflected_visible_count": self._reflected_visible_count,
+            "reflected_goal_count": self._reflected_goal_count,
+            "reflection_offscreen": self._reflection_offscreen,
+            "recovery_step": self._recovery_step,
         }
         metadata.update(extra)
         return metadata
@@ -759,6 +848,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._invalidate_target_cache()
         self._mirror_target_gy = None
         self._reset_mirror_phase_progress()
+        self._reset_reflection_recovery()
 
     def _reset_mirror_phase_progress(self, *, clear_unreachable: bool = False) -> None:
         self._mirror_phase = False
@@ -922,6 +1012,7 @@ class BeamCoverageSolver(DynamicsSolver):
             return False
         goals = self._goal_cells(ctx, getattr(gm, "board", None))
         if not goals:
+            logger.debug("beam activation skipped: no goals active=%s planned=%s", self.has_active_attempt, bool(self._planned_goal_cells))
             return False
         primary = gm.features.primary_dynamics
         coverage_in_progress = (
@@ -930,7 +1021,13 @@ class BeamCoverageSolver(DynamicsSolver):
             or bool(self._cached_targets)
         )
         if primary == "beam" and not coverage_in_progress:
-            return False
+            # A new AR25 level can already be classified as beam before the
+            # solver has created an attempt.  Permit the general horizontal
+            # mirror planner to bootstrap when multiple shape sources exist;
+            # retain the conservative behavior for single-source beam boards.
+            if not (mirror_info["horizontal"] and len(shapes) >= 2):
+                logger.debug("beam activation skipped: no coverage in progress active=%s cached=%s stage=%s", self.has_active_attempt, bool(self._cached_targets), self._active_stage_index)
+                return False
         # Build a board signature to detect level transitions
         # Use only stable features that don't change mid-level.
         sig = (mirror_info["horizontal"], len(gm.goal_positions), len(goals))
@@ -948,12 +1045,14 @@ class BeamCoverageSolver(DynamicsSolver):
     def decide(self, ctx: SolverContext) -> ActionDecision | None:
         gm = ctx.game_model
         if gm.player_pos is None:
+            logger.debug("beam decide skipped: no player position active=%s", self.has_active_attempt)
             return None
 
         mirror_info = _find_mirror_info(gm.components, gm.width, gm.height)
         if mirror_info is None:
             mirror_info = self._cached_mirror_info
         if mirror_info is None:
+            logger.debug("beam decide skipped: no mirror active=%s cached=%s", self.has_active_attempt, bool(self._cached_mirror_info))
             return None
         gs = max(1, gm.features.grid_scale) if hasattr(gm.features, 'grid_scale') else 3
         board = gm.board if hasattr(gm, 'board') else None
@@ -963,6 +1062,7 @@ class BeamCoverageSolver(DynamicsSolver):
         if not shapes and self.has_active_attempt:
             shapes = [[] for _ in range(max(1, self._planned_shape_count))]
         if not shapes:
+            logger.debug("beam decide skipped: no shapes active=%s cached=%s planned=%s", self.has_active_attempt, bool(self._cached_targets), self._planned_shape_count)
             return None
         px, py = gm.player_pos
         self._last_decision_player_pos = (px, py)
@@ -972,11 +1072,17 @@ class BeamCoverageSolver(DynamicsSolver):
             current_level = int(ctx.plan_context.get("levels_completed", 0))
         except (TypeError, ValueError):
             current_level = 0
+        logger.debug(
+            "beam level state current=%s previous=%s active=%s stage=%s",
+            current_level, self._last_levels_completed, self.has_active_attempt,
+            self._active_stage_index,
+        )
         if self._last_levels_completed is None or current_level > self._last_levels_completed:
             self.reset_level()
         self._last_levels_completed = current_level
         goals = self._goal_cells(ctx, board)
         if not goals:
+            logger.debug("beam decide skipped: no goals active=%s planned=%s", self.has_active_attempt, bool(self._planned_goal_cells))
             return None
         self._planned_shape_count = max(self._planned_shape_count, len(shapes))
 
@@ -1142,6 +1248,18 @@ class BeamCoverageSolver(DynamicsSolver):
                     key=lambda center: abs(center[0] - target_cx) + abs(center[1] - target_cy),
                 )
                 self._last_decision_player_pos = (px, py)
+
+        recovery = self._reflection_recovery_decision(
+            shapes=shapes,
+            mirror_info=mirror_info,
+            goals=goals,
+            board_width=gm.width,
+            board_height=gm.height,
+            target=(target_cx, target_cy),
+            gs=gs,
+        )
+        if recovery is not None:
+            return recovery
 
         if self._last_player_pos == (px, py):
             self._shape_stuck_steps += 1
@@ -1338,6 +1456,70 @@ class BeamCoverageSolver(DynamicsSolver):
                     ),
                 )
         return None
+
+    def _reflection_recovery_decision(
+        self,
+        *,
+        shapes: list[list[tuple[int, int]]],
+        mirror_info: dict[str, Any],
+        goals: list[tuple[int, int]],
+        board_width: int,
+        board_height: int,
+        target: tuple[int, int],
+        gs: int,
+    ) -> ActionDecision | None:
+        """Keep the active shape selected until its reflection is visible."""
+        if self._active_stage_index < 0 or self._switch_pending:
+            return None
+        if not mirror_info.get("horizontal"):
+            self._reset_reflection_recovery()
+            return None
+        candidates = [shape for shape in shapes if shape]
+        if not candidates:
+            # A dropout cannot prove that the reflection is still absent.  The
+            # frozen attempt remains active and the next observation retries.
+            return None
+        active_shape = min(
+            candidates,
+            key=lambda shape: abs(_shape_center(shape)[0] - target[0])
+            + abs(_shape_center(shape)[1] - target[1]),
+        )
+        visibility = reflected_visibility(
+            active_shape,
+            mirror_info,
+            board_width,
+            board_height,
+            goals,
+            gs=gs,
+        )
+        self._reflected_visible_count = len(visibility["visible_cells"])
+        self._reflected_goal_count = len(visibility["visible_goal_cells"])
+        self._reflection_offscreen = bool(visibility["offscreen"])
+        direction = reflection_recovery_direction(visibility, mirror_info)
+        if direction is None:
+            if self._reflection_recovery:
+                self._reset_reflection_recovery()
+            return None
+        if not self._reflection_recovery:
+            self._reflection_recovery = True
+            self._recovery_direction = direction
+            self._recovery_step = 0
+        elif self._recovery_direction != direction:
+            self._recovery_direction = direction
+        if self._recovery_step >= self._recovery_budget:
+            self._reset_attempt("reflection_recovery_exhausted")
+            return None
+        self._recovery_step += 1
+        return ActionDecision(
+            DIR_TO_ACTION[direction],
+            "solver:beam-coverage",
+            0.78,
+            reason=f"coverage_reflection_recovery_{direction}",
+            metadata=self._decision_metadata(
+                target_anchor=[target[0], target[1]],
+                shape_stage=self._active_stage_index,
+            ),
+        )
 
     def _build_expanded_walkable(self, gm) -> set[tuple[int, int]]:
         # In beam-coverage puzzles, shape pieces can move across all

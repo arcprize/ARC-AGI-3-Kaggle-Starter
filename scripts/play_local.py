@@ -88,6 +88,16 @@ def main() -> None:
                    help="List available games and exit.")
     p.add_argument("--render", default=None, choices=[None, "terminal"],
                    help="Optional terminal rendering each step.")
+    p.add_argument("--record-dir", default=None,
+                   help="Optional directory for PNG/GIF visual replay artifacts.")
+    p.add_argument("--record-format", default="both", choices=["png", "gif", "both"],
+                   help="Visual replay output format when --record-dir is set.")
+    p.add_argument("--record-every", type=int, default=1,
+                   help="Capture every Nth action; defaults to every action.")
+    p.add_argument("--record-scale", type=int, default=8,
+                   help="Nearest-neighbor pixel scale for recorded images.")
+    p.add_argument("--record-labels", action=argparse.BooleanOptionalAction, default=True,
+                   help="Add step/action/state labels to recorded frames.")
     p.add_argument(
         "--llm-provider",
         choices=["local", "openai"],
@@ -95,6 +105,8 @@ def main() -> None:
         help="LLM provider for local runs. Defaults to local so shell env does not leak OpenAI into play-local.",
     )
     args = p.parse_args()
+    if args.record_every < 1 or args.record_scale < 1:
+        p.error("--record-every and --record-scale must be at least 1")
 
     log_level = logging.DEBUG if os.environ.get("AGI_DEBUG_DECISIONS", "0").strip().lower() in {"1", "true", "yes", "on"} else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s:%(name)s:%(message)s")
@@ -141,7 +153,35 @@ def main() -> None:
             print(f"  could not create env for {game_id!r}, skipping")
             continue
 
-        agent = MyAgentCls(
+        recorder = None
+        if args.record_dir:
+            from scripts.visual_replay import VisualReplayRecorder
+            game_record_dir = Path(args.record_dir) / game_id
+            recorder = VisualReplayRecorder(
+                game_record_dir,
+                fmt=args.record_format,
+                every=args.record_every,
+                scale=args.record_scale,
+                labels=args.record_labels,
+            )
+
+        BaseAgent = MyAgentCls
+        if recorder is not None:
+            class RecordingAgent(BaseAgent):
+                def take_action(self, action):
+                    frame = super().take_action(action)
+                    if frame is not None:
+                        recorder.record(
+                            frame,
+                            action=getattr(action, "name", str(action)),
+                            step=self.action_counter + 1,
+                        )
+                    return frame
+            AgentCls = RecordingAgent
+        else:
+            AgentCls = BaseAgent
+
+        agent = AgentCls(
             card_id="local-dev",
             game_id=game_id,
             agent_name=f"MyAgent.local.{game_id}",
@@ -152,11 +192,16 @@ def main() -> None:
         )
         agent.main()
 
+        artifacts = recorder.close() if recorder is not None else None
+
         final = agent.frames[-1]
         per_game.append((game_id, final.state, final.levels_completed,
                          agent.action_counter))
         print(f"  -> state={final.state}, levels_completed={final.levels_completed}, "
               f"actions={agent.action_counter}")
+        if artifacts:
+            print(f"  -> replay frames={artifacts['frames_dir']}, gif={artifacts['gif']}, "
+                  f"timeline={artifacts['timeline']}")
 
     sc = arc.get_scorecard()
     print("\n========= SUMMARY =========")
