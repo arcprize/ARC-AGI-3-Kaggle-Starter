@@ -1,9 +1,8 @@
 """Parallel multi-agent system with distributed cognition.
 
-By default, the ``AgentSupervisor`` replaces ``ObjectiveReduction`` as the
-top-level decision-maker, managing 4 parallel strategy agents: Movement,
-Exploration, Interaction, and Puzzle. Set ``AGI_MULTI_AGENT_ENABLE=0`` to
-disable it.
+ORCH-OR remains the default top-level decision-maker. Enable the
+``AgentSupervisor`` research path with ``AGI_MULTI_AGENT_ENABLE=1`` to run
+the parallel Movement, Exploration, Interaction, and Puzzle agents.
 
 Each agent has its own private cognition bundle (WorkingMemory, GoalStack,
 AttentionFocus) while sharing ConsolidatedMemory and ChunkLibrary.

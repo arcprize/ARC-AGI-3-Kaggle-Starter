@@ -57,6 +57,11 @@ class SolverSelector:
     def active_solver(self) -> DynamicsSolver | None:
         return self._active_solver
 
+    @property
+    def active_attempt(self) -> bool:
+        """Whether the retained solver owns an in-progress execution attempt."""
+        return bool(getattr(self._active_solver, "has_active_attempt", False))
+
     def select_solver(
         self,
         game_model: GameModel,

@@ -112,7 +112,29 @@ def _get_shape_pixels(
     return result
 
 
-def get_goal_cells(components: list, width: int) -> list[tuple[int, int]]:
+def _shape_center(shape: list[tuple[int, int]]) -> tuple[int, int] | None:
+    if not shape:
+        return None
+    return (
+        sum(x for x, _ in shape) // len(shape),
+        sum(y for _, y in shape) // len(shape),
+    )
+
+
+def get_goal_cells(
+    components: list,
+    width: int,
+    board: list[list[int]] | None = None,
+) -> list[tuple[int, int]]:
+    if board:
+        board_goals = [
+            (x, y)
+            for y, row in enumerate(board)
+            for x, value in enumerate(row[:max(0, width - 1)])
+            if value == 11
+        ]
+        if board_goals:
+            return board_goals
     return [
         cell
         for comp in components
@@ -120,6 +142,23 @@ def get_goal_cells(components: list, width: int) -> list[tuple[int, int]]:
         and any(cx < width - 1 for cx, _ in comp.cells)
         for cell in comp.cells
     ]
+
+
+def _normalize_goal_cells(value: Any, width: int) -> list[tuple[int, int]]:
+    """Normalize serialized logical/pixel goal coordinates and remove duplicates."""
+    result: set[tuple[int, int]] = set()
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            x, y = int(item[0]), int(item[1])
+        except (TypeError, ValueError):
+            continue
+        if 0 <= x < max(0, width - 1) and y >= 0:
+            result.add((x, y))
+    return sorted(result)
 
 
 def predict_beam_coverage(
@@ -178,6 +217,66 @@ def predict_beam_coverage(
     return pixel_covered
 
 
+def predict_beam_cells(
+    shape_cells: list[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    gs: int = 3,
+) -> set[tuple[int, int]]:
+    """Return logical beam cells using the AR25 sprite reflection model.
+
+    The engine reflects occupied sprite cells as logical grid coordinates;
+    it does not score every pixel in a rendered cell independently.
+    """
+    grid_w = board_width // max(1, gs)
+    grid_h = board_height // max(1, gs)
+    source = {
+        (x // gs, y // gs)
+        for x, y in shape_cells
+        if 0 <= x // gs < grid_w and 0 <= y // gs < grid_h
+    }
+    if not source:
+        return set()
+
+    horizontal = bool(mirror_info.get("horizontal", True))
+    axis_gx = int(mirror_info.get("axis_px", 0)) // gs
+    axis_gy = int(mirror_info.get("axis_py", 0)) // gs
+    # The engine's completion array contains both the reflected beam and the
+    # occupied source sprite cells before goal checks are evaluated.
+    beam: set[tuple[int, int]] = set(source)
+    queue: deque[tuple[int, int, int]] = deque(
+        (gx, gy, 0) for gx, gy in source
+    )
+    visited = set(source)
+    while queue:
+        gx, gy, depth = queue.popleft()
+        if depth >= _MAX_REFLECT_DEPTH:
+            continue
+        if horizontal:
+            reflected = (gx, 2 * axis_gy - gy)
+        else:
+            reflected = (2 * axis_gx - gx, gy)
+        if not (0 <= reflected[0] < grid_w and 0 <= reflected[1] < grid_h):
+            continue
+        if reflected in visited:
+            continue
+        visited.add(reflected)
+        beam.add(reflected)
+        queue.append((reflected[0], reflected[1], depth + 1))
+    return beam
+
+
+def covered_goal_cells(
+    beam_cells: set[tuple[int, int]],
+    goal_cells: set[tuple[int, int]] | list[tuple[int, int]],
+    gs: int = 3,
+) -> set[tuple[int, int]]:
+    """Evaluate goals in the same logical-cell coordinate space as AR25."""
+    goals = {(x // max(1, gs), y // max(1, gs)) for x, y in goal_cells}
+    return beam_cells & goals
+
+
 def find_best_placement(
     shape_cells: list[tuple[int, int]],
     remaining_goals: set[tuple[int, int]],
@@ -203,8 +302,9 @@ def find_best_placement(
     best_score: tuple[int, int] | None = None
     best_pos: tuple[int, int] | None = None
 
-    for tx in range(0, max(1, board_width - shape_w + 1)):
-        for ty in range(0, max(1, board_height - shape_h + 1)):
+    step = max(1, gs)
+    for tx in range(0, max(1, board_width - shape_w + 1), step):
+        for ty in range(0, max(1, board_height - shape_h + 1), step):
             placed = {(tx + dx, ty + dy) for dx, dy in rel_set}
             # Skip if any placed cell overlaps the mirror
             if forbidden_cells and placed & forbidden_cells:
@@ -212,7 +312,10 @@ def find_best_placement(
             covered = predict_beam_coverage(
                 list(placed), mirror_info, board_width, board_height, gs=gs,
             )
-            hits = len(covered & remaining_goals)
+            logical_beam = predict_beam_cells(
+                list(placed), mirror_info, board_width, board_height, gs=gs,
+            )
+            hits = len(covered_goal_cells(logical_beam, remaining_goals, gs=gs))
             if hits == 0:
                 continue
             cx = sum(x for x, _ in placed) // len(placed)
@@ -254,6 +357,7 @@ def find_joint_best_placement(
     goal_set = set(goal_cells)
     for attempt in range(3):  # try 3 different offset sets
         all_covered = set()
+        all_beam_cells: set[tuple[int, int]] = set()
         for idx, shape_cells in enumerate(shapes):
             if idx >= len(greedy):
                 continue
@@ -286,7 +390,16 @@ def find_joint_best_placement(
                 list(placed2), mirror_info, board_width, board_height, gs=gs,
             )
             all_covered.update(covered)
-        newly = all_covered & goal_set
+            all_beam_cells.update(
+                predict_beam_cells(
+                    list(placed2), mirror_info, board_width, board_height, gs=gs,
+                )
+            )
+        hit_logical = covered_goal_cells(all_beam_cells, goal_set, gs=gs)
+        newly = {
+            cell for cell in goal_set
+            if (cell[0] // max(1, gs), cell[1] // max(1, gs)) in hit_logical
+        }
         if len(newly) >= best_combined_score:
             # Keep these targets (with the offset applied)
             for idx, stage in enumerate(greedy):
@@ -337,7 +450,14 @@ def compute_coverage_for_all_shapes(
         covered = predict_beam_coverage(
             list(placed), mirror_info, board_width, board_height, gs=gs,
         )
-        newly_covered = covered & remaining
+        logical_beam = predict_beam_cells(
+            list(placed), mirror_info, board_width, board_height, gs=gs,
+        )
+        hit_logical = covered_goal_cells(logical_beam, remaining, gs=gs)
+        newly_covered = {
+            cell for cell in remaining
+            if (cell[0] // max(1, gs), cell[1] // max(1, gs)) in hit_logical
+        }
         remaining -= newly_covered
 
         cx = sum(x for x, _ in placed) // len(placed) if placed else tx
@@ -360,6 +480,113 @@ def compute_coverage_for_all_shapes(
     return stage_targets
 
 
+def _stage_target_coverage_count(stage_targets: list[dict[str, Any]]) -> int:
+    covered: set[tuple[int, int]] = set()
+    for stage in stage_targets:
+        for cell in list(stage.get("covered_goals", []) or []):
+            if isinstance(cell, tuple) and len(cell) == 2:
+                covered.add((int(cell[0]), int(cell[1])))
+            elif isinstance(cell, list) and len(cell) == 2:
+                covered.add((int(cell[0]), int(cell[1])))
+    return len(covered)
+
+
+def _base_forbidden_cells(gm) -> set[tuple[int, int]]:
+    # AR25 movement has no sprite collision test. Beam, mirror, goals, and
+    # other visible components are all traversable by the active shape.
+    return set()
+
+
+def _forbidden_cells_for_mirror_row(
+    base_forbidden: set[tuple[int, int]],
+    width: int,
+    axis_py: int,
+) -> set[tuple[int, int]]:
+    # Mirror rows are valid shape positions in the engine; do not add a
+    # blanket exclusion buffer around the selected row.
+    return set(base_forbidden)
+
+
+def _clone_stage_targets_with_offset(
+    stage_targets: list[dict[str, Any]],
+    dx: int,
+    dy: int,
+    board_width: int,
+    board_height: int,
+) -> list[dict[str, Any]]:
+    cloned: list[dict[str, Any]] = []
+    for raw_stage in stage_targets:
+        stage = dict(raw_stage)
+        target_anchor = list(stage.get("target_anchor", []) or [])
+        if len(target_anchor) == 2:
+            stage["target_anchor"] = [
+                max(0, min(board_width - 1, int(target_anchor[0]) + dx)),
+                max(0, min(board_height - 1, int(target_anchor[1]) + dy)),
+            ]
+        target_bbox = list(stage.get("target_bbox", []) or [])
+        if len(target_bbox) == 4:
+            stage["target_bbox"] = [
+                max(0, min(board_width - 1, int(target_bbox[0]) + dx)),
+                max(0, min(board_height - 1, int(target_bbox[1]) + dy)),
+                max(0, min(board_width - 1, int(target_bbox[2]) + dx)),
+                max(0, min(board_height - 1, int(target_bbox[3]) + dy)),
+            ]
+        cloned.append(stage)
+    return cloned
+
+
+def select_best_horizontal_mirror_plan(
+    shapes: list[list[tuple[int, int]]],
+    goal_cells: list[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    current_mirror_row: int,
+    base_forbidden: set[tuple[int, int]],
+    *,
+    gs: int = 3,
+    excluded_rows: set[int] | None = None,
+    candidate_rows: set[int] | None = None,
+) -> tuple[int | None, list[dict[str, Any]] | None]:
+    excluded = excluded_rows or set()
+    grid_height = max(1, board_height // max(1, gs))
+    best_row: int | None = None
+    best_targets: list[dict[str, Any]] | None = None
+    best_score: tuple[int, int] | None = None
+
+    row_candidates = sorted(candidate_rows) if candidate_rows else range(grid_height)
+    for mirror_row in row_candidates:
+        if mirror_row in excluded:
+            continue
+        row_mirror_info = dict(mirror_info)
+        row_mirror_info["axis_py"] = mirror_row * gs + (gs // 2)
+        row_targets = find_joint_best_placement(
+            shapes,
+            goal_cells,
+            row_mirror_info,
+            board_width,
+            board_height,
+            forbidden_cells=_forbidden_cells_for_mirror_row(
+                base_forbidden,
+                board_width,
+                int(row_mirror_info["axis_py"]),
+            ),
+            gs=gs,
+        )
+        score = (
+            _stage_target_coverage_count(row_targets),
+            -abs(mirror_row - current_mirror_row),
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_row = mirror_row
+            best_targets = row_targets
+
+    if best_row is None or best_targets is None:
+        return None, None
+    return best_row, best_targets
+
+
 class BeamCoverageSolver(DynamicsSolver):
     """Solver for beam-coverage puzzles where shape pieces emit beam
     that reflects off fixed mirrors to cover goals.
@@ -372,58 +599,346 @@ class BeamCoverageSolver(DynamicsSolver):
     def __init__(self, memory_db_path: str | Path | None = None) -> None:
         super().__init__(memory_db_path)
         self._cached_targets: list[dict[str, Any]] | None = None
+        self._cached_mirror_info: dict[str, Any] | None = None
         self._cached_frame: int = -1
-        self._switch_count: int = 0
+        self._cached_target_key: tuple[int, int, int] | None = None
+        self._active_stage_index: int = -1
+        self._switch_pending: bool = False
+        self._pending_stage_index: int | None = None
+        self._pending_switch_origin: tuple[int, int] | None = None
+        self._pending_switch_color: int | None = None
+        self._pending_switch_frames: int = 0
+        self._pending_switch_retries: int = 0
+        self._pending_switch_scans: int = 0
+        self._emitted_switches: int = 0
+        self._planned_shape_count: int = 0
         self._last_player_pos: tuple[int, int] | None = None
         self._shape_stuck_steps: int = 0
         self._move_history: list[str] = []
         self._last_levels_completed: int | None = None
-        self._switched: bool = False
-        self._last_switch_step: int = -1
         self._board_sig: tuple = ()
         self._retry_count: int = 0
         self._both_placed_steps: int = 0
         self._mirror_target_gy: int | None = None
         self._mirror_phase: bool = False
+        self._mirror_stall_steps: int = 0
+        self._last_observed_mirror_gy: int | None = None
+        self._unreachable_mirror_rows: set[int] = set()
+        # A selected row and its joint targets form one execution attempt.
+        # They must not drift as the live sprite is tuned or temporarily lost.
+        self._attempt_id: int = 0
+        self._attempt_reset_reason: str | None = None
+        self._base_targets: list[dict[str, Any]] | None = None
+        self._planned_goal_cells: list[tuple[int, int]] | None = None
+        self._tune_step: int = 0
+        self._tune_budget: int = 12
+        self._final_tuning: bool = False
+        self._last_decision_player_pos: tuple[int, int] | None = None
+
+    @property
+    def has_active_attempt(self) -> bool:
+        return bool(
+            self._cached_targets
+            or self._base_targets
+            or self._active_stage_index >= 0
+            or self._switch_pending
+            or self._final_tuning
+        )
 
     def reset_level(self) -> None:
         self._cached_targets = None
+        self._cached_mirror_info = None
         self._cached_frame = -1
-        self._switch_count = 0
+        self._cached_target_key = None
+        self._active_stage_index = -1
+        self._switch_pending = False
+        self._pending_stage_index = None
+        self._pending_switch_origin = None
+        self._pending_switch_color = None
+        self._pending_switch_frames = 0
+        self._pending_switch_retries = 0
+        self._pending_switch_scans = 0
+        self._emitted_switches = 0
+        self._planned_shape_count = 0
         self._last_player_pos = None
         self._shape_stuck_steps = 0
         self._move_history = []
         self._last_levels_completed = None
-        self._switched = False
-        self._last_switch_step = -1
+        self._retry_count = 0
+        self._both_placed_steps = 0
         self._mirror_target_gy = None
         self._mirror_phase = False
+        self._mirror_stall_steps = 0
+        self._last_observed_mirror_gy = None
+        self._unreachable_mirror_rows.clear()
+        self._attempt_id += 1
+        self._attempt_reset_reason = "level_reset"
+        self._base_targets = None
+        self._planned_goal_cells = None
+        self._tune_step = 0
+        self._final_tuning = False
+        self._last_decision_player_pos = None
+
+    def _invalidate_target_cache(self) -> None:
+        self._cached_targets = None
+        self._cached_frame = -1
+        self._cached_target_key = None
+
+    def _goal_cells(self, ctx: SolverContext, board: list[list[int]] | None) -> list[tuple[int, int]]:
+        """Prefer the complete perception goal set over reduced GameModel centers."""
+        if self._planned_goal_cells is not None:
+            return list(self._planned_goal_cells)
+        plan_context = ctx.plan_context if isinstance(ctx.plan_context, dict) else {}
+        recognition = plan_context.get("shape_recognition", {})
+        mirror_puzzle = recognition.get("mirror_puzzle", {}) if isinstance(recognition, dict) else {}
+        candidates = []
+        if isinstance(mirror_puzzle, dict):
+            candidates.append(mirror_puzzle.get("goal_cells"))
+        if isinstance(recognition, dict):
+            candidates.append(recognition.get("goal_cells"))
+        goals: list[tuple[int, int]] = []
+        for candidate in candidates:
+            goals = _normalize_goal_cells(candidate, ctx.game_model.width)
+            if goals:
+                break
+        if not goals:
+            goals = get_goal_cells(
+                ctx.game_model.components,
+                ctx.game_model.width,
+                board=board,
+            )
+        if goals:
+            self._planned_goal_cells = list(goals)
+        return goals
+
+    def _decision_metadata(self, **extra: Any) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "selected_mirror_row": self._mirror_target_gy,
+            "base_target_anchor": (
+                list(self._base_targets[0].get("target_anchor", []))
+                if self._base_targets else None
+            ),
+            "tune_step": self._tune_step,
+            "attempt_id": self._attempt_id,
+            "attempt_reset_reason": self._attempt_reset_reason,
+            "placement_overlap_allowed": True,
+            "beam_crossing_allowed": True,
+            "covered_goal_count": _stage_target_coverage_count(
+                self._base_targets or []
+            ),
+            "goal_cell_count": len(self._planned_goal_cells or []),
+            "planned_goal_count": len(self._planned_goal_cells or []),
+            "observed_player_pos": (
+                list(self._last_decision_player_pos)
+                if self._last_decision_player_pos is not None else None
+            ),
+            "active_stage_index": self._active_stage_index,
+            "switch_pending": self._switch_pending,
+        }
+        metadata.update(extra)
+        return metadata
+
+    def _reset_attempt(self, reason: str) -> None:
+        self._attempt_id += 1
+        self._attempt_reset_reason = reason
+        self._base_targets = None
+        self._cached_mirror_info = None
+        self._planned_goal_cells = None
+        self._tune_step = 0
+        self._final_tuning = False
+        self._active_stage_index = -1
+        self._switch_pending = False
+        self._pending_stage_index = None
+        self._pending_switch_origin = None
+        self._pending_switch_color = None
+        self._pending_switch_frames = 0
+        self._pending_switch_retries = 0
+        self._pending_switch_scans = 0
+        self._shape_stuck_steps = 0
+        self._both_placed_steps = 0
+        self._invalidate_target_cache()
+        self._mirror_target_gy = None
+        self._reset_mirror_phase_progress()
+
+    def _reset_mirror_phase_progress(self, *, clear_unreachable: bool = False) -> None:
+        self._mirror_phase = False
+        self._mirror_stall_steps = 0
+        self._last_observed_mirror_gy = None
+        if clear_unreachable:
+            self._unreachable_mirror_rows.clear()
+
+    def _targets_with_retry_offset(
+        self,
+        stage_targets: list[dict[str, Any]],
+        gm,
+        gs: int,
+    ) -> list[dict[str, Any]]:
+        if self._retry_count <= 0:
+            return [dict(stage) for stage in stage_targets]
+        offsets = [
+            (0, gs), (0, -gs), (gs, 0), (-gs, 0),
+            (gs, gs), (gs, -gs), (-gs, gs), (-gs, -gs),
+            (0, gs * 2), (0, -gs * 2), (gs * 2, 0), (-gs * 2, 0),
+        ]
+        idx = (self._retry_count - 1) % len(offsets)
+        dx, dy = offsets[idx]
+        return _clone_stage_targets_with_offset(
+            stage_targets,
+            dx,
+            dy,
+            gm.width,
+            gm.height,
+        )
+
+    def _request_switch(
+        self,
+        ctx: SolverContext,
+        *,
+        next_stage: int,
+        player_pos: tuple[int, int],
+        player_color: int,
+        reason: str,
+        confidence: float,
+    ) -> ActionDecision:
+        self._switch_pending = True
+        self._pending_stage_index = next_stage
+        self._pending_switch_origin = player_pos
+        self._pending_switch_color = player_color
+        self._pending_switch_frames = 0
+        self._pending_switch_retries = 0
+        self._pending_switch_scans = 0
+        self._emitted_switches += 1
+        current = int(ctx.plan_context.get("switch_attempted", 0) or 0)
+        ctx.plan_context["switch_attempted"] = max(current, self._emitted_switches)
+        return ActionDecision(
+            "ACTION5",
+            "solver:beam-coverage",
+            confidence,
+            reason=reason,
+            metadata=self._decision_metadata(pending_shape_stage=next_stage),
+        )
+
+    def _observe_pending_switch(
+        self,
+        ctx: SolverContext,
+        *,
+        player_pos: tuple[int, int],
+        player_color: int,
+        shapes: list[list[tuple[int, int]]],
+        gs: int,
+    ) -> tuple[bool, ActionDecision | None]:
+        if not self._switch_pending:
+            return False, None
+
+        origin = self._pending_switch_origin
+        changed_position = origin is not None and (
+            abs(player_pos[0] - origin[0]) + abs(player_pos[1] - origin[1]) > gs * 2
+        )
+        changed_color = (
+            self._pending_switch_color is not None
+            and player_color != self._pending_switch_color
+        )
+        visible_shape_cells = [cell for shape in shapes for cell in shape]
+        controls_shape = (
+            any(
+                abs(player_pos[0] - sx) + abs(player_pos[1] - sy) <= gs * 3
+                for sx, sy in visible_shape_cells
+            )
+            if visible_shape_cells
+            else player_color == 5
+        )
+        if visible_shape_cells and (changed_position or changed_color) and not controls_shape:
+            scan_limit = max(2, self._planned_shape_count + 1)
+            if self._pending_switch_scans < scan_limit:
+                self._pending_switch_scans += 1
+                self._pending_switch_origin = player_pos
+                self._pending_switch_color = player_color
+                self._pending_switch_frames = 0
+                self._emitted_switches += 1
+                current = int(ctx.plan_context.get("switch_attempted", 0) or 0)
+                ctx.plan_context["switch_attempted"] = max(current, self._emitted_switches)
+                return False, ActionDecision(
+                    "ACTION5",
+                    "solver:beam-coverage",
+                    0.62,
+                    reason="coverage_switch_scan",
+                    metadata=self._decision_metadata(pending_shape_stage=self._pending_stage_index),
+                )
+
+        if (changed_position or changed_color) and controls_shape:
+            self._active_stage_index = int(self._pending_stage_index or 0)
+            self._switch_pending = False
+            self._pending_stage_index = None
+            self._pending_switch_origin = None
+            self._pending_switch_color = None
+            self._pending_switch_frames = 0
+            self._pending_switch_retries = 0
+            self._pending_switch_scans = 0
+            self._shape_stuck_steps = 0
+            self._last_player_pos = player_pos
+            return True, None
+
+        self._pending_switch_frames += 1
+        if self._pending_switch_frames <= 2:
+            return False, None
+        if self._pending_switch_retries == 0:
+            self._pending_switch_retries = 1
+            self._pending_switch_frames = 0
+            self._emitted_switches += 1
+            current = int(ctx.plan_context.get("switch_attempted", 0) or 0)
+            ctx.plan_context["switch_attempted"] = max(current, self._emitted_switches)
+            return False, ActionDecision(
+                "ACTION5",
+                "solver:beam-coverage",
+                0.50,
+                reason="coverage_switch_retry",
+                metadata=self._decision_metadata(pending_shape_stage=self._pending_stage_index),
+            )
+
+        self._switch_pending = False
+        self._pending_stage_index = None
+        self._pending_switch_origin = None
+        self._pending_switch_color = None
+        self._pending_switch_frames = 0
+        return False, None
 
     # ── Activation ─────────────────────────────────────────────────────
 
     def should_activate(self, ctx: SolverContext) -> bool:
         gm = ctx.game_model
-        if gm.player_pos is None or not gm.goal_positions:
+        if gm.player_pos is None and not self.has_active_attempt:
             return False
         mirror_info = _find_mirror_info(gm.components, gm.width, gm.height)
+        if mirror_info is None and self.has_active_attempt:
+            return True
         if mirror_info is None:
             return False
         shapes = _get_shape_pixels(gm.components, gm.width, gm.height, board=gm.board if hasattr(gm, 'board') else None)
+        if not shapes and self._cached_targets and self._planned_shape_count > 0:
+            shapes = [[] for _ in range(len(self._cached_targets))]
+        if not shapes and self.has_active_attempt:
+            return True
         if not shapes:
             return False
-        goals = get_goal_cells(gm.components, gm.width)
+        goals = self._goal_cells(ctx, getattr(gm, "board", None))
         if not goals:
             return False
         primary = gm.features.primary_dynamics
-        if primary == "beam":
+        coverage_in_progress = (
+            self._active_stage_index >= 0
+            or self._switch_pending
+            or bool(self._cached_targets)
+        )
+        if primary == "beam" and not coverage_in_progress:
             return False
         # Build a board signature to detect level transitions
         # Use only stable features that don't change mid-level.
-        sig = (mirror_info["horizontal"], len(gm.goal_positions), len(shapes))
+        sig = (mirror_info["horizontal"], len(gm.goal_positions), len(goals))
         # Reset on any change in board configuration (new level)
-        if sig != self._board_sig:
+        if sig != self._board_sig and not coverage_in_progress:
             self.reset_level()
-            self._board_sig = sig
+            goals = self._goal_cells(ctx, getattr(gm, "board", None))
+        self._board_sig = sig
         if mirror_info["horizontal"]:
             return True
         return len(shapes) >= 2
@@ -437,17 +952,20 @@ class BeamCoverageSolver(DynamicsSolver):
 
         mirror_info = _find_mirror_info(gm.components, gm.width, gm.height)
         if mirror_info is None:
+            mirror_info = self._cached_mirror_info
+        if mirror_info is None:
             return None
         gs = max(1, gm.features.grid_scale) if hasattr(gm.features, 'grid_scale') else 3
         board = gm.board if hasattr(gm, 'board') else None
         shapes = _get_shape_pixels(gm.components, gm.width, gm.height, board=board, gs=gs)
+        if not shapes and self._cached_targets and self._planned_shape_count > 0:
+            shapes = [[] for _ in range(len(self._cached_targets))]
+        if not shapes and self.has_active_attempt:
+            shapes = [[] for _ in range(max(1, self._planned_shape_count))]
         if not shapes:
             return None
-        goals = get_goal_cells(gm.components, gm.width)
-        if not goals:
-            return None
-
         px, py = gm.player_pos
+        self._last_decision_player_pos = (px, py)
 
         # Reset on level transition (MUST be before cache check)
         try:
@@ -457,78 +975,173 @@ class BeamCoverageSolver(DynamicsSolver):
         if self._last_levels_completed is None or current_level > self._last_levels_completed:
             self.reset_level()
         self._last_levels_completed = current_level
+        goals = self._goal_cells(ctx, board)
+        if not goals:
+            return None
+        self._planned_shape_count = max(self._planned_shape_count, len(shapes))
+
+        switch_confirmed, switch_decision = self._observe_pending_switch(
+            ctx,
+            player_pos=(px, py),
+            player_color=int(gm.features.player_color),
+            shapes=shapes,
+            gs=gs,
+        )
+        if switch_decision is not None:
+            return switch_decision
+        if self._switch_pending:
+            return None
+
+        player_jump = (
+            self._last_player_pos is not None
+            and abs(px - self._last_player_pos[0]) + abs(py - self._last_player_pos[1]) > gs * 4
+        )
+        execution_started = self._active_stage_index >= 0 or self._switch_pending
+        if player_jump and not switch_confirmed and not execution_started:
+            self._mirror_target_gy = None
+            self._retry_count = 0
+            self._invalidate_target_cache()
+            self._reset_mirror_phase_progress(clear_unreachable=True)
+
+        current_mirror_gy = mirror_info["axis_py"] // gs if mirror_info["horizontal"] else None
+        base_forbidden = _base_forbidden_cells(gm)
+        target_row = current_mirror_gy if current_mirror_gy is not None else -1
+        planning_needed = not execution_started or (
+            self._cached_targets is None and self._mirror_target_gy is None
+        )
+
+        if mirror_info["horizontal"] and current_mirror_gy is not None and planning_needed:
+            selected_row, selected_targets = None, None
+            mirror_cache_key = (
+                current_level,
+                int(self._mirror_target_gy) if self._mirror_target_gy is not None else current_mirror_gy,
+                self._planned_shape_count,
+            )
+            if self._mirror_target_gy is None or self._cached_target_key != mirror_cache_key:
+                selected_row, selected_targets = select_best_horizontal_mirror_plan(
+                    shapes,
+                    goals,
+                    mirror_info,
+                    gm.width,
+                    gm.height,
+                    current_mirror_row=current_mirror_gy,
+                    base_forbidden=base_forbidden,
+                    gs=gs,
+                    excluded_rows=self._unreachable_mirror_rows,
+                )
+                if selected_row is None and current_mirror_gy not in self._unreachable_mirror_rows:
+                    selected_row, selected_targets = select_best_horizontal_mirror_plan(
+                        shapes,
+                        goals,
+                        mirror_info,
+                        gm.width,
+                        gm.height,
+                        current_mirror_row=current_mirror_gy,
+                        base_forbidden=base_forbidden,
+                        gs=gs,
+                        candidate_rows={current_mirror_gy},
+                    )
+                self._mirror_target_gy = selected_row if selected_row is not None else current_mirror_gy
+                self._cached_mirror_info = dict(mirror_info)
+                self._cached_targets = selected_targets
+                self._base_targets = [dict(stage) for stage in (selected_targets or [])]
+                self._cached_target_key = (
+                    current_level,
+                    int(self._mirror_target_gy),
+                    self._planned_shape_count,
+                )
+                self._cached_frame = current_level
+
+            target_row = int(self._mirror_target_gy if self._mirror_target_gy is not None else current_mirror_gy)
+            if target_row != current_mirror_gy:
+                player_is_mirror = abs(py - mirror_info["axis_py"]) <= gs
+                if not player_is_mirror:
+                    self._unreachable_mirror_rows.add(target_row)
+                    self._mirror_target_gy = current_mirror_gy
+                    self._retry_count += 1
+                    self._reset_attempt("mirror_row_unreachable")
+                    self._reset_mirror_phase_progress()
+                    target_row = current_mirror_gy
+                else:
+                    if self._last_observed_mirror_gy == current_mirror_gy:
+                        self._mirror_stall_steps += 1
+                    else:
+                        self._last_observed_mirror_gy = current_mirror_gy
+                        self._mirror_stall_steps = 0
+                    if self._mirror_stall_steps >= 4:
+                        self._unreachable_mirror_rows.add(target_row)
+                        self._mirror_target_gy = current_mirror_gy
+                        self._retry_count += 1
+                        self._reset_attempt("mirror_row_stalled")
+                        self._reset_mirror_phase_progress()
+                        target_row = current_mirror_gy
+                    else:
+                        direction = "up" if target_row < current_mirror_gy else "down"
+                        return ActionDecision(
+                            DIR_TO_ACTION.get(direction, "ACTION1"),
+                            "solver:beam-coverage",
+                            0.65,
+                            reason=f"coverage_position_mirror_{direction}",
+                            metadata=self._decision_metadata(),
+                        )
+            else:
+                self._reset_mirror_phase_progress()
+
+        # The selected row remains authoritative after execution starts.
+        if mirror_info["horizontal"] and self._mirror_target_gy is not None:
+            mirror_info = dict(mirror_info)
+            mirror_info["axis_py"] = int(self._mirror_target_gy) * gs + (gs // 2)
 
         # ── Mirror positioning phase ─────────────────────────────────
-        # Run before ANY other logic.  Keep positioning until the mirror
-        # reaches the optimal Y for goal coverage.
-        if mirror_info["horizontal"]:
-            if self._mirror_target_gy is None:
-                goal_grid_ys = [gy // gs for _, gy in gm.goal_positions]
-                if goal_grid_ys:
-                    self._mirror_target_gy = (min(goal_grid_ys) + max(goal_grid_ys)) // 2
-                    self._mirror_phase = True
-            if self._mirror_phase and self._mirror_target_gy is not None:
-                current_mirror_gy = mirror_info["axis_py"] // gs
-                dy = self._mirror_target_gy - current_mirror_gy
-                if abs(dy) > 0:
-                    d = "up" if dy < 0 else "down"
-                    return ActionDecision(
-                        DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.65,
-                        reason=f"coverage_position_mirror_{d}",
-                    )
-                else:
-                    # Mirror positioned — exit phase
-                    self._mirror_phase = False
-
-        # Collect forbidden cells: mirror strip + border-touching obstacles
+        # The AR25 engine only enforces board bounds for shape movement.
+        # Shapes may overlap each other, goals, mirrors, and beam cells.
         forbidden: set[tuple[int, int]] = set()
-        for c in gm.components:
-            if c.touches_border and c.dominant_color not in (5, 11):
-                forbidden.update(c.cells)
-        # Add a thin buffer around the mirror axis to prevent shape overlap.
-        if mirror_info["horizontal"]:
-            my = mirror_info["axis_py"]
-            for x in range(gm.width):
-                for dy in range(-1, 2):
-                    forbidden.add((x, my + dy))
-        else:
-            mx = mirror_info["axis_px"]
-            for y in range(gm.height):
-                for dx in range(-1, 2):
-                    forbidden.add((mx + dx, y))
 
         # Cache targets — recompute on level change or retry
-        if self._cached_targets is None or self._cached_frame != current_level:
+        target_cache_key = (
+            current_level,
+            (mirror_info["axis_py"] // gs) if mirror_info["horizontal"] else -1,
+            self._planned_shape_count,
+        )
+        if self._cached_targets is None or (
+            self._active_stage_index < 0 and self._cached_target_key != target_cache_key
+        ):
             # Try joint placement first (evaluates combinations of both shapes)
             self._cached_targets = find_joint_best_placement(
                 shapes, goals, mirror_info, gm.width, gm.height,
                 forbidden_cells=forbidden, gs=gs,
             )
+            self._cached_target_key = target_cache_key
             self._cached_frame = current_level
+            if self._active_stage_index < 0:
+                self._base_targets = [dict(stage) for stage in self._cached_targets]
 
         if not self._cached_targets:
             return None
 
-        # Apply retry offset to nudge shapes to different positions.
-        if self._retry_count > 0:
-            offsets = [
-                (0, gs), (0, -gs), (gs, 0), (-gs, 0),
-                (gs, gs), (gs, -gs), (-gs, gs), (-gs, -gs),
-                (0, gs*2), (0, -gs*2), (gs*2, 0), (-gs*2, 0),
-            ]
-            idx = (self._retry_count - 1) % len(offsets)
-            dx, dy = offsets[idx]
-            for stage in self._cached_targets:
-                anc = stage["target_anchor"]
-                anc[0] = max(0, min(gm.width - 1, anc[0] + dx))
-                anc[1] = max(0, min(gm.height - 1, anc[1] + dy))
+        self._planned_shape_count = max(self._planned_shape_count, len(self._cached_targets))
 
-        active_target_idx = min(self._switch_count, len(self._cached_targets) - 1)
-        stage = self._cached_targets[active_target_idx]
+        targets = self._cached_targets
+
+        active_target_idx = min(max(self._active_stage_index, 0), len(targets) - 1)
+        stage = targets[active_target_idx]
         target_cx, target_cy = stage["target_anchor"]
         # Grid-align target: snap to nearest grid cell's pixel center
         target_cx = (target_cx // gs) * gs + (gs // 2)
         target_cy = (target_cy // gs) * gs + (gs // 2)
+
+        # Analyzer player selection can alternate between overlapping shape
+        # components after ACTION5. For beam puzzles, the active shape is the
+        # visible shape nearest its frozen stage target; use that position for
+        # navigation while retaining gm.player_pos for switch confirmation.
+        if self._active_stage_index >= 0:
+            visible_shapes = [center for center in (_shape_center(shape) for shape in shapes) if center is not None]
+            if visible_shapes:
+                px, py = min(
+                    visible_shapes,
+                    key=lambda center: abs(center[0] - target_cx) + abs(center[1] - target_cy),
+                )
+                self._last_decision_player_pos = (px, py)
 
         if self._last_player_pos == (px, py):
             self._shape_stuck_steps += 1
@@ -536,21 +1149,28 @@ class BeamCoverageSolver(DynamicsSolver):
             self._shape_stuck_steps = 0
         self._last_player_pos = (px, py)
 
-        # On first activation, do the initial switch to the first shape piece.
-        if self._switch_count == 0 and not self._switched:
-            self._switched = True
-            if len(shapes) > 0:
-                return ActionDecision("ACTION5", "solver:beam-coverage", 0.70,
-                                      reason="coverage_switch_to_shape")
-            return None
+        # On first activation, switch from the mirror controller to shape 0.
+        if self._active_stage_index < 0:
+            return self._request_switch(
+                ctx,
+                next_stage=0,
+                player_pos=(px, py),
+                player_color=int(gm.features.player_color),
+                reason="coverage_switch_to_shape",
+                confidence=0.70,
+            )
 
-        if self._shape_stuck_steps >= 30 and self._switch_count < len(shapes):
-            self._switch_count += 1
+        shape_count = max(self._planned_shape_count, len(targets))
+        if self._shape_stuck_steps >= 30 and self._active_stage_index + 1 < shape_count:
             self._shape_stuck_steps = 0
-            if self._switch_count < len(shapes):
-                return ActionDecision("ACTION5", "solver:beam-coverage", 0.65,
-                                      reason="coverage_stuck_switch")
-            return None
+            return self._request_switch(
+                ctx,
+                next_stage=self._active_stage_index + 1,
+                player_pos=(px, py),
+                player_color=int(gm.features.player_color),
+                reason="coverage_stuck_switch",
+                confidence=0.65,
+            )
 
         # Convert to grid coordinates for navigation (game engine moves in grid steps)
         gx, gy = px // gs, py // gs
@@ -561,51 +1181,91 @@ class BeamCoverageSolver(DynamicsSolver):
         arrival_dist = abs(gx - target_gx) + abs(gy - target_gy)
         # Also compute pixel distance for comparison
         pixel_dist = abs(px - target_cx) + abs(py - target_cy)
-        final_stage = self._switch_count >= len(shapes)
+        final_stage = self._active_stage_index >= shape_count - 1
 
-        # Track how long both shapes have been placed
-        if self._switch_count >= len(shapes):
+        if final_stage and self._final_tuning:
+            self._shape_stuck_steps = 0
+            self._both_placed_steps = 0
+            self._tune_step += 1
+            if self._tune_step > self._tune_budget:
+                self._reset_attempt("final_tuning_exhausted")
+                return ActionDecision(
+                    "ACTION5", "solver:beam-coverage", 0.40,
+                    reason="coverage_full_reset",
+                    metadata=self._decision_metadata(),
+                )
+            spiral = [
+                (0, -1), (1, 0), (0, 1), (-1, 0),
+                (0, -2), (1, -1), (2, 0), (1, 1),
+                (0, 2), (-1, 1), (-2, 0), (-1, -1),
+            ]
+            dvx, dvy = spiral[(self._tune_step - 1) % len(spiral)]
+            d = "up" if dvy < 0 else "down" if dvy > 0 else "left" if dvx < 0 else "right"
+            return ActionDecision(
+                DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.45,
+                reason=f"coverage_tune_{d}",
+                metadata=self._decision_metadata(
+                    target_anchor=[target_cx, target_cy],
+                    shape_stage=self._active_stage_index,
+                ),
+            )
+
+        # Track final-stage placement only after the live entity actually
+        # reaches its frozen anchor.  Counting every final-stage frame moved
+        # a still-navigating shape into the tuning spiral prematurely.
+        # A one-cell tolerance can switch away before the sprite occupies the
+        # planned cell.  AR25 checks completion after movement, so confirm the
+        # exact logical cell before advancing or tuning the stage.
+        at_target = arrival_dist == 0
+        if final_stage and at_target:
             self._both_placed_steps += 1
         else:
             self._both_placed_steps = 0
 
         # Emergency switch if close enough in pixel or grid space.
         # Skip when both shapes have been placed for >5 frames (to allow retry).
-        if self._both_placed_steps <= 2 and (arrival_dist <= 1 or pixel_dist <= gs * 2):
-            if self._switch_count < len(shapes):
-                self._switch_count += 1
+        if self._both_placed_steps <= 2 and at_target:
+            if not final_stage:
                 self._shape_stuck_steps = 0
-                if self._switch_count < len(shapes):
-                    return ActionDecision("ACTION5", "solver:beam-coverage", 0.68,
-                                          reason="coverage_switch_next")
-                return ActionDecision("ACTION6", "solver:beam-coverage", 0.60,
-                                      reason="coverage_all_placed")
+                return self._request_switch(
+                    ctx,
+                    next_stage=self._active_stage_index + 1,
+                    player_pos=(px, py),
+                    player_color=int(gm.features.player_color),
+                    reason="coverage_switch_next",
+                    confidence=0.68,
+                )
             return ActionDecision("ACTION6", "solver:beam-coverage", 0.60,
-                                  reason="coverage_wait")
+                                  reason="coverage_all_placed")
 
         # Emergency switch after stuck or both placed (fast retry with 3-frame cooldown)
         if self._shape_stuck_steps >= 6 or self._both_placed_steps >= 3:
-            if self._switch_count < len(shapes):
-                self._switch_count += 1
+            if not final_stage:
                 self._shape_stuck_steps = 0
-                if self._switch_count < len(shapes):
-                    return ActionDecision("ACTION5", "solver:beam-coverage", 0.65,
-                                          reason="coverage_early_switch")
-                return None
+                return self._request_switch(
+                    ctx,
+                    next_stage=self._active_stage_index + 1,
+                    player_pos=(px, py),
+                    player_color=int(gm.features.player_color),
+                    reason="coverage_early_switch",
+                    confidence=0.65,
+                )
             # Both shapes placed — try brute-force fine-tuning.
             # Move current entity by 1 grid cell in each cardinal direction.
             # The game engine checks win after each step.
             self._shape_stuck_steps = 0
             self._both_placed_steps = 0
-            self._retry_count += 1
-            if self._retry_count > 60:
-                self.reset_level()
+            self._final_tuning = True
+            self._tune_step += 1
+            if self._tune_step > self._tune_budget:
+                self._reset_attempt("final_tuning_exhausted")
                 return ActionDecision("ACTION5", "solver:beam-coverage", 0.40,
-                                      reason="coverage_full_reset")
+                                      reason="coverage_full_reset",
+                                      metadata=self._decision_metadata())
             # Try moving in a spiral pattern around current position
             spiral = [(0, -1), (1, 0), (0, 1), (-1, 0),  # up, right, down, left
                       (0, -2), (1, -1), (2, 0), (1, 1), (0, 2), (-1, 1), (-2, 0), (-1, -1)]
-            idx = (self._retry_count - 1) % len(spiral)
+            idx = (self._tune_step - 1) % len(spiral)
             dvx, dvy = spiral[idx]
             ngx, ngy = gx + dvx, gy + dvy
             g_w = gm.width // gs
@@ -615,14 +1275,28 @@ class BeamCoverageSolver(DynamicsSolver):
                 return ActionDecision(
                     DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.45,
                     reason=f"coverage_tune_{d}",
+                    metadata=self._decision_metadata(
+                        target_anchor=[target_cx, target_cy],
+                        shape_stage=self._active_stage_index,
+                    ),
                 )
             return ActionDecision("ACTION6", "solver:beam-coverage", 0.40,
-                                  reason="coverage_tune_wait")
+                                  reason="coverage_tune_wait",
+                                  metadata=self._decision_metadata(
+                                      target_anchor=[target_cx, target_cy],
+                                      shape_stage=self._active_stage_index,
+                                  ))
 
         # Direct axis-priority navigation: prioritize the axis with larger delta
         # to avoid A* oscillation between directions.
         dx = target_gx - gx
         dy = target_gy - gy
+        logger.debug(
+            "beam navigation state: player_px=(%s,%s) player_grid=(%s,%s) "
+            "target_px=(%s,%s) target_grid=(%s,%s) delta=(%s,%s) stage=%s",
+            px, py, gx, gy, target_cx, target_cy, target_gx, target_gy,
+            dx, dy, self._active_stage_index,
+        )
         candidates = []
         if abs(dx) >= abs(dy):
             if dx > 0: candidates.append("right")
@@ -639,18 +1313,17 @@ class BeamCoverageSolver(DynamicsSolver):
         grid_walkable = set()
         for wx, wy in expanded:
             grid_walkable.add((wx // gs, wy // gs))
-        failed = ctx.plan_context.get("failed_directions", set())
         for d in candidates:
-            if d in failed:
-                continue
             dvx, dvy = vec[d]
             ngx, ngy = gx + dvx, gy + dvy
             if (ngx, ngy) in grid_walkable:
                 return ActionDecision(
                     DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.65,
                     reason=f"coverage_nav_{d}",
-                    metadata={"target_anchor": [target_cx, target_cy],
-                              "shape_stage": self._switch_count},
+                    metadata=self._decision_metadata(
+                        target_anchor=[target_cx, target_cy],
+                        shape_stage=self._active_stage_index,
+                    ),
                 )
         # Forced fallback
         for d, (dvx, dvy) in vec.items():
@@ -659,8 +1332,10 @@ class BeamCoverageSolver(DynamicsSolver):
                 return ActionDecision(
                     DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.40,
                     reason=f"coverage_forced_{d}",
-                    metadata={"target_anchor": [target_cx, target_cy],
-                              "shape_stage": self._switch_count},
+                    metadata=self._decision_metadata(
+                        target_anchor=[target_cx, target_cy],
+                        shape_stage=self._active_stage_index,
+                    ),
                 )
         return None
 
@@ -672,11 +1347,6 @@ class BeamCoverageSolver(DynamicsSolver):
         for y in range(gm.height):
             for x in range(gm.width):
                 w.add((x, y))
-        # Exclude only border-touching walls (immovable obstacles)
-        for c in gm.components:
-            if c.touches_border and c.dominant_color != 11:
-                for cx, cy in c.cells:
-                    w.discard((cx, cy))
         return w
 
 

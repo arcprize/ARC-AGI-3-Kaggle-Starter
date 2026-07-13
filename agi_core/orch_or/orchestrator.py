@@ -16,6 +16,7 @@ from agi_core.orch_or.game_model import (
 )
 from agi_core.cognition.multi_modal import ActionEffectLog
 from agi_core.image_input import compute_board_signature
+from agi_core.perception.shape_recognition import ensure_shape_recognition
 from agi_core.orch_or.monitor import check_progress
 from agi_core.orch_or.tracker import EntityTracker
 from agi_core.orch_or.parallel import ThreadPoolManager
@@ -37,6 +38,16 @@ _BEAM_DIR_KEY = "orch_or_beam_best_direction"
 _BEAM_PROX_KEY = "orch_or_beam_proximity"
 _BEAM_COLOR_KEY = "orch_or_beam_controller_color"
 _LEVEL_JUMP_THRESHOLD = 35
+
+
+def _is_level_transition_jump(
+    previous: tuple[int, int],
+    current: tuple[int, int],
+    last_action: str | None,
+) -> bool:
+    if last_action == "ACTION5":
+        return False
+    return abs(current[0] - previous[0]) + abs(current[1] - previous[1]) > _LEVEL_JUMP_THRESHOLD
 
 
 def _gameplay_memory_db_path(config: Any) -> Any:
@@ -171,7 +182,9 @@ class ObjectiveReduction:
         if self._previous_model is not None and self._previous_model.player_pos is not None and game_model.player_pos is not None:
             prev_p = self._previous_model.player_pos
             curr_p = game_model.player_pos
-            player_jumped = abs(curr_p[0] - prev_p[0]) + abs(curr_p[1] - prev_p[1]) > _LEVEL_JUMP_THRESHOLD
+            player_jumped = _is_level_transition_jump(prev_p, curr_p, last_action)
+            # ACTION5 changes the selected entity and can legitimately move the
+            # observed player across the board. That is not a level boundary.
             if player_jumped:
                 self._non_beam_controllers.clear()
                 self._switch_count = 0
@@ -201,6 +214,11 @@ class ObjectiveReduction:
         if solver_decision is not None:
             if sctx and sctx.get("switch_attempted", 0) > self._switch_count:
                 self._switch_count = sctx["switch_attempted"]
+            if solver_decision.action_name == "ACTION5":
+                # Failed directions and queued plan steps belong to the old
+                # controller; carrying them across an entity switch can block
+                # the new shape's only route to its placement target.
+                self._reset_controller_state_after_solver_switch(context)
             logger.debug("solver system primary decision: %s", solver_decision.action_name)
             context.memory.note_decision(solver_decision)
             self._previous_model = game_model
@@ -269,23 +287,30 @@ class ObjectiveReduction:
             pass
         try:
             # Check for reset-needed
-            for row in context.hyperon.run_rules("reset-needed"):
-                if row.get("action_name"):
-                    logger.debug("hyperon reset-needed: %s", row)
-                    return ActionDecision(
-                        action_name=row["action_name"],
-                        source="orch_or:hyperon",
-                        confidence=float(row.get("confidence", 0.95)),
-                        reason=str(row.get("reason", "hyperon reset")),
-                        subgoal="re-enter-level",
-                        proposals=[ActionProposal(
+            active_solver = self._solver_selector.active_solver if self._solver_selector else None
+            active_beam_attempt = bool(
+                active_solver is not None
+                and getattr(active_solver, "dynamics", "") == "beam-coverage"
+                and self._solver_selector.active_attempt
+            )
+            if not active_beam_attempt:
+                for row in context.hyperon.run_rules("reset-needed"):
+                    if row.get("action_name"):
+                        logger.debug("hyperon reset-needed: %s", row)
+                        return ActionDecision(
                             action_name=row["action_name"],
                             source="orch_or:hyperon",
                             confidence=float(row.get("confidence", 0.95)),
                             reason=str(row.get("reason", "hyperon reset")),
                             subgoal="re-enter-level",
-                        )],
-                    )
+                            proposals=[ActionProposal(
+                                action_name=row["action_name"],
+                                source="orch_or:hyperon",
+                                confidence=float(row.get("confidence", 0.95)),
+                                reason=str(row.get("reason", "hyperon reset")),
+                                subgoal="re-enter-level",
+                            )],
+                        )
             # Query game-aware goal hints (factors in board_type).
             goal_hints = context.hyperon.run_rules("game-goal-hints")
             if goal_hints:
@@ -654,6 +679,13 @@ class ObjectiveReduction:
             wm[_PLAN_KEY] = serialize_plan(self._active_plan)
         elif _PLAN_KEY in wm:
             del wm[_PLAN_KEY]
+
+    def _reset_controller_state_after_solver_switch(self, context: ExecutiveContext) -> None:
+        self._failed_directions.clear()
+        self._pending_failed_dir = None
+        self._active_plan = None
+        self._regenerate_count = 0
+        self._persist_plan(context)
 
     def _get_working_memory(self, context: ExecutiveContext) -> dict[str, Any]:
         if context.memory_bundle is not None:

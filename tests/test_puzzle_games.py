@@ -22,6 +22,11 @@ from agi_core.knowledge.solvers.mirror_solver import (
     _has_large_interior_goal_region,
     _horizontal_small_goal_target,
     _is_interior_shape_piece,
+    _plan_stage_target_metadata,
+)
+from agi_core.knowledge.solvers.beam_coverage_solver import (
+    BeamCoverageSolver,
+    select_best_horizontal_mirror_plan,
 )
 from agi_core.perception.shape_recognition import ensure_shape_recognition, recognize_shape_recognition
 from agi_core.image_input import BoardImageInput
@@ -2984,7 +2989,7 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         self.assertEqual(decision.reason, "mirror_placed_wait")
         self.assertEqual(solver._switch_count, 1)
 
-    def test_mirror_solver_honors_single_stage_vertical_artifact_target(self) -> None:
+    def test_mirror_solver_single_stage_vertical_uses_geometric_target_even_with_shape_component(self) -> None:
         from agi_core.knowledge.solvers import SolverContext
 
         gm = game_ar25_level1()
@@ -3041,8 +3046,93 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         )
 
         self.assertIsNotNone(decision)
-        self.assertEqual(decision.action_name, "ACTION4")
-        self.assertEqual(decision.reason, "mirror_placement_right")
+        self.assertEqual(decision.action_name, "ACTION3")
+        self.assertEqual(decision.reason, "mirror_placement_left")
+        self.assertEqual(decision.metadata["target_anchor"], [4, 46])
+
+    def test_plan_stage_target_metadata_keeps_rich_level1_stage_target_fields(self) -> None:
+        artifact = recognize_shape_recognition(
+            BoardImageInput(
+                board=game_ar25_level1().board,
+                height=64,
+                width=64,
+                frame_signature="level1-rich-stage",
+                source_attr="test",
+            )
+        )
+
+        metadata = _plan_stage_target_metadata(
+            {"shape_stage_targets": artifact["mirror_puzzle"]["stage_targets"]},
+            1,
+        )
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["target_anchor"], [10, 46])
+        self.assertIn("target_bbox", metadata)
+        self.assertGreater(metadata["fresh_hits"], 0)
+
+    def test_mirror_solver_single_stage_vertical_trusts_rich_stage_target_metadata(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+
+        gm = game_ar25_level1()
+        solver = MirrorSolver()
+        solver._mirror_is_horizontal = False
+        solver._switch_count = 1
+        mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
+        mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
+        mirror_gx = mirror_comp.bbox[0] // gm.features.grid_scale
+        goal_cells = [
+            cell
+            for comp in gm.components
+            if comp.dominant_color == 11
+            and comp.size <= 100
+            and any(cx < gm.width - 1 for cx, _ in comp.cells)
+            for cell in comp.cells
+        ]
+        min_gpy = min(cy for _, cy in goal_cells)
+        max_gpy = max(cy for _, cy in goal_cells)
+        min_ggy = min_gpy // gm.features.grid_scale
+        max_ggy = max_gpy // gm.features.grid_scale
+        min_gpx = min(cx for cx, _ in goal_cells)
+        max_gpx = max(cx for cx, _ in goal_cells)
+        min_ggx = min_gpx // gm.features.grid_scale
+        max_ggx = max_gpx // gm.features.grid_scale
+        shape_comps = [c for c in gm.components if _is_interior_shape_piece(c, gm)]
+        artifact = recognize_shape_recognition(
+            BoardImageInput(
+                board=gm.board,
+                height=gm.height,
+                width=gm.width,
+                frame_signature="level1-live-like",
+                source_attr="test",
+            )
+        )
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "shape_stage_targets": artifact["mirror_puzzle"]["stage_targets"],
+                "shape_recognition": artifact,
+            },
+        )
+
+        decision = solver._navigate_shape(
+            gm,
+            ctx,
+            (19, 16),
+            mirror_gx,
+            mirror_py // gm.features.grid_scale,
+            mirror_py,
+            gm.features.grid_scale,
+            min_ggx,
+            max_ggx,
+            min_ggy,
+            max_ggy,
+            shape_comps=shape_comps,
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action_name, "ACTION3")
+        self.assertEqual(decision.metadata["target_anchor"], [10, 46])
 
     def test_mirror_solver_clears_failed_directions_on_horizontal_switch(self) -> None:
         from agi_core.knowledge.solvers import SolverContext
@@ -3766,6 +3856,341 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         # so entity discovery should NOT trigger (player IS on color-0)
 
 # ---------------------------------------------------------------------------
+
+
+class TestBeamCoverageSolver(unittest.TestCase):
+    def test_pending_switch_advances_stage_only_after_observed_entity_change(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        ctx = SolverContext(game_model=gm, plan_context={"switch_attempted": 0})
+
+        decision = solver._request_switch(
+            ctx,
+            next_stage=0,
+            player_pos=(6, 6),
+            player_color=10,
+            reason="coverage_switch_to_shape",
+            confidence=0.70,
+        )
+        confirmed, follow_up = solver._observe_pending_switch(
+            ctx,
+            player_pos=(42, 42),
+            player_color=5,
+            shapes=[[(42, 42)]],
+            gs=3,
+        )
+
+        self.assertEqual(decision.action_name, "ACTION5")
+        self.assertTrue(confirmed)
+        self.assertIsNone(follow_up)
+        self.assertFalse(solver._switch_pending)
+        self.assertEqual(solver._active_stage_index, 0)
+        self.assertEqual(ctx.plan_context["switch_attempted"], 1)
+
+    def test_pending_switch_does_not_duplicate_action5_before_retry_budget(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        ctx = SolverContext(game_model=gm, plan_context={})
+        solver._request_switch(
+            ctx,
+            next_stage=0,
+            player_pos=(6, 6),
+            player_color=10,
+            reason="coverage_switch_to_shape",
+            confidence=0.70,
+        )
+
+        first = solver._observe_pending_switch(
+            ctx, player_pos=(6, 6), player_color=10, shapes=[[(42, 42)]], gs=3,
+        )
+        second = solver._observe_pending_switch(
+            ctx, player_pos=(6, 6), player_color=10, shapes=[[(42, 42)]], gs=3,
+        )
+        third = solver._observe_pending_switch(
+            ctx, player_pos=(6, 6), player_color=10, shapes=[[(42, 42)]], gs=3,
+        )
+
+        self.assertEqual(first, (False, None))
+        self.assertEqual(second, (False, None))
+        self.assertEqual(third[1].action_name, "ACTION5")
+        self.assertEqual(third[1].reason, "coverage_switch_retry")
+        self.assertEqual(ctx.plan_context["switch_attempted"], 2)
+
+    def test_pending_switch_scans_past_non_shape_controller(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        solver._planned_shape_count = 2
+        ctx = SolverContext(game_model=gm, plan_context={})
+        solver._request_switch(
+            ctx,
+            next_stage=1,
+            player_pos=(20, 17),
+            player_color=5,
+            reason="coverage_switch_next",
+            confidence=0.68,
+        )
+
+        confirmed, decision = solver._observe_pending_switch(
+            ctx,
+            player_pos=(31, 45),
+            player_color=10,
+            shapes=[[(13, 13)], [(49, 46)]],
+            gs=3,
+        )
+
+        self.assertFalse(confirmed)
+        self.assertEqual(decision.action_name, "ACTION5")
+        self.assertEqual(decision.reason, "coverage_switch_scan")
+        self.assertTrue(solver._switch_pending)
+        self.assertEqual(solver._pending_stage_index, 1)
+
+    def test_failed_switch_confirmation_exits_pending_state_after_one_retry(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        ctx = SolverContext(game_model=gm, plan_context={})
+        solver._request_switch(
+            ctx,
+            next_stage=0,
+            player_pos=(6, 6),
+            player_color=10,
+            reason="coverage_switch_to_shape",
+            confidence=0.70,
+        )
+
+        results = [
+            solver._observe_pending_switch(
+                ctx, player_pos=(6, 6), player_color=10, shapes=[[(42, 42)]], gs=3,
+            )
+            for _ in range(6)
+        ]
+
+        self.assertEqual(sum(r[1] is not None for r in results), 1)
+        self.assertFalse(solver._switch_pending)
+        self.assertEqual(solver._active_stage_index, -1)
+
+    def test_select_best_horizontal_mirror_plan_prefers_max_coverage(self) -> None:
+        mirror_info = {"horizontal": True, "axis_py": 31}
+
+        def fake_joint(
+            _shapes: Any,
+            _goals: Any,
+            row_mirror_info: dict[str, Any],
+            _width: int,
+            _height: int,
+            *,
+            forbidden_cells: set[tuple[int, int]],
+            gs: int,
+        ) -> list[dict[str, Any]]:
+            row = row_mirror_info["axis_py"] // gs
+            coverage = {
+                7: [(1, 1), (2, 2), (3, 3)],
+                8: [(1, 1), (2, 2)],
+                9: [(1, 1)],
+            }.get(row, [])
+            return [{"target_anchor": [10, 10], "covered_goals": coverage}]
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.find_joint_best_placement",
+            side_effect=fake_joint,
+        ):
+            row, targets = select_best_horizontal_mirror_plan(
+                shapes=[[(0, 0)]],
+                goal_cells=[(1, 1), (2, 2), (3, 3)],
+                mirror_info=mirror_info,
+                board_width=63,
+                board_height=63,
+                current_mirror_row=8,
+                base_forbidden=set(),
+                gs=3,
+                candidate_rows={7, 8, 9},
+            )
+
+        self.assertEqual(row, 7)
+        self.assertEqual(len(targets[0]["covered_goals"]), 3)
+
+    def test_select_best_horizontal_mirror_plan_tiebreaks_by_distance(self) -> None:
+        mirror_info = {"horizontal": True, "axis_py": 31}
+
+        def fake_joint(
+            _shapes: Any,
+            _goals: Any,
+            row_mirror_info: dict[str, Any],
+            _width: int,
+            _height: int,
+            *,
+            forbidden_cells: set[tuple[int, int]],
+            gs: int,
+        ) -> list[dict[str, Any]]:
+            row = row_mirror_info["axis_py"] // gs
+            coverage = [(1, 1), (2, 2)] if row in {6, 8} else [(1, 1)]
+            return [{"target_anchor": [10, 10], "covered_goals": coverage}]
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.find_joint_best_placement",
+            side_effect=fake_joint,
+        ):
+            row, _ = select_best_horizontal_mirror_plan(
+                shapes=[[(0, 0)]],
+                goal_cells=[(1, 1), (2, 2)],
+                mirror_info=mirror_info,
+                board_width=63,
+                board_height=63,
+                current_mirror_row=7,
+                base_forbidden=set(),
+                gs=3,
+                candidate_rows={6, 8},
+            )
+
+        self.assertEqual(row, 6)
+
+    def test_targets_with_retry_offset_does_not_mutate_cached_targets(self) -> None:
+        solver = BeamCoverageSolver()
+        solver._retry_count = 1
+        gm = game_ar25_level3()
+        cached_targets = [{
+            "target_anchor": [10, 10],
+            "target_bbox": [9, 9, 11, 11],
+            "covered_goals": [(1, 1)],
+        }]
+
+        shifted_targets = solver._targets_with_retry_offset(cached_targets, gm, 3)
+
+        self.assertEqual(cached_targets[0]["target_anchor"], [10, 10])
+        self.assertEqual(cached_targets[0]["target_bbox"], [9, 9, 11, 11])
+        self.assertNotEqual(shifted_targets[0]["target_anchor"], [10, 10])
+
+    def test_mirror_phase_stall_marks_target_unreachable_and_falls_through(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        solver._last_levels_completed = 2
+        solver._last_observed_mirror_gy = 7
+        solver._mirror_stall_steps = 4
+        ctx = SolverContext(game_model=gm, plan_context={"levels_completed": 2})
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._find_mirror_info",
+            return_value={"horizontal": True, "axis_px": 0, "axis_py": gm.player_pos[1]},
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._get_shape_pixels",
+            return_value=[[(0, 0)]],
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.select_best_horizontal_mirror_plan",
+            return_value=(6, [{"target_anchor": [33, 33], "covered_goals": [(1, 1)]}]),
+        ):
+            decision = solver.decide(ctx)
+
+        self.assertIsNotNone(decision)
+        self.assertNotIn("coverage_position_mirror", decision.reason)
+        self.assertIn(6, solver._unreachable_mirror_rows)
+        self.assertGreaterEqual(solver._retry_count, 1)
+
+    def test_cache_key_tracks_mirror_row(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        solver._active_stage_index = 0
+        solver._last_levels_completed = 2
+        ctx = SolverContext(game_model=gm, plan_context={"levels_completed": 2})
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._find_mirror_info",
+            return_value={"horizontal": True, "axis_px": 0, "axis_py": gm.player_pos[1]},
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._get_shape_pixels",
+            return_value=[[(0, 0)]],
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.select_best_horizontal_mirror_plan",
+            return_value=(7, [{"target_anchor": [33, 33], "covered_goals": [(1, 1)]}]),
+        ):
+            solver.decide(ctx)
+
+        first_key = solver._cached_target_key
+        solver._mirror_target_gy = None
+        solver._invalidate_target_cache()
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._find_mirror_info",
+            return_value={"horizontal": True, "axis_px": 0, "axis_py": gm.player_pos[1]},
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._get_shape_pixels",
+            return_value=[[(0, 0)]],
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.select_best_horizontal_mirror_plan",
+            return_value=(6, [{"target_anchor": [30, 30], "covered_goals": [(1, 1)]}]),
+        ):
+            solver.decide(ctx)
+
+        self.assertNotEqual(first_key, solver._cached_target_key)
+        self.assertEqual(solver._cached_target_key, (2, 6, 1))
+
+    def test_should_activate_does_not_reset_on_shape_count_fluctuation(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        ctx = SolverContext(game_model=gm, plan_context={})
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._find_mirror_info",
+            return_value={"horizontal": True, "axis_px": 0, "axis_py": gm.player_pos[1]},
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._get_shape_pixels",
+            side_effect=[[[(0, 0)], [(3, 3)]], [[(0, 0)]]],
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.get_goal_cells",
+            return_value=[(1, 1), (2, 2)],
+        ):
+            self.assertTrue(solver.should_activate(ctx))
+            solver._active_stage_index = 0
+            solver._planned_shape_count = 2
+            self.assertTrue(solver.should_activate(ctx))
+
+        self.assertEqual(solver._active_stage_index, 0)
+        self.assertEqual(solver._planned_shape_count, 2)
+
+    def test_should_activate_keeps_cached_shape_plan_when_shapes_drop_out(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        solver._cached_targets = [{"target_anchor": [33, 33], "covered_goals": [(1, 1)]}]
+        solver._active_stage_index = 0
+        solver._planned_shape_count = 1
+        ctx = SolverContext(game_model=gm, plan_context={})
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._find_mirror_info",
+            return_value={"horizontal": True, "axis_px": 0, "axis_py": gm.player_pos[1]},
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._get_shape_pixels",
+            return_value=[],
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.get_goal_cells",
+            return_value=[(1, 1), (2, 2)],
+        ):
+            self.assertTrue(solver.should_activate(ctx))
+
+    def test_should_activate_keeps_in_progress_plan_when_dynamics_becomes_beam(self) -> None:
+        gm = game_ar25_level3()
+        gm.features.primary_dynamics = "beam"
+        solver = BeamCoverageSolver()
+        solver._active_stage_index = 1
+        solver._planned_shape_count = 2
+        solver._cached_targets = [
+            {"target_anchor": [13, 13], "covered_goals": [(1, 1)]},
+            {"target_anchor": [49, 46], "covered_goals": [(2, 2)]},
+        ]
+        solver._board_sig = (True, 2, 2)
+        ctx = SolverContext(game_model=gm, plan_context={})
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._find_mirror_info",
+            return_value={"horizontal": True, "axis_px": 0, "axis_py": gm.player_pos[1]},
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._get_shape_pixels",
+            return_value=[],
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.get_goal_cells",
+            return_value=[(1, 1), (2, 2), (3, 3)],
+        ):
+            self.assertTrue(solver.should_activate(ctx))
+
+        self.assertEqual(solver._active_stage_index, 1)
+        self.assertIsNotNone(solver._cached_targets)
 
 
 GAMES: dict[str, Callable[[], GameModel]] = {

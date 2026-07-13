@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import Future, wait
+from concurrent.futures import Future
 from typing import Any
 
 from agi_core.multi_agent.agents import (
@@ -10,9 +10,15 @@ from agi_core.multi_agent.agents import (
     InteractionAgent,
     MovementAgent,
     PuzzleAgent,
+    build_frame_snapshot,
     prepare_frame_cache,
 )
 from agi_core.multi_agent.consensus import ConsensusModule
+from agi_core.multi_agent.runtime import (
+    AgentOutcomeUpdate,
+    ProcessMultiAgentExecutor,
+    build_multi_agent_executor,
+)
 from agi_core.multi_agent.strategy_agent import StrategyAgent
 from agi_core.perception.shape_recognition import ensure_shape_recognition
 from agi_core.runtime_sync import ensure_hyperon_context_synced
@@ -69,6 +75,8 @@ class AgentSupervisor(ObjectiveReduction):
         except Exception:
             self._workers = 4
         self._agent_timeout = max(0.5, float(getattr(config, 'planner_parallel_timeout', None) or 2.0))
+        self._executor = build_multi_agent_executor(config, self._agents)
+        self._process_executor = isinstance(self._executor, ProcessMultiAgentExecutor)
         self._agent_health: dict[str, dict[str, float]] = {}
         self._agent_metrics: dict[str, dict[str, float]] = {}
         self._agent_futures: dict[str, tuple[Future, int]] = {}
@@ -103,7 +111,7 @@ class AgentSupervisor(ObjectiveReduction):
         context.cognition_strategy = "multi-agent"
 
         # Log health if any stale tasks remain from previous frame
-        stale_count = ThreadPoolManager.active_worker_count()
+        stale_count = self._executor.active_worker_count()
         if self._workers > 0 and stale_count >= self._workers:
             logger.warning(
                 "AgentSupervisor: pool saturated by %d queued/running tasks (budget=%d)",
@@ -150,9 +158,16 @@ class AgentSupervisor(ObjectiveReduction):
         else:
             self._solver_cooldown -= 1
         if solver_decision is not None:
-            # The solver's decision takes priority over agent proposals.
-            # Return directly without going through agent consensus.
-            return solver_decision
+            solver_proposal = self._solver_decision_as_proposal(solver_decision)
+            if self._proposal_is_legal(context, solver_proposal):
+                if str(solver_decision.source).startswith("solver:"):
+                    self._seed_sticky_shape_target(context, solver_decision)
+                context.memory.note_decision(solver_decision)
+                self._finalize_cognition(context, solver_decision)
+                return solver_decision
+            agent_proposals = dict(agent_proposals)
+            agent_proposals.setdefault("solver", []).append(solver_proposal)
+            participating_agents.add("solver")
 
         selected = self._decide_from_agents(
             context,
@@ -189,7 +204,7 @@ class AgentSupervisor(ObjectiveReduction):
 
         self._health_counter = getattr(self, '_health_counter', 0) + 1
         if self._health_counter >= 100:
-            active = ThreadPoolManager.active_worker_count()
+            active = self._executor.active_worker_count()
             if self._workers > 0 and active >= self._workers:
                 logger.warning("AgentSupervisor: %d active pool tasks (budget=%d)", active, self._workers)
             for aid, h in self._agent_health.items():
@@ -387,6 +402,7 @@ class AgentSupervisor(ObjectiveReduction):
         proposals: dict[str, list[AgentProposal]] = {}
         completed_agents: set[str] = set()
         step_index = int(getattr(context.observation, "step_index", 0) or 0)
+        snapshot = build_frame_snapshot(context)
 
         # Reap work from older frames. Its execution health is useful, but its
         # proposals are stale and must never be applied to the current frame.
@@ -422,10 +438,10 @@ class AgentSupervisor(ObjectiveReduction):
         for agent in agents:
             if agent.agent_id in self._agent_futures:
                 continue
-            future = ThreadPoolManager.submit_unique(
-                f"agent:{agent.agent_id}",
-                agent.produce,
-                context,
+            future = self._executor.submit(
+                agent.agent_id,
+                agent,
+                snapshot,
             )
             if future is None:
                 continue
@@ -435,7 +451,18 @@ class AgentSupervisor(ObjectiveReduction):
         t0 = time.monotonic()
         done: set[Future] = set()
         if current:
-            done, _ = wait(set(current.values()), timeout=self._agent_timeout)
+            deadline = time.monotonic() + self._agent_timeout
+            while True:
+                done = {
+                    future
+                    for future in current.values()
+                    if future.done()
+                }
+                if len(done) >= len(current):
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.001)
         elapsed = time.monotonic() - t0
         self._record_agent_metric("supervisor", "exec_time_ms", elapsed * 1000)
 
@@ -538,14 +565,14 @@ class AgentSupervisor(ObjectiveReduction):
 
     def reset_agents(self) -> None:
         """Reset all agents, consensus stats, circuit breakers, and metrics for a new game."""
-        for agent in self._agents:
-            agent.reset()
+        self._executor.reset()
+        if not self._process_executor:
+            for agent in self._agents:
+                agent.reset()
         self._consensus._agent_stats.clear()
         self._agent_health.clear()
         self._agent_metrics.clear()
-        for agent_id, (future, _) in list(self._agent_futures.items()):
-            if future.done() or future.cancel():
-                self._agent_futures.pop(agent_id, None)
+        self._agent_futures.clear()
         self._mirror_solver = None
         self._solver_selector = None
         self._solver_stall_count = 0
@@ -619,15 +646,26 @@ class AgentSupervisor(ObjectiveReduction):
             outcome = str(transition.local_outcome or "unknown")
             if matches and outcome in {"progress", "advanced", "failed", "stalled"}:
                 agent_id = str(pending["agent_id"])
-                agent = self._agent_map.get(agent_id)
                 success = outcome in {"progress", "advanced"}
-                if agent is not None:
+                agent = self._agent_map.get(agent_id)
+                if agent is not None and not self._process_executor:
                     agent.apply_cognition(
                         str(pending["action_name"]),
                         "progress" if success else outcome,
                         pending.get("subgoal"),
                     )
                     agent.note_outcome(success)
+                if agent is not None and self._process_executor:
+                    self._executor.apply_outcome(
+                        agent_id,
+                        AgentOutcomeUpdate(
+                            action_name=str(pending["action_name"]),
+                            outcome="progress" if success else outcome,
+                            subgoal=pending.get("subgoal"),
+                            success=success,
+                        ),
+                    )
+                if agent is not None:
                     self._consensus.note_outcome(agent_id, success, None)
                 self._pending_agent_credit = None
             elif transition.boundary is not None:
@@ -639,6 +677,10 @@ class AgentSupervisor(ObjectiveReduction):
         if hasattr(self._executive, "note_transition"):
             self._executive.note_transition(transition)
         if transition.boundary == "level":
+            self._executor.reset()
+            if not self._process_executor:
+                for agent in self._agents:
+                    agent.reset()
             self.reset_level_state()
             self._mirror_solver = None
             self._solver_stall_count = 0

@@ -29,7 +29,11 @@ from agi_core.orch_or.strategies.exploration import exploration_strategy, _mirro
 from agi_core.orch_or.strategies.interaction import interaction_strategy
 from agi_core.orch_or.strategies.movement import movement_strategy
 from agi_core.orch_or.parallel import ThreadPoolManager
-from agi_core.orch_or.orchestrator import ObjectiveReduction
+from agi_core.orch_or.orchestrator import (
+    ObjectiveReduction,
+    _PLAN_KEY,
+    _is_level_transition_jump,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +121,33 @@ class GameModelTests(unittest.TestCase):
 
 
 class BackgroundPrecomputeTests(unittest.TestCase):
+    def test_action5_entity_jump_is_not_a_level_transition(self) -> None:
+        self.assertFalse(_is_level_transition_jump((3, 3), (54, 48), "ACTION5"))
+
+    def test_movement_jump_remains_a_level_transition(self) -> None:
+        self.assertTrue(_is_level_transition_jump((3, 3), (54, 48), "ACTION4"))
+
+    def test_solver_switch_clears_controller_specific_monitor_state(self) -> None:
+        orchestrator = ObjectiveReduction(
+            executive=SimpleNamespace(),
+            config=SimpleNamespace(),
+        )
+        orchestrator._failed_directions = {"left", "up"}
+        orchestrator._pending_failed_dir = "left"
+        orchestrator._active_plan = Plan(objective_id="stale", steps=[])
+        orchestrator._regenerate_count = 2
+        context = SimpleNamespace(
+            memory_bundle=SimpleNamespace(working_memory={_PLAN_KEY: {"stale": True}}),
+        )
+
+        orchestrator._reset_controller_state_after_solver_switch(context)
+
+        self.assertEqual(orchestrator._failed_directions, set())
+        self.assertIsNone(orchestrator._pending_failed_dir)
+        self.assertIsNone(orchestrator._active_plan)
+        self.assertEqual(orchestrator._regenerate_count, 0)
+        self.assertEqual(context.memory_bundle.working_memory, {})
+
     def test_background_precompute_uses_thread_pool_for_small_search_spaces(self) -> None:
         orchestrator = ObjectiveReduction(
             executive=SimpleNamespace(),

@@ -2,16 +2,55 @@ from __future__ import annotations
 
 from typing import Any
 
+from agi_core.multi_agent.payload import AgentFrameSnapshot, sanitize_payload
 from agi_core.multi_agent.strategy_agent import StrategyAgent
 from agi_core.perception.shape_recognition import ensure_shape_recognition
 from agi_core.types import ExecutiveContext
 
-def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
+AgentFrameInput = ExecutiveContext | AgentFrameSnapshot
+
+
+def _frame_cache(frame: AgentFrameInput) -> dict[str, Any]:
+    if isinstance(frame, AgentFrameSnapshot):
+        return frame.frame_cache
+    return frame.multi_agent_frame_cache
+
+
+def _derived_features(frame: AgentFrameInput) -> dict[str, Any]:
+    if isinstance(frame, AgentFrameSnapshot):
+        return frame.derived_features
+    return getattr(frame.observation, "derived_features", {}) or {}
+
+
+def _normalize_single_stage_vertical_target(
+    mirror_puzzle: dict[str, Any],
+    goals: list[tuple[int, int]],
+    width: int,
+    height: int,
+) -> tuple[int, int] | None:
+    if not isinstance(mirror_puzzle, dict) or mirror_puzzle.get("orientation") != "vertical":
+        return None
+    stage_targets = mirror_puzzle.get("stage_targets", [])
+    if not isinstance(stage_targets, list) or len(stage_targets) != 1:
+        return None
+    axis = mirror_puzzle.get("axis_pixel")
+    if not isinstance(axis, int) or not goals:
+        return None
+    goal_xs = [int(goal[0]) for goal in goals]
+    goal_ys = [int(goal[1]) for goal in goals]
+    target_x = max(0, min(int(width) - 1, 2 * int(axis) - max(goal_xs)))
+    target_y = max(0, min(int(height) - 1, min(goal_ys)))
+    return (target_x, target_y)
+
+
+def prepare_frame_cache(context: AgentFrameInput) -> dict[str, Any]:
     """Precompute shared per-frame agent features once per observation."""
-    cache = context.multi_agent_frame_cache
+    cache = _frame_cache(context)
     # Other frame-scoped systems (notably Hyperon synchronization) may seed
     # this dictionary before the strategy-agent fields are prepared.
     if "legal_set" in cache and "legal_actions" in cache:
+        return cache
+    if isinstance(context, AgentFrameSnapshot):
         return cache
     observation = context.observation
     legal_actions = tuple(getattr(observation, "legal_actions", ()) or ())
@@ -36,6 +75,14 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
             for cluster in shape_recognition.get("goal_clusters", [])
             if cluster.get("center")
         ]
+    normalized_target = _normalize_single_stage_vertical_target(
+        mirror_puzzle,
+        goals,
+        getattr(observation, "image_input", None).width if not isinstance(context, AgentFrameSnapshot) and getattr(observation, "image_input", None) is not None else 64,
+        getattr(observation, "image_input", None).height if not isinstance(context, AgentFrameSnapshot) and getattr(observation, "image_input", None) is not None else 64,
+    )
+    if normalized_target is not None:
+        active_target = normalized_target
     goal_direction = None
     target_for_direction = active_target
     if player is not None and target_for_direction is not None:
@@ -98,27 +145,39 @@ def prepare_frame_cache(context: ExecutiveContext) -> dict[str, Any]:
     return cache
 
 
-def _has_beam(context: ExecutiveContext) -> bool:
+def build_frame_snapshot(context: ExecutiveContext) -> AgentFrameSnapshot:
+    cache = dict(prepare_frame_cache(context))
+    return AgentFrameSnapshot(
+        game_id=str(getattr(context.observation, "game_id", "") or ""),
+        step_index=int(getattr(context.observation, "step_index", 0) or 0),
+        levels_completed=int(getattr(context.observation, "levels_completed", 0) or 0),
+        legal_actions=tuple(getattr(context.observation, "legal_actions", ()) or ()),
+        derived_features=sanitize_payload(_derived_features(context)),
+        frame_cache=sanitize_payload(cache),
+    )
+
+
+def _has_beam(context: AgentFrameInput) -> bool:
     """Check if the current board has beam (color 4)."""
     return bool(prepare_frame_cache(context).get("has_beam"))
 
 
-def _has_uncertain_beam(context: ExecutiveContext) -> bool:
+def _has_uncertain_beam(context: AgentFrameInput) -> bool:
     """Check for visible beam evidence when analyzer confirmation failed."""
     return bool(prepare_frame_cache(context).get("beam_evidence_uncertain"))
 
 
-def _has_mirror(context: ExecutiveContext) -> bool:
+def _has_mirror(context: AgentFrameInput) -> bool:
     """Check if the board has mirror cells (color 10)."""
     return bool(prepare_frame_cache(context).get("has_mirror"))
 
 
-def _goal_direction(context: ExecutiveContext) -> str | None:
+def _goal_direction(context: AgentFrameInput) -> str | None:
     """Return a heuristic direction toward goals, or None."""
     return prepare_frame_cache(context).get("goal_direction")
 
 
-def _target_metadata(context: ExecutiveContext) -> dict[str, Any]:
+def _target_metadata(context: AgentFrameInput) -> dict[str, Any]:
     cache = prepare_frame_cache(context)
     target = cache.get("active_shape_target")
     if target is None:
@@ -131,12 +190,12 @@ def _target_metadata(context: ExecutiveContext) -> dict[str, Any]:
     }
 
 
-def _ordered_mirror_actions(context: ExecutiveContext) -> list[str]:
+def _ordered_mirror_actions(context: AgentFrameInput) -> list[str]:
     cache = prepare_frame_cache(context)
     legal = cache["legal_set"]
     ordered: list[str] = []
     target = cache.get("active_shape_target")
-    player = getattr(context.observation, "derived_features", {}).get("player_position")
+    player = _derived_features(context).get("player_position")
     if cache.get("ready_to_switch") and "ACTION5" in legal:
         ordered.append("ACTION5")
     if (

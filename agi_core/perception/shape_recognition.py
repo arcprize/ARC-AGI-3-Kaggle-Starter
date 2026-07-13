@@ -555,6 +555,7 @@ def _build_mirror_puzzle(
             "active_stage": 0,
             "recommended_switch_order": [],
             "stage_targets": [],
+            "goal_cells": [[x, y] for x, y in sorted(goal_cells or set())],
             "goal_cluster_count": len(goal_cluster_map),
             "shape_entity_count": len(ordered_shapes),
         }
@@ -574,6 +575,7 @@ def _build_mirror_puzzle(
         "active_stage": active_stage,
         "recommended_switch_order": recommended_order,
         "stage_targets": stage_targets,
+        "goal_cells": [[x, y] for x, y in sorted(goal_cells or [])],
         "goal_cluster_count": len(goal_cluster_map),
         "shape_entity_count": len(ordered_shapes),
     }

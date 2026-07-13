@@ -27,6 +27,61 @@ from agi_core.types import (
 )
 
 
+class FastProcessTestAgent(StrategyAgent):
+    def __init__(self) -> None:
+        super().__init__(agent_id="fast")
+
+    def produce(self, context) -> list[AgentProposal]:
+        return [
+            self._make_proposal(
+                action_name="ACTION1",
+                confidence=0.9,
+                reason="fast",
+                subgoal="navigate",
+            )
+        ]
+
+
+class SlowProcessTestAgent(StrategyAgent):
+    def __init__(self) -> None:
+        super().__init__(agent_id="slow")
+
+    def produce(self, context) -> list[AgentProposal]:
+        time.sleep(0.3)
+        return [
+            self._make_proposal(
+                action_name="ACTION2",
+                confidence=0.6,
+                reason="slow",
+                subgoal="navigate",
+            )
+        ]
+
+
+class OutcomeAwareProcessAgent(StrategyAgent):
+    def __init__(self) -> None:
+        super().__init__(agent_id="stateful")
+
+    def produce(self, context) -> list[AgentProposal]:
+        action_name = "ACTION2" if self._success_count else "ACTION1"
+        return [
+            self._make_proposal(
+                action_name=action_name,
+                confidence=0.75,
+                reason=f"state:{self._success_count}",
+                subgoal="navigate",
+            )
+        ]
+
+
+class FailingProcessAgent(StrategyAgent):
+    def __init__(self) -> None:
+        super().__init__(agent_id="failing")
+
+    def produce(self, context) -> list[AgentProposal]:
+        raise RuntimeError("boom")
+
+
 class TestMultiAgent(unittest.TestCase):
 
     def test_movement_agent_produces_proposals(self):
@@ -123,6 +178,8 @@ class TestMultiAgent(unittest.TestCase):
 
     def test_supervisor_creates_agents(self):
         config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_executor = "process"
+        config.cuda_enabled = False
         executive = MagicMock()
         sup = AgentSupervisor(executive=executive, config=config)
         self.assertEqual(len(sup._agents), 4)
@@ -130,10 +187,13 @@ class TestMultiAgent(unittest.TestCase):
         self.assertIn("exploration", sup._agent_map)
         self.assertIn("interaction", sup._agent_map)
         self.assertIn("puzzle", sup._agent_map)
+        self.assertTrue(sup._process_executor)
 
     def test_supervisor_preserves_bootstrapped_thread_pool_worker_budget(self):
         config = MagicMock(spec=RuntimeConfig)
         config.multi_agent_workers = 6
+        config.multi_agent_executor = "thread"
+        config.cuda_enabled = False
         executive = MagicMock()
         with patch("agi_core.multi_agent.supervisor.ThreadPoolManager.set_max_workers") as set_workers:
             supervisor = AgentSupervisor(executive=executive, config=config)
@@ -148,6 +208,7 @@ class TestMultiAgent(unittest.TestCase):
         config = MagicMock(spec=RuntimeConfig)
         config.multi_agent_workers = 2
         config.planner_parallel_timeout = 0.01
+        config.multi_agent_executor = "thread"
         config.cuda_enabled = False
         executive = MagicMock()
         fast_agent = MagicMock()
@@ -209,6 +270,7 @@ class TestMultiAgent(unittest.TestCase):
         config = MagicMock(spec=RuntimeConfig)
         config.multi_agent_workers = 2
         config.planner_parallel_timeout = None
+        config.multi_agent_executor = "thread"
         config.cuda_enabled = False
         agent = MagicMock()
         agent.agent_id = "idle"
@@ -231,6 +293,7 @@ class TestMultiAgent(unittest.TestCase):
         config = MagicMock(spec=RuntimeConfig)
         config.multi_agent_workers = 2
         config.planner_parallel_timeout = None
+        config.multi_agent_executor = "thread"
         config.cuda_enabled = False
         release = threading.Event()
         agent = MagicMock()
@@ -258,6 +321,191 @@ class TestMultiAgent(unittest.TestCase):
             pending = supervisor._agent_futures.get("slow")
             if pending is not None:
                 pending[0].result(timeout=1.0)
+
+    def test_process_executor_partial_results_without_serial_rerun(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = 0.2
+        config.multi_agent_executor = "process"
+        config.cuda_enabled = False
+        supervisor = AgentSupervisor(
+            executive=MagicMock(),
+            config=config,
+            agents=[FastProcessTestAgent(), SlowProcessTestAgent()],
+        )
+        supervisor._agent_timeout = 0.2
+
+        t0 = time.monotonic()
+        proposals = supervisor._run_agents(
+            supervisor._agents,
+            self._mock_context(legal=["ACTION1", "ACTION2"]),
+        )
+        elapsed = time.monotonic() - t0
+
+        self.assertIn("fast", proposals)
+        self.assertNotIn("slow", proposals)
+        self.assertLess(elapsed, 0.3)
+
+    def test_process_executor_does_not_duplicate_in_flight_agent(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 1
+        config.planner_parallel_timeout = 0.05
+        config.multi_agent_executor = "process"
+        config.cuda_enabled = False
+        supervisor = AgentSupervisor(
+            executive=MagicMock(),
+            config=config,
+            agents=[SlowProcessTestAgent()],
+        )
+        supervisor._agent_timeout = 0.05
+        context = self._mock_context(legal=["ACTION2"])
+
+        self.assertEqual(supervisor._run_agents(supervisor._agents, context), {})
+        self.assertEqual(supervisor._executor.active_worker_count(), 1)
+        self.assertEqual(supervisor._run_agents(supervisor._agents, context), {})
+        self.assertEqual(supervisor._executor.active_worker_count(), 1)
+
+    def test_process_executor_reaps_stale_completion_without_reusing_proposal(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 1
+        config.planner_parallel_timeout = 0.05
+        config.multi_agent_executor = "process"
+        config.cuda_enabled = False
+        supervisor = AgentSupervisor(
+            executive=MagicMock(),
+            config=config,
+            agents=[SlowProcessTestAgent()],
+        )
+        supervisor._agent_timeout = 0.05
+        context = self._mock_context(legal=["ACTION2"])
+
+        self.assertEqual(supervisor._run_agents(supervisor._agents, context), {})
+        time.sleep(0.45)
+        self.assertEqual(supervisor._run_agents(supervisor._agents, context), {})
+        self.assertGreater(
+            supervisor._agent_metrics["slow"]["proposal_count"],
+            0.0,
+        )
+
+    def test_process_executor_outcome_feedback_updates_worker_owned_cognition(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 1
+        config.planner_parallel_timeout = 0.1
+        config.multi_agent_executor = "process"
+        config.cuda_enabled = False
+        supervisor = AgentSupervisor(
+            executive=MagicMock(),
+            config=config,
+            agents=[OutcomeAwareProcessAgent()],
+        )
+        context = self._mock_context(legal=["ACTION1", "ACTION2"])
+
+        initial = supervisor._run_agents(supervisor._agents, context)
+        self.assertEqual(initial["stateful"][0].action_name, "ACTION1")
+        supervisor._pending_agent_credit = {
+            "game_id": "ls20",
+            "agent_id": "stateful",
+            "action_name": "ACTION1",
+            "source": "agent-stateful",
+            "subgoal": "navigate",
+        }
+        supervisor.note_transition(
+            ObservedTransition(
+                game_id="ls20",
+                action_name="ACTION1",
+                decision_source="agent-stateful",
+                local_outcome="progress",
+            )
+        )
+        updated = supervisor._run_agents(supervisor._agents, context)
+        self.assertEqual(updated["stateful"][0].action_name, "ACTION2")
+
+    def test_process_executor_level_reset_clears_worker_cognition(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 1
+        config.planner_parallel_timeout = 0.1
+        config.multi_agent_executor = "process"
+        config.cuda_enabled = False
+        supervisor = AgentSupervisor(
+            executive=MagicMock(),
+            config=config,
+            agents=[OutcomeAwareProcessAgent()],
+        )
+        context = self._mock_context(legal=["ACTION1", "ACTION2"])
+        supervisor._pending_agent_credit = {
+            "game_id": "ls20",
+            "agent_id": "stateful",
+            "action_name": "ACTION1",
+            "source": "agent-stateful",
+            "subgoal": "navigate",
+        }
+        supervisor.note_transition(
+            ObservedTransition(
+                game_id="ls20",
+                action_name="ACTION1",
+                decision_source="agent-stateful",
+                local_outcome="progress",
+            )
+        )
+        progressed = supervisor._run_agents(supervisor._agents, context)
+        self.assertEqual(progressed["stateful"][0].action_name, "ACTION2")
+        supervisor.note_transition(ObservedTransition(game_id="ls20", boundary="level"))
+        reset = supervisor._run_agents(supervisor._agents, context)
+        self.assertEqual(reset["stateful"][0].action_name, "ACTION1")
+
+    def test_process_executor_failures_degrade_without_crashing(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 1
+        config.planner_parallel_timeout = 0.1
+        config.multi_agent_executor = "process"
+        config.cuda_enabled = False
+        supervisor = AgentSupervisor(
+            executive=MagicMock(),
+            config=config,
+            agents=[FailingProcessAgent()],
+        )
+
+        proposals = supervisor._run_agents(
+            supervisor._agents,
+            self._mock_context(legal=["ACTION1"]),
+        )
+
+        self.assertEqual(proposals, {})
+        self.assertGreaterEqual(
+            supervisor._agent_health["failing"]["consecutive_failures"],
+            1,
+        )
+
+    def test_process_and_thread_modes_produce_equivalent_proposals(self):
+        thread_config = MagicMock(spec=RuntimeConfig)
+        thread_config.multi_agent_workers = 2
+        thread_config.planner_parallel_timeout = 0.1
+        thread_config.multi_agent_executor = "thread"
+        thread_config.cuda_enabled = False
+        process_config = MagicMock(spec=RuntimeConfig)
+        process_config.multi_agent_workers = 2
+        process_config.planner_parallel_timeout = 0.1
+        process_config.multi_agent_executor = "process"
+        process_config.cuda_enabled = False
+        context = self._mock_context(legal=["ACTION1", "ACTION2"])
+
+        thread_sup = AgentSupervisor(
+            executive=MagicMock(),
+            config=thread_config,
+            agents=[FastProcessTestAgent(), OutcomeAwareProcessAgent()],
+        )
+        process_sup = AgentSupervisor(
+            executive=MagicMock(),
+            config=process_config,
+            agents=[FastProcessTestAgent(), OutcomeAwareProcessAgent()],
+        )
+        thread_props = thread_sup._run_agents(thread_sup._agents, context)
+        process_props = process_sup._run_agents(process_sup._agents, context)
+
+        self.assertEqual(
+            {agent_id: [p.action_name for p in proposals] for agent_id, proposals in thread_props.items()},
+            {agent_id: [p.action_name for p in proposals] for agent_id, proposals in process_props.items()},
+        )
 
     def test_circuit_breaker_allows_half_open_recovery_probe(self):
         config = MagicMock(spec=RuntimeConfig)
@@ -310,6 +558,7 @@ class TestMultiAgent(unittest.TestCase):
         config = MagicMock(spec=RuntimeConfig)
         config.multi_agent_workers = 2
         config.planner_parallel_timeout = None
+        config.multi_agent_executor = "thread"
         config.cuda_enabled = False
         executive = MagicMock()
         overlap_confirmed = threading.Event()
@@ -378,20 +627,17 @@ class TestMultiAgent(unittest.TestCase):
         self.assertEqual(decision.source, "solver:mirror")
         self.assertTrue(overlap_confirmed.is_set())
         for agent in agents:
-            agent.produce.assert_called_once_with(ctx)
+            agent.produce.assert_called_once()
         sup._try_solver_direct.assert_called_once_with(ctx)
-        combined = executive.critic.rescore.call_args.args[1]
-        self.assertEqual(
-            {proposal.source for proposal in combined},
-            {"agent-movement", "agent-exploration", "solver:mirror"},
-        )
-        ctx.hyperon.update_proposals.assert_called_once()
+        executive.critic.rescore.assert_not_called()
+        ctx.hyperon.update_proposals.assert_not_called()
         self.assertEqual(sup._agent_health, {})
 
     def test_illegal_solver_proposal_cannot_bypass_legal_agent(self):
         config = MagicMock(spec=RuntimeConfig)
         config.multi_agent_workers = 2
         config.planner_parallel_timeout = None
+        config.multi_agent_executor = "thread"
         config.cuda_enabled = False
         config.reset_state_names = ("NOT_PLAYED", "GAME_OVER")
         executive = MagicMock()
@@ -448,6 +694,8 @@ class TestMultiAgent(unittest.TestCase):
 
     def test_finalize_cognition_defers_credit_until_observed_transition(self):
         config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_executor = "thread"
+        config.cuda_enabled = False
         executive = MagicMock()
         sup = AgentSupervisor(executive=executive, config=config)
         decision = ActionDecision(
@@ -894,6 +1142,32 @@ class TestMultiAgent(unittest.TestCase):
         self.assertTrue(cache["mirror_puzzle_active"])
         self.assertEqual(cache["active_shape_target"], (7, 3))
         self.assertFalse(cache["shape_agent_mode"])
+
+    def test_prepare_frame_cache_normalizes_single_stage_vertical_target(self):
+        ctx = self._mock_context(
+            legal=["ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"],
+            derived_features={
+                "player_position": (8, 42),
+                "goal_positions": [(52, 46), (58, 52), (55, 49)],
+                "shape_recognition": {
+                    "version": 2,
+                    "active_anchor": [8, 42],
+                    "mirror": {"present": True},
+                    "goal_clusters": [{"center": [55, 49]}],
+                    "mirror_puzzle": {
+                        "active": True,
+                        "orientation": "vertical",
+                        "axis_pixel": 31,
+                        "active_stage": 1,
+                        "stage_targets": [{"target_anchor": [10, 46]}],
+                    },
+                },
+            },
+        )
+
+        cache = prepare_frame_cache(ctx)
+
+        self.assertEqual(cache["active_shape_target"], (4, 46))
 
     def test_prepare_frame_cache_enables_shape_agent_mode_after_level_two(self):
         ctx = self._mock_context(

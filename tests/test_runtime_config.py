@@ -18,7 +18,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.openai_api_key_env, "OPENAI_API_KEY")
         self.assertIsNone(config.openai_base_url)
         self.assertIsNone(config.openai_timeout_seconds)
-        self.assertTrue(config.multi_agent_enabled)
+        self.assertFalse(config.multi_agent_enabled)
         self.assertFalse(config.gameplay_disk_io_enabled)
         self.assertIsNone(config.gameplay_memory_db_path())
         self.assertIsNone(config.gameplay_archive_memory_db_path())

@@ -43,7 +43,7 @@ def _resolve_parallel_thread_workers(config: RuntimeConfig) -> int:
         multi_agent_workers = int(getattr(config, "multi_agent_workers", 0) or 0)
     except Exception:
         multi_agent_workers = 0
-    if not getattr(config, "multi_agent_enabled", True):
+    if not getattr(config, "multi_agent_enabled", False):
         return planner_workers
     return max(planner_workers, multi_agent_workers)
 

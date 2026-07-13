@@ -160,6 +160,31 @@ def _plan_stage_target(
     return _artifact_stage_target(plan_context.get("shape_recognition"), switch_count)
 
 
+def _plan_stage_target_metadata(
+    plan_context: dict[str, Any] | None,
+    switch_count: int,
+) -> dict[str, Any] | None:
+    if not isinstance(plan_context, dict):
+        return None
+    stage_targets = plan_context.get("shape_stage_targets")
+    if isinstance(stage_targets, list) and stage_targets:
+        stage_index = min(max(switch_count - 1, 0), len(stage_targets) - 1)
+        stage_target = stage_targets[stage_index]
+        return stage_target if isinstance(stage_target, dict) else None
+    artifact = plan_context.get("shape_recognition")
+    if not isinstance(artifact, dict):
+        return None
+    mirror_puzzle = artifact.get("mirror_puzzle", {})
+    if not isinstance(mirror_puzzle, dict):
+        return None
+    stage_targets = mirror_puzzle.get("stage_targets", [])
+    if not isinstance(stage_targets, list) or not stage_targets:
+        return None
+    stage_index = min(max(switch_count - 1, 0), len(stage_targets) - 1)
+    stage_target = stage_targets[stage_index]
+    return stage_target if isinstance(stage_target, dict) else None
+
+
 class MirrorSolver(DynamicsSolver):
     """Solver for mirror reflection puzzles (color-10 mirror, no beam).
 
@@ -504,8 +529,20 @@ class MirrorSolver(DynamicsSolver):
         else:
             max_switches_override = 0
             artifact_target = _plan_stage_target(ctx.plan_context, self._switch_count)
+            stage_target_meta = _plan_stage_target_metadata(
+                ctx.plan_context,
+                self._switch_count,
+            )
+            trust_single_stage_target = bool(
+                isinstance(stage_target_meta, dict)
+                and (
+                    stage_target_meta.get("target_bbox") is not None
+                    or stage_target_meta.get("reflected_coverage") is not None
+                    or int(stage_target_meta.get("fresh_hits", 0) or 0) > 0
+                )
+            )
             if artifact_target is not None and (
-                max(0, len(shape_comps or [])) > 0 or artifact_target[1] > 1
+                artifact_target[1] > 1 or trust_single_stage_target
             ):
                 (target_px, target_py), max_switches_override = artifact_target
             else:

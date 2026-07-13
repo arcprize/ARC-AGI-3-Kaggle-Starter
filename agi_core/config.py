@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 DEFAULT_RESET_STATE_NAMES = ("NOT_PLAYED", "GAME_OVER")
 DEFAULT_WIN_STATE_NAME = "WIN"
@@ -66,7 +67,8 @@ class RuntimeConfig:
     planner_parallel: bool = True
     planner_workers: int = 0  # 0 = auto: thread pool = min(4, cpu), process pool = min(8, cpu)
     planner_parallel_timeout: float | None = None
-    multi_agent_enabled: bool = True
+    multi_agent_enabled: bool = False
+    multi_agent_executor: Literal["process", "thread"] = "process"
     multi_agent_workers: int = 4
     gameplay_disk_io_enabled: bool = False
     cuda_enabled: bool = True
@@ -149,6 +151,13 @@ class RuntimeConfig:
             "models/executive.gguf",
         )
         openai_timeout = env.get("AGI_OPENAI_TIMEOUT_SECONDS")
+        multi_agent_executor = (
+            env.get("AGI_MULTI_AGENT_EXECUTOR", "process").strip().lower() or "process"
+        )
+        if multi_agent_executor not in {"process", "thread"}:
+            raise ValueError(
+                f"unsupported AGI_MULTI_AGENT_EXECUTOR: {multi_agent_executor}"
+            )
         return cls(
             project_root=root,
             hyperon_rules_path=_resolve_path(
@@ -219,8 +228,9 @@ class RuntimeConfig:
                 if env.get("AGI_PLANNER_PARALLEL_TIMEOUT", "").strip()
                 else None
             ),
-            multi_agent_enabled=env.get("AGI_MULTI_AGENT_ENABLE", "1").strip().lower()
+            multi_agent_enabled=env.get("AGI_MULTI_AGENT_ENABLE", "0").strip().lower()
             in {"1", "true", "yes", "on"},
+            multi_agent_executor=multi_agent_executor,
             multi_agent_workers=int(env.get("AGI_MULTI_AGENT_WORKERS", "4")),
             gameplay_disk_io_enabled=env.get("AGI_GAMEPLAY_DISK_IO", "0").strip().lower()
             in {"1", "true", "yes", "on"},
