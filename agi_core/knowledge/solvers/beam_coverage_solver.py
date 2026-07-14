@@ -1225,6 +1225,22 @@ class BeamCoverageSolver(DynamicsSolver):
             (int(target[1]) // gs) * gs + (gs // 2),
         )
 
+    def _pending_stage_target_anchor(self) -> list[int] | None:
+        if (
+            self._pending_stage_index is None
+            or not self._cached_targets
+            or self._pending_stage_index < 0
+            or self._pending_stage_index >= len(self._cached_targets)
+        ):
+            return None
+        stage = self._cached_targets[self._pending_stage_index]
+        if not isinstance(stage, dict):
+            return None
+        target = stage.get("target_anchor")
+        if not isinstance(target, (list, tuple)) or len(target) != 2:
+            return None
+        return [int(target[0]), int(target[1])]
+
     def _horizontal_final_stage_covered(
         self,
         *,
@@ -1449,7 +1465,10 @@ class BeamCoverageSolver(DynamicsSolver):
             "solver:beam-coverage",
             confidence,
             reason=reason,
-            metadata=self._decision_metadata(pending_shape_stage=next_stage),
+            metadata=self._decision_metadata(
+                pending_shape_stage=next_stage,
+                pending_shape_target=self._pending_stage_target_anchor(),
+            ),
         )
 
     def _observe_pending_switch(

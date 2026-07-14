@@ -34,6 +34,23 @@ from agi_core.orch_or.orchestrator import (
     _PLAN_KEY,
     _is_level_transition_jump,
 )
+from agi_core.types import ActionDecision
+
+
+class _FrameCacheMirrorSolver:
+    dynamics = "mirror"
+
+    def __init__(self, *, active_attempt: bool = False) -> None:
+        self.seen_context = None
+        self.has_active_attempt = active_attempt
+
+    def should_activate(self, ctx) -> bool:
+        self.seen_context = ctx
+        stage_targets = ctx.plan_context.get("shape_stage_targets", [])
+        return bool(stage_targets)
+
+    def decide(self, ctx):
+        return ActionDecision("ACTION4", "solver:mirror", 0.82, "frame-cache handoff")
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +263,193 @@ class BackgroundPrecomputeTests(unittest.TestCase):
         self.assertIsNone(orchestrator._active_plan)
         self.assertIsNone(orchestrator._stable_goal)
         self.assertNotIn(_PLAN_KEY, context.memory_bundle.working_memory)
+
+    def test_try_solver_system_uses_sticky_shape_target_for_post_switch_mirror_handoff(self) -> None:
+        orchestrator = ObjectiveReduction(
+            executive=SimpleNamespace(),
+            config=SimpleNamespace(),
+        )
+        solver = _FrameCacheMirrorSolver()
+        selector = SimpleNamespace(
+            select_solver=lambda *_args, **_kwargs: solver,
+            build_solver_context=lambda game_model, plan_context, _context: SimpleNamespace(
+                game_model=game_model,
+                plan_context=plan_context,
+                episode={},
+                memory={},
+            ),
+            record_outcome=lambda *_args, **_kwargs: None,
+        )
+        orchestrator._solver_selector = selector
+        orchestrator._sticky_shape_target = {
+            "levels_completed": 4,
+            "target": (13, 40),
+            "stage": 1,
+            "stage_targets": [{"switch_stage": 1, "target_anchor": [13, 40]}],
+        }
+        gm = GameModel(
+            board=[[9, 10, 9], [9, 9, 9], [9, 11, 9]],
+            height=3,
+            width=3,
+            player_pos=(0, 1),
+            goal_positions=[(1, 2)],
+            obstacles=[],
+            components=[
+                Component(
+                    cells=((1, 0),),
+                    bbox=(1, 0, 1, 0),
+                    size=1,
+                    dominant_color=10,
+                    touches_border=True,
+                ),
+            ],
+            walkable={(0, 1), (1, 1), (1, 2)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=True,
+                board_type="puzzle",
+                primary_dynamics="puzzle",
+                has_beam=False,
+            ),
+        )
+        context = SimpleNamespace(
+            observation=SimpleNamespace(
+                image_input=None,
+                derived_features={
+                    "shape_recognition": {
+                        "version": 2,
+                        "mirror": {"present": True},
+                        "mirror_puzzle": {"active": False, "stage_targets": []},
+                    }
+                },
+                levels_completed=4,
+                last_action="ACTION5",
+            ),
+            memory_bundle=SimpleNamespace(
+                abstract_memories=[],
+                working_memory={},
+            ),
+            hyperon=SimpleNamespace(facts={}),
+            config=SimpleNamespace(memory_db_path=None),
+            multi_agent_frame_cache={},
+        )
+
+        decision, pctx = orchestrator._try_solver_system(context, gm)
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.source, "solver:mirror")
+        self.assertEqual(pctx["active_shape_target"], (13, 40))
+        self.assertTrue(pctx["mirror_puzzle_active"])
+        self.assertEqual(pctx["shape_stage_targets"][0]["target_anchor"], [13, 40])
+
+    def test_solver_action5_seeds_sticky_shape_target_from_pending_metadata(self) -> None:
+        orchestrator = ObjectiveReduction(
+            executive=SimpleNamespace(),
+            config=SimpleNamespace(),
+        )
+        context = SimpleNamespace(observation=SimpleNamespace(levels_completed=4))
+        decision = ActionDecision(
+            "ACTION5",
+            "solver:beam-coverage",
+            0.68,
+            "coverage_switch_next",
+            metadata={
+                "pending_shape_stage": 1,
+                "pending_shape_target": [13, 40],
+            },
+        )
+
+        orchestrator._seed_sticky_shape_target(context, decision, {})
+
+        self.assertEqual(
+            orchestrator._sticky_shape_target,
+            {
+                "levels_completed": 4,
+                "target": (13, 40),
+                "stage": 1,
+                "stage_targets": [{"switch_stage": 1, "target_anchor": [13, 40]}],
+            },
+        )
+
+    def test_try_solver_system_keeps_sticky_shape_target_during_retained_mirror_attempt(self) -> None:
+        orchestrator = ObjectiveReduction(
+            executive=SimpleNamespace(),
+            config=SimpleNamespace(),
+        )
+        solver = _FrameCacheMirrorSolver(active_attempt=True)
+        selector = SimpleNamespace(
+            active_solver=solver,
+            select_solver=lambda *_args, **_kwargs: solver,
+            build_solver_context=lambda game_model, plan_context, _context: SimpleNamespace(
+                game_model=game_model,
+                plan_context=plan_context,
+                episode={},
+                memory={},
+            ),
+            record_outcome=lambda *_args, **_kwargs: None,
+        )
+        orchestrator._solver_selector = selector
+        orchestrator._sticky_shape_target = {
+            "levels_completed": 4,
+            "target": (13, 40),
+            "stage": 1,
+            "stage_targets": [{"switch_stage": 1, "target_anchor": [13, 40]}],
+        }
+        gm = GameModel(
+            board=[[9, 10, 4], [9, 9, 9], [9, 11, 9]],
+            height=3,
+            width=3,
+            player_pos=(0, 1),
+            goal_positions=[(1, 2)],
+            obstacles=[],
+            components=[
+                Component(
+                    cells=((1, 0),),
+                    bbox=(1, 0, 1, 0),
+                    size=1,
+                    dominant_color=10,
+                    touches_border=True,
+                ),
+            ],
+            walkable={(0, 1), (1, 1), (1, 2)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=True,
+                board_type="beam",
+                primary_dynamics="beam",
+                has_beam=True,
+            ),
+        )
+        context = SimpleNamespace(
+            observation=SimpleNamespace(
+                image_input=None,
+                derived_features={
+                    "shape_recognition": {
+                        "version": 2,
+                        "mirror": {"present": True},
+                        "mirror_puzzle": {"active": False, "stage_targets": []},
+                    }
+                },
+                levels_completed=4,
+                last_action="ACTION1",
+            ),
+            memory_bundle=SimpleNamespace(
+                abstract_memories=[],
+                working_memory={},
+            ),
+            hyperon=SimpleNamespace(facts={}),
+            config=SimpleNamespace(memory_db_path=None),
+            multi_agent_frame_cache={},
+        )
+
+        decision, pctx = orchestrator._try_solver_system(context, gm)
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.source, "solver:mirror")
+        self.assertTrue(pctx["mirror_puzzle_active"])
+        self.assertEqual(pctx["shape_stage_targets"][0]["target_anchor"], [13, 40])
 
     def test_background_precompute_uses_thread_pool_for_small_search_spaces(self) -> None:
         orchestrator = ObjectiveReduction(

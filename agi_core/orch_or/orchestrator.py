@@ -57,6 +57,21 @@ def _gameplay_memory_db_path(config: Any) -> Any:
     return getattr(config, "memory_db_path", None)
 
 
+def _normalize_stage_targets(stage_targets: Any) -> list[dict[str, Any]]:
+    if not isinstance(stage_targets, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw_stage in stage_targets:
+        if not isinstance(raw_stage, dict):
+            continue
+        stage = dict(raw_stage)
+        target = stage.get("target_anchor")
+        if isinstance(target, (list, tuple)) and len(target) == 2:
+            stage["target_anchor"] = [int(target[0]), int(target[1])]
+        normalized.append(stage)
+    return normalized
+
+
 class ObjectiveReduction:
     _MAX_REGENERATE = 3
 
@@ -76,6 +91,7 @@ class ObjectiveReduction:
         self._hyperon_priors: dict[str, float] = {}
         self._goal_history: list[list[tuple[int, int]]] = []
         self._solver_selector = None
+        self._sticky_shape_target: dict[str, Any] | None = None
         self._entity_tracker = EntityTracker()
         self._action_effect_log = ActionEffectLog()
         self._cached_model: GameModel | None = None
@@ -190,6 +206,7 @@ class ObjectiveReduction:
                 self._switch_count = 0
                 self._failed_directions.clear()
                 self._stable_goal = None
+                self._sticky_shape_target = None
                 self._entity_tracker.reset()
                 self._action_effect_log.reset()
                 self._cached_model = None
@@ -204,6 +221,7 @@ class ObjectiveReduction:
             self._switch_count = 0
             self._failed_directions.clear()
             self._stable_goal = None
+            self._sticky_shape_target = None
             self._entity_tracker.reset()
             self._action_effect_log.reset()
             self._cached_model = None
@@ -215,6 +233,7 @@ class ObjectiveReduction:
             if sctx and sctx.get("switch_attempted", 0) > self._switch_count:
                 self._switch_count = sctx["switch_attempted"]
             if solver_decision.action_name == "ACTION5":
+                self._seed_sticky_shape_target(context, solver_decision, sctx or {})
                 # Failed directions and queued plan steps belong to the old
                 # controller; carrying them across an entity switch can block
                 # the new shape's only route to its placement target.
@@ -871,18 +890,95 @@ class ObjectiveReduction:
                     if isinstance(shape_recognition, dict)
                     else {}
                 )
-                pctx["shape_recognition"] = shape_recognition
-                pctx["shape_stage_targets"] = (
-                    list(mirror_puzzle.get("stage_targets", []))
+                frame_cache = getattr(context, "multi_agent_frame_cache", {}) or {}
+                cached_stage_targets = _normalize_stage_targets(
+                    frame_cache.get("shape_stage_targets")
+                )
+                stage_targets = (
+                    cached_stage_targets
+                    if cached_stage_targets
+                    else list(mirror_puzzle.get("stage_targets", []))
                     if isinstance(mirror_puzzle, dict)
                     else []
                 )
+                active_shape_target = frame_cache.get("active_shape_target")
+                active_shape_stage = int(frame_cache.get("active_shape_stage", 0) or 0)
+                mirror_puzzle_active = bool(
+                    frame_cache.get("mirror_puzzle_active")
+                    or (
+                        isinstance(mirror_puzzle, dict)
+                        and mirror_puzzle.get("active")
+                    )
+                )
+                sticky = self._sticky_shape_target
+                active_solver = getattr(self._solver_selector, "active_solver", None)
+                retain_mirror_attempt = bool(
+                    getattr(active_solver, "dynamics", "") == "mirror"
+                    and getattr(active_solver, "has_active_attempt", False)
+                )
+                sticky_valid = (
+                    isinstance(sticky, dict)
+                    and int(sticky.get("levels_completed", -1) or -1)
+                    == int(getattr(context.observation, "levels_completed", 0) or 0)
+                    and (not game_model.features.has_beam or retain_mirror_attempt)
+                    and any(c.dominant_color == 10 for c in game_model.components)
+                )
+                if not stage_targets and sticky_valid:
+                    sticky_targets = _normalize_stage_targets(sticky.get("stage_targets"))
+                    if sticky_targets:
+                        stage_targets = sticky_targets
+                    if active_shape_target is None:
+                        sticky_target = sticky.get("target")
+                        if isinstance(sticky_target, tuple) and len(sticky_target) == 2:
+                            active_shape_target = sticky_target
+                    if active_shape_stage <= 0:
+                        active_shape_stage = max(int(sticky.get("stage", 0) or 0), 0)
+                    if stage_targets or active_shape_target is not None:
+                        mirror_puzzle_active = True
+                if (
+                    not stage_targets
+                    and mirror_puzzle_active
+                    and isinstance(active_shape_target, (list, tuple))
+                    and len(active_shape_target) == 2
+                ):
+                    inferred_stage = 1
+                    if isinstance(mirror_puzzle, dict):
+                        inferred_stage = int(mirror_puzzle.get("active_stage", 1) or 1)
+                    seeded_stage = max(
+                        active_shape_stage or inferred_stage,
+                        1,
+                    )
+                    stage_targets = [{
+                        "switch_stage": seeded_stage,
+                        "target_anchor": [
+                            int(active_shape_target[0]),
+                            int(active_shape_target[1]),
+                        ],
+                    }]
+                pctx["shape_recognition"] = shape_recognition
+                pctx["shape_stage_targets"] = stage_targets
+                pctx["active_shape_target"] = active_shape_target
+                pctx["active_shape_stage"] = active_shape_stage
+                pctx["mirror_puzzle_active"] = mirror_puzzle_active
                 if game_model.features.has_beam:
                     beam_comps = [c for c in game_model.components if c.dominant_color == game_model.features.beam_color and not c.touches_border]
                     if beam_comps:
                         pctx["beam_cells"] = beam_comps[0].cells[:20]
                 ctx = self._solver_selector.build_solver_context(game_model, pctx, context)
-                if solver.should_activate(ctx):
+                should_activate = solver.should_activate(ctx)
+                if not should_activate and getattr(solver, "dynamics", "") == "mirror":
+                    logger.debug(
+                        "mirror activation rejected: recommended=%s board_type=%s primary_dynamics=%s has_beam=%s mirror_present=%s stage_targets=%d mirror_puzzle_active=%s active_shape_target=%s",
+                        getattr(solver, "dynamics", ""),
+                        game_model.features.board_type,
+                        game_model.features.primary_dynamics,
+                        game_model.features.has_beam,
+                        any(c.dominant_color == 10 for c in game_model.components),
+                        len(stage_targets),
+                        mirror_puzzle_active,
+                        active_shape_target,
+                    )
+                if should_activate:
                     decision = solver.decide(ctx)
                     if decision is not None:
                         self._solver_selector.record_outcome(context, game_model, decision, pctx)
@@ -891,6 +987,38 @@ class ObjectiveReduction:
         except Exception:
             logger.debug("solver system failed", exc_info=True)
         return (None, None)
+
+    def _seed_sticky_shape_target(
+        self,
+        context: ExecutiveContext,
+        decision: ActionDecision,
+        plan_context: dict[str, Any],
+    ) -> None:
+        metadata = dict(getattr(decision, "metadata", {}) or {})
+        target = metadata.get("pending_shape_target")
+        if not isinstance(target, (list, tuple)) or len(target) != 2:
+            target = metadata.get("target_anchor")
+        if not isinstance(target, (list, tuple)) or len(target) != 2:
+            return
+        stage = metadata.get("pending_shape_stage")
+        if stage is None:
+            stage = metadata.get("shape_stage")
+        try:
+            stage_index = max(int(stage or 0), 1)
+        except (TypeError, ValueError):
+            return
+        stage_targets = _normalize_stage_targets(plan_context.get("shape_stage_targets"))
+        if not stage_targets:
+            stage_targets = [{
+                "switch_stage": stage_index,
+                "target_anchor": [int(target[0]), int(target[1])],
+            }]
+        self._sticky_shape_target = {
+            "levels_completed": int(getattr(context.observation, "levels_completed", 0) or 0),
+            "target": (int(target[0]), int(target[1])),
+            "stage": stage_index,
+            "stage_targets": stage_targets,
+        }
 
     def _fallback_executive(self, context: ExecutiveContext) -> ActionDecision:
         logger.debug("falling back to base executive")

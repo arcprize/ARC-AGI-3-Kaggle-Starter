@@ -7,6 +7,7 @@ Useful for testing specific components in isolation.
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
@@ -2007,6 +2008,327 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
             solver.should_activate(ctx),
             "MirrorSolver should trust explicit stage targets for no-beam border-mirror puzzles",
         )
+
+    def test_mirror_solver_activates_for_cached_active_target_border_mirror(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+
+        solver = MirrorSolver()
+        gm = game_ar25_level5()
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "mirror_puzzle_active": True,
+                "active_shape_stage": 1,
+                "active_shape_target": (13, 40),
+            },
+        )
+
+        self.assertTrue(
+            solver.should_activate(ctx),
+            "MirrorSolver should accept cached post-switch mirror targets when fresh stage targets disappear",
+        )
+
+    def test_mirror_solver_retains_stage_target_activation_during_transient_beam(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+
+        solver = MirrorSolver()
+        solver._switch_count = 1
+        gm = game_ar25_level5()
+        gm = replace(
+            gm,
+            features=replace(
+                gm.features,
+                primary_dynamics="beam",
+                has_beam=True,
+            ),
+        )
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "mirror_puzzle_active": True,
+                "active_shape_stage": 1,
+                "active_shape_target": (13, 40),
+            },
+        )
+
+        self.assertTrue(
+            solver.should_activate(ctx),
+            "MirrorSolver should keep ownership of an in-flight stage target across transient beam reclassification",
+        )
+
+    def test_mirror_solver_decides_with_stage_target_even_when_geometry_flips(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+        from agi_core.orch_or.game_model import Component, GameFeatures, GameModel
+
+        solver = MirrorSolver()
+        solver._switch_count = 1
+        gm = GameModel(
+            board=[[9] * 64 for _ in range(64)],
+            height=64,
+            width=64,
+            player_pos=(38, 36),
+            goal_positions=[(37, 16), (13, 40), (25, 31), (22, 22)],
+            obstacles=[],
+            components=[
+                Component(
+                    cells=tuple((10, y) for y in range(0, 63)),
+                    bbox=(10, 0, 10, 62),
+                    size=63,
+                    dominant_color=10,
+                    touches_border=True,
+                ),
+                Component(
+                    cells=((38, 36), (39, 36), (38, 37), (39, 37)),
+                    bbox=(38, 36, 39, 37),
+                    size=4,
+                    dominant_color=5,
+                    touches_border=False,
+                ),
+                Component(
+                    cells=((37, 16), (13, 40), (25, 31), (22, 22)),
+                    bbox=(13, 16, 37, 40),
+                    size=4,
+                    dominant_color=11,
+                    touches_border=False,
+                ),
+            ],
+            walkable={(x, y) for x in range(64) for y in range(64)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=True,
+                board_type="beam",
+                primary_dynamics="beam",
+                has_beam=True,
+                grid_scale=3,
+            ),
+        )
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "mirror_puzzle_active": True,
+                "shape_stage_targets": [{"switch_stage": 1, "target_anchor": [24, 33]}],
+            },
+        )
+
+        decision = solver.decide(ctx)
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.source, "solver:mirror")
+
+    def test_mirror_solver_prefers_nearest_mirror_component_for_activation(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+        from agi_core.orch_or.game_model import Component, GameFeatures, GameModel
+
+        solver = MirrorSolver()
+        gm = GameModel(
+            board=[[9] * 64 for _ in range(64)],
+            height=64,
+            width=64,
+            player_pos=(10, 31),
+            goal_positions=[(13, 40)],
+            obstacles=[],
+            components=[
+                Component(
+                    cells=tuple((30, y) for y in range(5, 58)),
+                    bbox=(30, 5, 30, 57),
+                    size=53,
+                    dominant_color=10,
+                    touches_border=False,
+                ),
+                Component(
+                    cells=tuple((10, y) for y in range(0, 64)),
+                    bbox=(10, 0, 10, 63),
+                    size=64,
+                    dominant_color=10,
+                    touches_border=True,
+                ),
+            ],
+            walkable={(10, 31), (13, 40)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=False,
+                board_type="puzzle",
+                primary_dynamics="puzzle",
+                has_beam=False,
+            ),
+        )
+        ctx = SolverContext(game_model=gm, plan_context={})
+
+        self.assertTrue(
+            solver.should_activate(ctx),
+            "MirrorSolver activation should use the mirror nearest the active controller",
+        )
+
+    def test_mirror_solver_activates_when_player_is_on_thick_border_mirror(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+        from agi_core.orch_or.game_model import Component, GameFeatures, GameModel
+
+        solver = MirrorSolver()
+        gm = GameModel(
+            board=[[9] * 64 for _ in range(64)],
+            height=64,
+            width=64,
+            player_pos=(10, 31),
+            goal_positions=[(13, 40)],
+            obstacles=[],
+            components=[
+                Component(
+                    cells=tuple((x, y) for x in range(0, 12) for y in range(0, 63) if x in (0, 10, 11) or y in (0, 62)),
+                    bbox=(0, 0, 11, 62),
+                    size=192,
+                    dominant_color=10,
+                    touches_border=True,
+                ),
+            ],
+            walkable={(10, 31), (13, 40)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=False,
+                board_type="puzzle",
+                primary_dynamics="puzzle",
+                has_beam=False,
+                grid_scale=3,
+            ),
+        )
+        ctx = SolverContext(game_model=gm, plan_context={})
+
+        self.assertTrue(
+            solver.should_activate(ctx),
+            "MirrorSolver should activate when the selected controller sits on a thick border mirror",
+        )
+
+    def test_mirror_solver_decide_uses_selected_mirror_component_axis(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+        from agi_core.orch_or.game_model import Component, GameFeatures, GameModel
+
+        solver = MirrorSolver()
+        gm = GameModel(
+            board=[[9] * 64 for _ in range(64)],
+            height=64,
+            width=64,
+            player_pos=(10, 31),
+            goal_positions=[(13, 40)],
+            obstacles=[],
+            components=[
+                Component(
+                    cells=tuple((x, y) for x in range(0, 12) for y in range(0, 63) if x in (0, 10, 11) or y in (0, 62)),
+                    bbox=(0, 0, 11, 62),
+                    size=192,
+                    dominant_color=10,
+                    touches_border=True,
+                ),
+                Component(
+                    cells=tuple((x, y) for x in range(24, 36) for y in range(15, 18)),
+                    bbox=(24, 15, 35, 17),
+                    size=36,
+                    dominant_color=10,
+                    touches_border=False,
+                ),
+                Component(
+                    cells=tuple((10, y) for y in range(1, 62, 3)),
+                    bbox=(10, 1, 10, 61),
+                    size=21,
+                    dominant_color=0,
+                    touches_border=False,
+                ),
+                Component(
+                    cells=tuple((x, y) for x in range(42, 51) for y in range(36, 45)),
+                    bbox=(42, 36, 50, 44),
+                    size=81,
+                    dominant_color=5,
+                    touches_border=False,
+                ),
+                Component(
+                    cells=tuple((x, y) for x in range(12, 15) for y in range(39, 42)),
+                    bbox=(12, 39, 14, 41),
+                    size=9,
+                    dominant_color=11,
+                    touches_border=False,
+                ),
+            ],
+            walkable={(10, 31), (13, 40)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=False,
+                board_type="puzzle",
+                primary_dynamics="puzzle",
+                has_beam=False,
+                grid_scale=3,
+            ),
+        )
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "switch_attempted": 1,
+                "failed_directions": set(),
+                "shape_stage_targets": [],
+            },
+        )
+
+        decision = solver.decide(ctx)
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.source, "solver:mirror")
+
+    def test_mirror_solver_border_mirror_tolerance_avoids_nav_oscillation(self) -> None:
+        from agi_core.orch_or.game_model import Component, GameFeatures, GameModel
+
+        solver = MirrorSolver()
+        gm = GameModel(
+            board=[[9] * 64 for _ in range(64)],
+            height=64,
+            width=64,
+            player_pos=(33, 31),
+            goal_positions=[(13, 40)],
+            obstacles=[],
+            components=[],
+            walkable={(33, 31), (13, 40)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=False,
+                board_type="puzzle",
+                primary_dynamics="puzzle",
+                has_beam=False,
+                grid_scale=3,
+            ),
+        )
+        shape_comp = Component(
+            cells=tuple((x, y) for x in range(42, 51) for y in range(36, 45)),
+            bbox=(42, 36, 50, 44),
+            size=81,
+            dominant_color=5,
+            touches_border=False,
+        )
+        mirror_comp = Component(
+            cells=tuple((x, y) for x in range(27, 39) for y in range(0, 63) if x in (27, 37, 38) or y in (0, 62)),
+            bbox=(27, 0, 38, 62),
+            size=192,
+            dominant_color=10,
+            touches_border=True,
+        )
+        ctx = SolverContext(game_model=gm, plan_context={"failed_directions": set()})
+
+        decision = solver._navigate_mirror(
+            gm,
+            ctx,
+            [shape_comp],
+            mirror_comp,
+            11,
+            9,
+            4,
+            12,
+            5,
+            13,
+            3,
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertNotIn(decision.reason, {"mirror_nav_left", "mirror_nav_right"})
 
     # --- Iteration 1: Edge passage with various barrier heights ---
 

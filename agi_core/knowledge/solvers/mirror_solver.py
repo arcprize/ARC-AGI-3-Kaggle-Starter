@@ -157,6 +157,17 @@ def _plan_stage_target(
         target = dict(stage_targets[stage_index] or {}).get("target_anchor")
         if isinstance(target, list) and len(target) == 2:
             return (int(target[0]), int(target[1])), len(stage_targets)
+    active_target = plan_context.get("active_shape_target")
+    mirror_active = bool(plan_context.get("mirror_puzzle_active"))
+    if (
+        mirror_active
+        and isinstance(active_target, (list, tuple))
+        and len(active_target) == 2
+    ):
+        return (int(active_target[0]), int(active_target[1])), max(
+            int(plan_context.get("active_shape_stage", 1) or 1),
+            1,
+        )
     return _artifact_stage_target(plan_context.get("shape_recognition"), switch_count)
 
 
@@ -171,6 +182,17 @@ def _plan_stage_target_metadata(
         stage_index = min(max(switch_count - 1, 0), len(stage_targets) - 1)
         stage_target = stage_targets[stage_index]
         return stage_target if isinstance(stage_target, dict) else None
+    active_target = plan_context.get("active_shape_target")
+    mirror_active = bool(plan_context.get("mirror_puzzle_active"))
+    if (
+        mirror_active
+        and isinstance(active_target, (list, tuple))
+        and len(active_target) == 2
+    ):
+        return {
+            "switch_stage": max(int(plan_context.get("active_shape_stage", 1) or 1), 1),
+            "target_anchor": [int(active_target[0]), int(active_target[1])],
+        }
     artifact = plan_context.get("shape_recognition")
     if not isinstance(artifact, dict):
         return None
@@ -220,6 +242,10 @@ class MirrorSolver(DynamicsSolver):
             self.reset_level()
             initialize_puzzle_schema(self._memory_db_path)
 
+    @property
+    def has_active_attempt(self) -> bool:
+        return self._positioned_steps > 0 or self._switch_count > 0
+
     def reset_level(self, full: bool = True) -> None:
         self._last_move_target = None
         self._impassable_cells.clear()
@@ -253,16 +279,32 @@ class MirrorSolver(DynamicsSolver):
         mx1, my1, mx2, my2 = mirror_comp.bbox
         return (mx2 - mx1) > (my2 - my1)
 
+    @staticmethod
+    def _select_mirror_component(gm):
+        mirrors = [c for c in gm.components if c.dominant_color == 10]
+        if not mirrors:
+            return None
+        player = gm.player_pos
+        if player is not None and len(mirrors) > 1:
+            px, py = player
+            mirrors.sort(
+                key=lambda c: min(
+                    abs(cx - px) + abs(cy - py) for cx, cy in c.cells
+                )
+            )
+        return mirrors[0]
+
     # ── Activation ─────────────────────────────────────────────────────
 
     def should_activate(self, ctx: SolverContext) -> bool:
         gm = ctx.game_model
         if gm.player_pos is None or not gm.goal_positions:
             return False
-        mirror_comp = next((c for c in gm.components if c.dominant_color == 10), None)
+        mirror_comp = self._select_mirror_component(gm)
         if mirror_comp is None:
             return False
-        if not gm.features.has_beam and _plan_stage_target(ctx.plan_context, max(self._switch_count, 1)):
+        planned_stage_target = _plan_stage_target(ctx.plan_context, max(self._switch_count, 1))
+        if planned_stage_target and (not gm.features.has_beam or self.has_active_attempt):
             return True
         if gm.features.has_beam and not self._detect_mirror_axis(mirror_comp):
             return False
@@ -273,6 +315,13 @@ class MirrorSolver(DynamicsSolver):
             # old beam-specific exclusion when a live beam board is present.
             return not gm.features.has_beam
         px, py = gm.player_pos
+        gs = max(int(getattr(gm.features, "grid_scale", 1) or 1), 1)
+        player_gx = px // gs
+        mirror_gx = (
+            sum(cx for cx, _ in mirror_comp.cells) // max(len(mirror_comp.cells), 1)
+        ) // gs
+        if abs(player_gx - mirror_gx) <= 1:
+            return True
         mirr_cells = list(mirror_comp.cells)
         mirror_px = sum(cx for cx, _ in mirr_cells) // len(mirr_cells)
         goal_xs = [gx for gx, _ in gm.goal_positions]
@@ -317,11 +366,12 @@ class MirrorSolver(DynamicsSolver):
             if _pp is not None:
                 _ppx, _ppy = _pp
                 all_c10.sort(key=lambda c: min(abs(cx - _ppx) + abs(cy - _ppy) for cx, cy in c.cells))
-        self._mirror_is_horizontal = self._detect_mirror_axis(all_c10[0])
+        mirror_comp = all_c10[0]
+        self._mirror_is_horizontal = self._detect_mirror_axis(mirror_comp)
 
         # Mirror centre
-        mirr_xs = [cx for c in all_c10 for cx, _ in c.cells]
-        mirr_ys = [cy for c in all_c10 for _, cy in c.cells]
+        mirr_xs = [cx for cx, _ in mirror_comp.cells]
+        mirr_ys = [cy for _, cy in mirror_comp.cells]
         if not mirr_xs:
             return None
         mirror_px = sum(mirr_xs) // len(mirr_xs)
@@ -337,6 +387,7 @@ class MirrorSolver(DynamicsSolver):
         self._max_shape_count_seen = max(self._max_shape_count_seen, len(shape_comps))
         has_shape = bool(shape_comps)
         spx, spy = (px, py)
+        planned_stage_target = _plan_stage_target(ctx.plan_context, self._switch_count)
 
         # Goals
         goal_cells = [
@@ -410,7 +461,7 @@ class MirrorSolver(DynamicsSolver):
             # color-0 cells near the mirror Y.
             if self._switch_count == 0:
                 return self._navigate_mirror(
-                    gm, ctx, shape_comps, mirror_gx, mirror_gy,
+                    gm, ctx, shape_comps, mirror_comp, mirror_gx, mirror_gy,
                     min_ggx, max_ggx, min_ggy, max_ggy, gs,
                 )
             # Fall through to shape-piece navigation.
@@ -424,7 +475,8 @@ class MirrorSolver(DynamicsSolver):
         if not self._mirror_is_horizontal:
             if not ((player_gx < mirror_gx < min_ggx) or
                     (player_gx > mirror_gx > max_ggx)):
-                return None
+                if planned_stage_target is None:
+                    return None
 
         return self._navigate_shape(
             gm, ctx, (spx, spy), mirror_gx, mirror_gy, mirror_py, gs,
@@ -435,7 +487,7 @@ class MirrorSolver(DynamicsSolver):
     # ── Mirror navigation (player IS the mirror) ──────────────────────
 
     def _navigate_mirror(
-        self, gm, ctx, shape_comps,
+        self, gm, ctx, shape_comps, mirror_comp,
         mirror_gx: int, mirror_gy: int,
         min_ggx: int, max_ggx: int,
         min_ggy: int, max_ggy: int,
@@ -459,10 +511,12 @@ class MirrorSolver(DynamicsSolver):
         shape_right_gx = best_shape.bbox[2] // gs
         target_mgx = (min_ggx + shape_right_gx) // 2
         dx = target_mgx - mirror_gx
-        if dx < 0:
+        mirror_width = mirror_comp.bbox[2] - mirror_comp.bbox[0] + 1
+        alignment_tolerance = 1 if mirror_comp.touches_border and mirror_width >= gs * 3 else 0
+        if dx < -alignment_tolerance:
             return ActionDecision("ACTION3", "solver:mirror", 0.70,
                                   reason="mirror_nav_left")
-        elif dx > 0:
+        elif dx > alignment_tolerance:
             return ActionDecision("ACTION4", "solver:mirror", 0.70,
                                   reason="mirror_nav_right")
         self._positioned_steps += 1

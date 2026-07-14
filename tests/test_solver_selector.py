@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 from agi_core.knowledge.solver_selector import SolverSelector
 from agi_core.knowledge.solvers import DynamicsSolver, register_solver
+from agi_core.knowledge.solvers.mirror_solver import MirrorSolver
 from agi_core.orch_or.game_model import GameFeatures, GameModel
 from agi_core.storage.memory_cache import drop_cache
 from agi_core.types import ActionDecision, ObservedTransition
@@ -212,6 +213,23 @@ class SolverSelectorFeedbackTests(unittest.TestCase):
         self.assertIs(selected, old_solver)
         old_solver.reset_level.assert_not_called()
         self.assertEqual(selector._active_name, "beam-coverage")
+
+    def test_select_solver_retains_mirror_with_active_stage_attempt(self) -> None:
+        hyperon = SimpleNamespace(
+            facts={"episode": {}, "memory": {}},
+            run_rules=lambda query: [{"solver": "gravity"}] if query == "solver-select" else [],
+        )
+        selector = SolverSelector(hyperon)
+        old_solver = MirrorSolver()
+        old_solver._switch_count = 1
+        selector._active_solver = old_solver
+        selector._active_name = "mirror"
+        context = SimpleNamespace(observation=SimpleNamespace(last_action="ACTION5"))
+
+        selected = selector.select_solver(self._make_game_model("gravity"), context)
+
+        self.assertIs(selected, old_solver)
+        self.assertEqual(selector._active_name, "mirror")
 
 
 if __name__ == "__main__":
