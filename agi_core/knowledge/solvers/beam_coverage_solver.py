@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -343,7 +344,98 @@ def covered_goal_cells(
     return beam_cells & goals
 
 
-def find_best_placement(
+def _logical_goal_set(
+    goal_cells: set[tuple[int, int]] | list[tuple[int, int]],
+    gs: int = 3,
+) -> set[tuple[int, int]]:
+    return {(x // max(1, gs), y // max(1, gs)) for x, y in goal_cells}
+
+
+def _shape_relative_cells(
+    shape_cells: list[tuple[int, int]],
+) -> tuple[set[tuple[int, int]], tuple[int, int]] | None:
+    if not shape_cells:
+        return None
+    xs = [x for x, _ in shape_cells]
+    ys = [y for _, y in shape_cells]
+    x1, y1 = min(xs), min(ys)
+    rel_set = {(x - x1, y - y1) for x, y in shape_cells}
+    return rel_set, (x1, y1)
+
+
+def _placed_shape_from_anchor(
+    shape_cells: list[tuple[int, int]],
+    anchor: tuple[int, int],
+) -> set[tuple[int, int]]:
+    relative = _shape_relative_cells(shape_cells)
+    if relative is None:
+        return set()
+    rel_set, (x1, y1) = relative
+    rel_cx = sum(x for x, _ in rel_set) // len(rel_set) if rel_set else 0
+    rel_cy = sum(y for _, y in rel_set) // len(rel_set) if rel_set else 0
+    px = int(anchor[0]) - rel_cx + x1
+    py = int(anchor[1]) - rel_cy + y1
+    return {(px + dx, py + dy) for dx, dy in rel_set}
+
+
+def _score_stage_target_family(
+    stage_targets: list[dict[str, Any]],
+    shapes: list[list[tuple[int, int]]],
+    goal_cells: list[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    *,
+    current_centers: list[tuple[int, int] | None] | None = None,
+    gs: int = 3,
+) -> dict[str, Any]:
+    total_goals = _logical_goal_set(goal_cells, gs=gs)
+    covered_goals: set[tuple[int, int]] = set()
+    stage_coverage: list[int] = []
+    total_distance = 0
+
+    for stage in stage_targets:
+        if not isinstance(stage, dict):
+            continue
+        shape_index = int(stage.get("shape_index", -1))
+        if shape_index < 0 or shape_index >= len(shapes):
+            continue
+        target_anchor = stage.get("target_anchor")
+        if not isinstance(target_anchor, (list, tuple)) or len(target_anchor) != 2:
+            continue
+        placed = _placed_shape_from_anchor(
+            shapes[shape_index],
+            (int(target_anchor[0]), int(target_anchor[1])),
+        )
+        logical_beam = predict_beam_cells(
+            list(placed),
+            mirror_info,
+            board_width,
+            board_height,
+            gs=gs,
+        )
+        hits = covered_goal_cells(logical_beam, goal_cells, gs=gs)
+        covered_goals.update(hits)
+        stage_coverage.append(len(hits))
+        if current_centers and shape_index < len(current_centers):
+            current_center = current_centers[shape_index]
+            if current_center is not None:
+                total_distance += (
+                    abs(int(target_anchor[0]) - current_center[0])
+                    + abs(int(target_anchor[1]) - current_center[1])
+                )
+
+    return {
+        "covered_goal_count": len(covered_goals),
+        "goal_cell_count": len(total_goals),
+        "full_coverage": bool(total_goals) and covered_goals >= total_goals,
+        "final_stage_coverage": stage_coverage[-1] if stage_coverage else 0,
+        "stage_coverage": stage_coverage,
+        "total_distance": total_distance,
+    }
+
+
+def find_candidate_placements(
     shape_cells: list[tuple[int, int]],
     remaining_goals: set[tuple[int, int]],
     mirror_info: dict[str, Any],
@@ -352,9 +444,9 @@ def find_best_placement(
     current_center: tuple[int, int] | None = None,
     forbidden_cells: set[tuple[int, int]] | None = None,
     gs: int = 3,
-) -> tuple[int, int] | None:
+) -> list[dict[str, Any]]:
     if not shape_cells or not remaining_goals:
-        return None
+        return []
     xs = [x for x, _ in shape_cells]
     ys = [y for _, y in shape_cells]
     x1, y1 = min(xs), min(ys)
@@ -362,11 +454,10 @@ def find_best_placement(
     shape_w = x2 - x1 + 1
     shape_h = y2 - y1 + 1
     if shape_w <= 0 or shape_h <= 0:
-        return None
+        return []
 
     rel_set = {(x - x1, y - y1) for x, y in shape_cells}
-    best_score: tuple[int, int] | None = None
-    best_pos: tuple[int, int] | None = None
+    candidates: list[dict[str, Any]] = []
 
     step = max(1, gs)
     for tx in range(0, max(1, board_width - shape_w + 1), step):
@@ -387,12 +478,157 @@ def find_best_placement(
             cx = sum(x for x, _ in placed) // len(placed)
             cy = sum(y for _, y in placed) // len(placed)
             dist = abs(cx - current_center[0]) + abs(cy - current_center[1]) if current_center else 0
-            score = (hits, -dist)
-            if best_score is None or score > best_score:
-                best_score = score
-                best_pos = (tx, ty)
+            covered_goals = {
+                cell for cell in remaining_goals
+                if (cell[0] // max(1, gs), cell[1] // max(1, gs)) in logical_beam
+            }
+            candidates.append({
+                "top_left": (tx, ty),
+                "target_anchor": [cx, cy],
+                "target_bbox": [
+                    min(x for x, _ in placed),
+                    min(y for _, y in placed),
+                    max(x for x, _ in placed),
+                    max(y for _, y in placed),
+                ],
+                "covered_goals": sorted(covered_goals),
+                "hits": hits,
+                "distance": dist,
+            })
 
-    return best_pos
+    candidates.sort(
+        key=lambda item: (
+            int(item.get("hits", 0)),
+            -int(item.get("distance", 0)),
+        ),
+        reverse=True,
+    )
+    return candidates[:6]
+
+
+def find_best_placement(
+    shape_cells: list[tuple[int, int]],
+    remaining_goals: set[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    current_center: tuple[int, int] | None = None,
+    forbidden_cells: set[tuple[int, int]] | None = None,
+    gs: int = 3,
+) -> tuple[int, int] | None:
+    candidates = find_candidate_placements(
+        shape_cells,
+        remaining_goals,
+        mirror_info,
+        board_width,
+        board_height,
+        current_center=current_center,
+        forbidden_cells=forbidden_cells,
+        gs=gs,
+    )
+    if not candidates:
+        return None
+    return tuple(candidates[0]["top_left"])
+
+
+def rank_joint_best_placements(
+    shapes: list[list[tuple[int, int]]],
+    goal_cells: list[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    forbidden_cells: set[tuple[int, int]] | None = None,
+    *,
+    family_limit: int = 6,
+    gs: int = 3,
+) -> list[dict[str, Any]]:
+    if not shapes or not goal_cells:
+        return []
+
+    all_goals = set(goal_cells)
+    remaining = set(goal_cells)
+    current_centers: list[tuple[int, int] | None] = []
+    candidate_lists: list[list[dict[str, Any]]] = []
+    for shape_cells in shapes:
+        current_center = (
+            sum(x for x, _ in shape_cells) // len(shape_cells),
+            sum(y for _, y in shape_cells) // len(shape_cells),
+        ) if shape_cells else None
+        current_centers.append(current_center)
+        candidates = find_candidate_placements(
+            shape_cells,
+            remaining,
+            mirror_info,
+            board_width,
+            board_height,
+            current_center=current_center,
+            forbidden_cells=forbidden_cells,
+            gs=gs,
+        )
+        if not candidates:
+            candidates = find_candidate_placements(
+                shape_cells,
+                all_goals,
+                mirror_info,
+                board_width,
+                board_height,
+                current_center=current_center,
+                forbidden_cells=forbidden_cells,
+                gs=gs,
+            )
+        if not candidates:
+            return []
+        trimmed = candidates[: min(len(candidates), 4)]
+        candidate_lists.append(trimmed)
+        remaining -= {
+            tuple(cell)
+            for cell in trimmed[0].get("covered_goals", [])
+            if isinstance(cell, (list, tuple)) and len(cell) == 2
+        }
+
+    ranked: list[dict[str, Any]] = []
+    seen_orders: set[tuple[tuple[int, int], ...]] = set()
+    for combo in product(*candidate_lists):
+        stage_targets: list[dict[str, Any]] = []
+        for shape_index, candidate in enumerate(combo):
+            target_anchor = candidate.get("target_anchor", [])
+            if not isinstance(target_anchor, list) or len(target_anchor) != 2:
+                continue
+            stage_targets.append({
+                "shape_index": shape_index,
+                "target_anchor": [int(target_anchor[0]), int(target_anchor[1])],
+                "target_bbox": list(candidate.get("target_bbox", [])),
+                "covered_goals": list(candidate.get("covered_goals", [])),
+            })
+        order_key = tuple(
+            (int(stage["target_anchor"][0]), int(stage["target_anchor"][1]))
+            for stage in stage_targets
+        )
+        if not order_key or order_key in seen_orders:
+            continue
+        seen_orders.add(order_key)
+        score = _score_stage_target_family(
+            stage_targets,
+            shapes,
+            goal_cells,
+            mirror_info,
+            board_width,
+            board_height,
+            current_centers=current_centers,
+            gs=gs,
+        )
+        ranked.append({"targets": stage_targets, "score": score})
+
+    ranked.sort(
+        key=lambda item: (
+            bool(item["score"].get("full_coverage")),
+            int(item["score"].get("covered_goal_count", 0)),
+            int(item["score"].get("final_stage_coverage", 0)),
+            -int(item["score"].get("total_distance", 0)),
+        ),
+        reverse=True,
+    )
+    return ranked[:family_limit]
 
 
 def find_joint_best_placement(
@@ -653,6 +889,64 @@ def select_best_horizontal_mirror_plan(
     return best_row, best_targets
 
 
+def rank_horizontal_mirror_plans(
+    shapes: list[list[tuple[int, int]]],
+    goal_cells: list[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    current_mirror_row: int,
+    base_forbidden: set[tuple[int, int]],
+    *,
+    gs: int = 3,
+    excluded_rows: set[int] | None = None,
+    candidate_rows: set[int] | None = None,
+) -> dict[str, Any] | None:
+    excluded = excluded_rows or set()
+    grid_height = max(1, board_height // max(1, gs))
+    best_plan: dict[str, Any] | None = None
+    best_score: tuple[int, int, int, int] | None = None
+
+    row_candidates = sorted(candidate_rows) if candidate_rows else range(grid_height)
+    for mirror_row in row_candidates:
+        if mirror_row in excluded:
+            continue
+        row_mirror_info = dict(mirror_info)
+        row_mirror_info["axis_py"] = mirror_row * gs + (gs // 2)
+        ranked_families = rank_joint_best_placements(
+            shapes,
+            goal_cells,
+            row_mirror_info,
+            board_width,
+            board_height,
+            forbidden_cells=_forbidden_cells_for_mirror_row(
+                base_forbidden,
+                board_width,
+                int(row_mirror_info["axis_py"]),
+            ),
+            gs=gs,
+        )
+        if not ranked_families:
+            continue
+        row_family_score = ranked_families[0]["score"]
+        score = (
+            int(bool(row_family_score.get("full_coverage"))),
+            int(row_family_score.get("covered_goal_count", 0)),
+            int(row_family_score.get("final_stage_coverage", 0)),
+            -abs(mirror_row - current_mirror_row),
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_plan = {
+                "mirror_row": mirror_row,
+                "targets": [dict(stage) for stage in ranked_families[0]["targets"]],
+                "families": ranked_families,
+                "score": dict(row_family_score),
+            }
+
+    return best_plan
+
+
 class BeamCoverageSolver(DynamicsSolver):
     """Solver for beam-coverage puzzles where shape pieces emit beam
     that reflects off fixed mirrors to cover goals.
@@ -695,6 +989,10 @@ class BeamCoverageSolver(DynamicsSolver):
         self._attempt_id: int = 0
         self._attempt_reset_reason: str | None = None
         self._base_targets: list[dict[str, Any]] | None = None
+        self._ranked_target_families: list[dict[str, Any]] = []
+        self._current_family_index: int = 0
+        self._family_retry_count: int = 0
+        self._family_retry_budget: int = 1
         self._planned_goal_cells: list[tuple[int, int]] | None = None
         self._tune_step: int = 0
         self._tune_budget: int = 12
@@ -750,6 +1048,9 @@ class BeamCoverageSolver(DynamicsSolver):
         self._attempt_id += 1
         self._attempt_reset_reason = "level_reset"
         self._base_targets = None
+        self._ranked_target_families = []
+        self._current_family_index = 0
+        self._family_retry_count = 0
         self._planned_goal_cells = None
         self._tune_step = 0
         self._final_tuning = False
@@ -805,10 +1106,23 @@ class BeamCoverageSolver(DynamicsSolver):
                 list(self._base_targets[0].get("target_anchor", []))
                 if self._base_targets else None
             ),
+            "chosen_target_family": [
+                list(stage.get("target_anchor", []))
+                for stage in (self._base_targets or [])
+                if isinstance(stage, dict)
+            ],
             "cached_target_order": [
                 list(stage.get("target_anchor", []))
                 for stage in (self._cached_targets or [])
                 if isinstance(stage, dict)
+            ],
+            "target_family_index": self._current_family_index,
+            "target_family_retry_count": self._family_retry_count,
+            "alternative_family_count": max(0, len(self._ranked_target_families) - 1),
+            "family_scores": [
+                dict(family.get("score", {}))
+                for family in self._ranked_target_families[:4]
+                if isinstance(family, dict)
             ],
             "tune_step": self._tune_step,
             "attempt_id": self._attempt_id,
@@ -841,6 +1155,7 @@ class BeamCoverageSolver(DynamicsSolver):
             "reflected_goal_count": self._reflected_goal_count,
             "reflection_offscreen": self._reflection_offscreen,
             "recovery_step": self._recovery_step,
+            "final_stage_coverage_incomplete": False,
         }
         metadata.update(extra)
         return metadata
@@ -940,6 +1255,7 @@ class BeamCoverageSolver(DynamicsSolver):
         gs: int,
         target_cx: int,
         target_cy: int,
+        final_stage_coverage_incomplete: bool = False,
     ) -> ActionDecision:
         self._final_tuning = True
         self._tune_step += 1
@@ -968,6 +1284,7 @@ class BeamCoverageSolver(DynamicsSolver):
                 metadata=self._decision_metadata(
                     target_anchor=[target_cx, target_cy],
                     shape_stage=self._active_stage_index,
+                    final_stage_coverage_incomplete=final_stage_coverage_incomplete,
                 ),
             )
         return ActionDecision(
@@ -976,6 +1293,7 @@ class BeamCoverageSolver(DynamicsSolver):
             metadata=self._decision_metadata(
                 target_anchor=[target_cx, target_cy],
                 shape_stage=self._active_stage_index,
+                final_stage_coverage_incomplete=final_stage_coverage_incomplete,
             ),
         )
 
@@ -983,6 +1301,9 @@ class BeamCoverageSolver(DynamicsSolver):
         self._attempt_id += 1
         self._attempt_reset_reason = reason
         self._base_targets = None
+        self._ranked_target_families = []
+        self._current_family_index = 0
+        self._family_retry_count = 0
         self._cached_mirror_info = None
         self._planned_goal_cells = None
         self._tune_step = 0
@@ -1014,7 +1335,6 @@ class BeamCoverageSolver(DynamicsSolver):
     def _restart_attempt_with_retry(self, reason: str, gm, gs: int) -> None:
         self._attempt_id += 1
         self._attempt_reset_reason = reason
-        self._retry_count += 1
         self._active_stage_index = -1
         self._switch_pending = False
         self._pending_stage_index = None
@@ -1033,10 +1353,20 @@ class BeamCoverageSolver(DynamicsSolver):
         self._stage_shape_centers.clear()
         self._confirmed_shape_center = None
         if self._base_targets:
-            self._cached_targets = self._targets_with_retry_offset(self._base_targets, gm, gs)
-            self._cached_frame = self._last_levels_completed or self._cached_frame
-        else:
-            self._invalidate_target_cache()
+            if (
+                self._ranked_target_families
+                and self._current_family_index + 1 < len(self._ranked_target_families)
+            ):
+                promoted = self._promote_target_family(gm, gs)
+                if promoted:
+                    return
+            self._family_retry_count += 1
+            self._retry_count += 1
+            if self._family_retry_count <= self._family_retry_budget:
+                self._cached_targets = self._targets_with_retry_offset(self._base_targets, gm, gs)
+                self._cached_frame = self._last_levels_completed or self._cached_frame
+                return
+        self._invalidate_target_cache()
 
     def _targets_with_retry_offset(
         self,
@@ -1060,6 +1390,36 @@ class BeamCoverageSolver(DynamicsSolver):
             gm.width,
             gm.height,
         )
+
+    def _adopt_target_family(
+        self,
+        family_index: int,
+        gm,
+        gs: int,
+        *,
+        apply_offset: bool = False,
+    ) -> bool:
+        if family_index < 0 or family_index >= len(self._ranked_target_families):
+            return False
+        family = self._ranked_target_families[family_index]
+        targets = family.get("targets", []) if isinstance(family, dict) else []
+        if not isinstance(targets, list) or not targets:
+            return False
+        self._current_family_index = family_index
+        self._base_targets = [dict(stage) for stage in targets if isinstance(stage, dict)]
+        self._cached_targets = (
+            self._targets_with_retry_offset(self._base_targets, gm, gs)
+            if apply_offset else [dict(stage) for stage in self._base_targets]
+        )
+        self._cached_frame = self._last_levels_completed or self._cached_frame
+        return bool(self._cached_targets)
+
+    def _promote_target_family(self, gm, gs: int) -> bool:
+        if self._current_family_index + 1 >= len(self._ranked_target_families):
+            return False
+        self._family_retry_count = 0
+        self._retry_count = 0
+        return self._adopt_target_family(self._current_family_index + 1, gm, gs)
 
     def _request_switch(
         self,
@@ -1306,11 +1666,13 @@ class BeamCoverageSolver(DynamicsSolver):
         current_mirror_gy = mirror_info["axis_py"] // gs if mirror_info["horizontal"] else None
         base_forbidden = _base_forbidden_cells(gm)
         target_row = current_mirror_gy if current_mirror_gy is not None else -1
+        use_ranked_families = bool(mirror_info["horizontal"]) and current_level >= 3
         planning_needed = not execution_started or (
             self._cached_targets is None and self._mirror_target_gy is None
         )
 
         if mirror_info["horizontal"] and current_mirror_gy is not None and planning_needed:
+            selected_plan = None
             selected_row, selected_targets = None, None
             mirror_cache_key = (
                 current_level,
@@ -1318,18 +1680,36 @@ class BeamCoverageSolver(DynamicsSolver):
                 self._planned_shape_count,
             )
             if self._mirror_target_gy is None or self._cached_target_key != mirror_cache_key:
-                selected_row, selected_targets = select_best_horizontal_mirror_plan(
-                    shapes,
-                    goals,
-                    mirror_info,
-                    gm.width,
-                    gm.height,
-                    current_mirror_row=current_mirror_gy,
-                    base_forbidden=base_forbidden,
-                    gs=gs,
-                    excluded_rows=self._unreachable_mirror_rows,
-                )
-                if selected_row is None and current_mirror_gy not in self._unreachable_mirror_rows:
+                if use_ranked_families:
+                    selected_plan = rank_horizontal_mirror_plans(
+                        shapes,
+                        goals,
+                        mirror_info,
+                        gm.width,
+                        gm.height,
+                        current_mirror_row=current_mirror_gy,
+                        base_forbidden=base_forbidden,
+                        gs=gs,
+                        excluded_rows=self._unreachable_mirror_rows,
+                    )
+                    if selected_plan is None and current_mirror_gy not in self._unreachable_mirror_rows:
+                        selected_plan = rank_horizontal_mirror_plans(
+                            shapes,
+                            goals,
+                            mirror_info,
+                            gm.width,
+                            gm.height,
+                            current_mirror_row=current_mirror_gy,
+                            base_forbidden=base_forbidden,
+                            gs=gs,
+                            candidate_rows={current_mirror_gy},
+                        )
+                    selected_row = (
+                        int(selected_plan["mirror_row"])
+                        if isinstance(selected_plan, dict) and selected_plan.get("mirror_row") is not None
+                        else None
+                    )
+                else:
                     selected_row, selected_targets = select_best_horizontal_mirror_plan(
                         shapes,
                         goals,
@@ -1339,12 +1719,38 @@ class BeamCoverageSolver(DynamicsSolver):
                         current_mirror_row=current_mirror_gy,
                         base_forbidden=base_forbidden,
                         gs=gs,
-                        candidate_rows={current_mirror_gy},
+                        excluded_rows=self._unreachable_mirror_rows,
                     )
+                    if selected_row is None and current_mirror_gy not in self._unreachable_mirror_rows:
+                        selected_row, selected_targets = select_best_horizontal_mirror_plan(
+                            shapes,
+                            goals,
+                            mirror_info,
+                            gm.width,
+                            gm.height,
+                            current_mirror_row=current_mirror_gy,
+                            base_forbidden=base_forbidden,
+                            gs=gs,
+                            candidate_rows={current_mirror_gy},
+                        )
                 self._mirror_target_gy = selected_row if selected_row is not None else current_mirror_gy
                 self._cached_mirror_info = dict(mirror_info)
-                self._cached_targets = selected_targets
-                self._base_targets = [dict(stage) for stage in (selected_targets or [])]
+                if use_ranked_families:
+                    self._ranked_target_families = (
+                        list(selected_plan.get("families", []))
+                        if isinstance(selected_plan, dict) else []
+                    )
+                    self._current_family_index = 0
+                    self._family_retry_count = 0
+                    self._cached_targets = None
+                    self._base_targets = None
+                    self._adopt_target_family(0, gm, gs)
+                else:
+                    self._ranked_target_families = []
+                    self._current_family_index = 0
+                    self._family_retry_count = 0
+                    self._cached_targets = selected_targets
+                    self._base_targets = [dict(stage) for stage in (selected_targets or [])]
                 self._cached_target_key = (
                     current_level,
                     int(self._mirror_target_gy),
@@ -1406,15 +1812,30 @@ class BeamCoverageSolver(DynamicsSolver):
         if self._cached_targets is None or (
             self._active_stage_index < 0 and self._cached_target_key != target_cache_key
         ):
-            # Try joint placement first (evaluates combinations of both shapes)
-            self._cached_targets = find_joint_best_placement(
-                shapes, goals, mirror_info, gm.width, gm.height,
-                forbidden_cells=forbidden, gs=gs,
-            )
+            if use_ranked_families:
+                self._ranked_target_families = rank_joint_best_placements(
+                    shapes, goals, mirror_info, gm.width, gm.height,
+                    forbidden_cells=forbidden, gs=gs,
+                )
+                if self._ranked_target_families:
+                    self._current_family_index = 0
+                    self._family_retry_count = 0
+                    self._adopt_target_family(0, gm, gs)
+                else:
+                    self._cached_targets = find_joint_best_placement(
+                        shapes, goals, mirror_info, gm.width, gm.height,
+                        forbidden_cells=forbidden, gs=gs,
+                    )
+                    self._base_targets = [dict(stage) for stage in self._cached_targets]
+            else:
+                self._ranked_target_families = []
+                self._cached_targets = find_joint_best_placement(
+                    shapes, goals, mirror_info, gm.width, gm.height,
+                    forbidden_cells=forbidden, gs=gs,
+                )
+                self._base_targets = [dict(stage) for stage in self._cached_targets]
             self._cached_target_key = target_cache_key
             self._cached_frame = current_level
-            if self._active_stage_index < 0:
-                self._base_targets = [dict(stage) for stage in self._cached_targets]
 
         if not self._cached_targets:
             return None
@@ -1537,6 +1958,7 @@ class BeamCoverageSolver(DynamicsSolver):
                 gs=gs,
                 target_cx=target_cx,
                 target_cy=target_cy,
+                final_stage_coverage_incomplete=True,
             )
         if final_stage and at_target:
             self._both_placed_steps += 1

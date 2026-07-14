@@ -26,6 +26,8 @@ from agi_core.knowledge.solvers.mirror_solver import (
 )
 from agi_core.knowledge.solvers.beam_coverage_solver import (
     BeamCoverageSolver,
+    rank_horizontal_mirror_plans,
+    rank_joint_best_placements,
     select_best_horizontal_mirror_plan,
 )
 from agi_core.perception.shape_recognition import ensure_shape_recognition, recognize_shape_recognition
@@ -4065,6 +4067,7 @@ class TestBeamCoverageSolver(unittest.TestCase):
         self.assertIsNotNone(decision)
         self.assertNotEqual(decision.reason, "coverage_all_placed")
         self.assertTrue(decision.reason.startswith("coverage_tune_"))
+        self.assertTrue(decision.metadata["final_stage_coverage_incomplete"])
 
     def test_vertical_final_stage_keeps_existing_completion_path(self) -> None:
         gm = game_open_path()
@@ -4180,6 +4183,89 @@ class TestBeamCoverageSolver(unittest.TestCase):
             )
 
         self.assertEqual(row, 6)
+
+    def test_rank_joint_best_placements_prefers_fuller_reflected_coverage(self) -> None:
+        candidate_lists = [
+            [{
+                "top_left": (10, 10),
+                "target_anchor": [40, 22],
+                "target_bbox": [39, 21, 41, 23],
+                "covered_goals": [(27, 30)],
+                "hits": 1,
+                "distance": 0,
+            }],
+            [
+                {
+                    "top_left": (10, 10),
+                    "target_anchor": [40, 37],
+                    "target_bbox": [39, 36, 41, 38],
+                    "covered_goals": [(30, 30)],
+                    "hits": 1,
+                    "distance": 0,
+                },
+                {
+                    "top_left": (10, 10),
+                    "target_anchor": [40, 43],
+                    "target_bbox": [39, 42, 41, 44],
+                    "covered_goals": [(30, 30), (33, 30)],
+                    "hits": 2,
+                    "distance": 1,
+                },
+            ],
+        ]
+        shapes = [[(0, 0)], [(0, 0)]]
+        goals = [(27, 30), (30, 30), (33, 30)]
+
+        def fake_predict(
+            shape_cells: list[tuple[int, int]],
+            _mirror_info: dict[str, Any],
+            _width: int,
+            _height: int,
+            gs: int = 3,
+        ) -> set[tuple[int, int]]:
+            if (40, 43) in shape_cells:
+                return {(9, 10), (10, 10), (11, 10)}
+            if (40, 37) in shape_cells:
+                return {(9, 10), (10, 10)}
+            return {(9, 10)}
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.find_candidate_placements",
+            side_effect=candidate_lists,
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.predict_beam_cells",
+            side_effect=fake_predict,
+        ):
+            ranked = rank_joint_best_placements(
+                shapes,
+                goals,
+                {"horizontal": True, "axis_py": 31},
+                64,
+                64,
+                gs=3,
+            )
+
+        self.assertGreaterEqual(len(ranked), 2)
+        self.assertEqual(ranked[0]["targets"][1]["target_anchor"], [40, 43])
+        self.assertTrue(ranked[0]["score"]["full_coverage"])
+
+    def test_restart_attempt_with_retry_promotes_next_family_before_offsetting(self) -> None:
+        solver = BeamCoverageSolver()
+        gm = game_ar25_level3()
+        solver._ranked_target_families = [
+            {"targets": [{"target_anchor": [10, 10], "target_bbox": [9, 9, 11, 11]}], "score": {}},
+            {"targets": [{"target_anchor": [40, 43], "target_bbox": [39, 42, 41, 44]}], "score": {}},
+        ]
+        solver._base_targets = [dict(stage) for stage in solver._ranked_target_families[0]["targets"]]
+        solver._cached_targets = [dict(stage) for stage in solver._base_targets]
+
+        solver._restart_attempt_with_retry("final_tuning_exhausted", gm, 3)
+
+        self.assertEqual(solver._current_family_index, 1)
+        self.assertEqual(solver._base_targets[0]["target_anchor"], [40, 43])
+        self.assertEqual(solver._cached_targets[0]["target_anchor"], [40, 43])
+        self.assertEqual(solver._family_retry_count, 0)
+        self.assertEqual(solver._retry_count, 0)
 
     def test_targets_with_retry_offset_does_not_mutate_cached_targets(self) -> None:
         solver = BeamCoverageSolver()
