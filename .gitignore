@@ -1,8 +1,6 @@
-# Kaggle credentials (project-local, never check in)
-.kaggle/
+.*/
 
 # Python
-.venv/
 __pycache__/
 *.pyc
 
@@ -10,13 +8,28 @@ __pycache__/
 vendor/
 environment_files/
 recordings/
-logs.log
+*.log
 
 # Generated artefacts
+out/
+replays/
 notebooks/submission.ipynb
+notebooks/runtime_bundle/
 reference/
+agi_core/knowledge/rules/arc_learned.json
+training_artifacts/
+
+# Optional local AGI assets
+models/*.gguf
+third_party/hyperon/*.whl
+third_party/wheels/*.whl
+arc_agi_3_public_demo_human_testing.zip
+# Local test scratch space
+tmp*/
 
 # OS / editors
 .DS_Store
-.idea/
-.vscode/
+/third_party
+/models
+/*.sqlite3
+/*.sqlite3-journal

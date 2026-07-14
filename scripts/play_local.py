@@ -2,7 +2,7 @@
 
 This is the fast inner-loop: no Docker, no Kaggle round-trip. Uses the
 `arc-agi` PyPI package to host the game engine and the ARC-AGI-3-Agents
-framework's `Agent.main()` loop to drive it — exactly what the Kaggle
+framework's `Agent.main()` loop to drive it exactly like the Kaggle
 gateway does, just in-process.
 
 Usage:
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,16 @@ sys.path.insert(0, str(VENDOR))
 
 import arc_agi
 from arc_agi import OperationMode
+from agi_core.cuda import format_kernel_stats, snapshot_kernel_stats
+
+_PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
 def load_my_agent_class():
@@ -43,6 +54,29 @@ def load_my_agent_class():
     return module.MyAgent
 
 
+def _configure_local_runner_env(llm_provider: str) -> None:
+    os.environ["AGI_LLM_PROVIDER"] = (
+        str(llm_provider or "local").strip().lower() or "local"
+    )
+    preserve_proxy = str(
+        os.environ.get("AGI_PLAY_LOCAL_PRESERVE_PROXY", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if preserve_proxy:
+        return
+    for env_name in _PROXY_ENV_VARS:
+        os.environ.pop(env_name, None)
+    no_proxy_entries = [
+        entry.strip()
+        for entry in str(os.environ.get("NO_PROXY", "") or "").split(",")
+        if entry.strip()
+    ]
+    for host in ("localhost", "127.0.0.1"):
+        if host not in no_proxy_entries:
+            no_proxy_entries.append(host)
+    os.environ["NO_PROXY"] = ",".join(no_proxy_entries)
+    os.environ["no_proxy"] = os.environ["NO_PROXY"]
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--game", default=None,
@@ -55,9 +89,33 @@ def main() -> None:
                    help="List available games and exit.")
     p.add_argument("--render", default=None, choices=[None, "terminal"],
                    help="Optional terminal rendering each step.")
+    p.add_argument("--record-dir", default=None,
+                   help="Optional directory for PNG/GIF visual replay artifacts.")
+    p.add_argument("--record-format", default="both", choices=["png", "gif", "both"],
+                   help="Visual replay output format when --record-dir is set.")
+    p.add_argument("--record-every", type=int, default=1,
+                   help="Capture every Nth action; defaults to every action.")
+    p.add_argument("--record-scale", type=int, default=8,
+                   help="Nearest-neighbor pixel scale for recorded images.")
+    p.add_argument("--record-labels", action=argparse.BooleanOptionalAction, default=True,
+                   help="Add step/action/state labels to recorded frames.")
+    p.add_argument(
+        "--llm-provider",
+        choices=["local", "openai"],
+        default="local",
+        help="LLM provider for local runs. Defaults to local so shell env does not leak OpenAI into play-local.",
+    )
     args = p.parse_args()
+    if args.record_every < 1 or args.record_scale < 1:
+        p.error("--record-every and --record-scale must be at least 1")
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    log_level = logging.DEBUG if os.environ.get("AGI_DEBUG_DECISIONS", "0").strip().lower() in {"1", "true", "yes", "on"} else logging.INFO
+    cuda_debug_stats = log_level == logging.DEBUG or os.environ.get("AGI_CUDA_DEBUG_STATS", "0").strip().lower() in {"1", "true", "yes", "on"}
+    logging.basicConfig(level=log_level, format="%(levelname)s:%(name)s:%(message)s")
+    if log_level == logging.DEBUG:
+        logging.getLogger("agi_core.orch_or").setLevel(logging.DEBUG)
+    _configure_local_runner_env(args.llm_provider)
+    print(f"Using llm provider: {args.llm_provider}")
 
     # NORMAL = local execution; game source is downloaded on first call into
     # ./environment_files/ and cached for subsequent runs.
@@ -91,13 +149,43 @@ def main() -> None:
 
     per_game = []
     for i, game_id in enumerate(game_ids, 1):
+        if cuda_debug_stats:
+            snapshot_kernel_stats(reset=True)
         print(f"=== [{i}/{len(game_ids)}] {game_id} ===")
         env = arc.make(game_id, render_mode=args.render)
         if env is None:
             print(f"  could not create env for {game_id!r}, skipping")
             continue
 
-        agent = MyAgentCls(
+        recorder = None
+        if args.record_dir:
+            from scripts.visual_replay import VisualReplayRecorder
+            game_record_dir = Path(args.record_dir) / game_id
+            recorder = VisualReplayRecorder(
+                game_record_dir,
+                fmt=args.record_format,
+                every=args.record_every,
+                scale=args.record_scale,
+                labels=args.record_labels,
+            )
+
+        BaseAgent = MyAgentCls
+        if recorder is not None:
+            class RecordingAgent(BaseAgent):
+                def take_action(self, action):
+                    frame = super().take_action(action)
+                    if frame is not None:
+                        recorder.record(
+                            frame,
+                            action=getattr(action, "name", str(action)),
+                            step=self.action_counter + 1,
+                        )
+                    return frame
+            AgentCls = RecordingAgent
+        else:
+            AgentCls = BaseAgent
+
+        agent = AgentCls(
             card_id="local-dev",
             game_id=game_id,
             agent_name=f"MyAgent.local.{game_id}",
@@ -108,11 +196,18 @@ def main() -> None:
         )
         agent.main()
 
+        artifacts = recorder.close() if recorder is not None else None
+
         final = agent.frames[-1]
         per_game.append((game_id, final.state, final.levels_completed,
                          agent.action_counter))
-        print(f"  → state={final.state}, levels_completed={final.levels_completed}, "
+        print(f"  -> state={final.state}, levels_completed={final.levels_completed}, "
               f"actions={agent.action_counter}")
+        if cuda_debug_stats:
+            print(f"  -> cuda_kernels={format_kernel_stats(reset=True)}")
+        if artifacts:
+            print(f"  -> replay frames={artifacts['frames_dir']}, gif={artifacts['gif']}, "
+                  f"timeline={artifacts['timeline']}")
 
     sc = arc.get_scorecard()
     print("\n========= SUMMARY =========")

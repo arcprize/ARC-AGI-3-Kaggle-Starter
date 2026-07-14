@@ -1,0 +1,358 @@
+from __future__ import annotations
+
+from typing import Any
+from dataclasses import dataclass
+
+from agi_core.orch_or.analyzer import build_game_model
+from agi_core.image_input import (
+    active_cell_count,
+    board_image_input_from_source,
+    default_click_target,
+    extract_board_image_input,
+    preferred_board_probe_action,
+)
+from agi_core.perception.shape_recognition import ensure_shape_recognition
+from agi_core.types import ActionDecision, Observation
+
+
+@dataclass(slots=True)
+class _BoardModelResult:
+    model: Any | None
+    error: str | None = None
+
+
+class ArcAdapter:
+    """Normalizes ARC frames and maps executive decisions to GameAction."""
+
+    def __init__(
+        self,
+        game_action_cls: Any,
+        default_game_id: str = "",
+        deterministic_action: str = "ACTION1",
+        reset_state_names: tuple[str, ...] = ("NOT_PLAYED", "GAME_OVER"),
+    ) -> None:
+        self._game_action_cls = game_action_cls
+        self._game_id = default_game_id
+        self._last_image_input = None
+        self._last_levels_completed = 0
+        self._reset_state_names = {str(name or "").upper() for name in reset_state_names}
+        self._default_legal_actions = self._discover_default_actions()
+        if deterministic_action in self._default_legal_actions:
+            self._deterministic_action = deterministic_action
+        elif self._default_legal_actions:
+            self._deterministic_action = self._default_legal_actions[0]
+        else:
+            self._deterministic_action = "RESET"
+
+    def bind_game(self, game_id: str) -> None:
+        self._game_id = game_id
+
+    def observe(self, frames: list[Any], latest_frame: Any) -> Observation:
+        game_state = self._normalize_name(self._get_attr(latest_frame, "state"))
+        legal_actions, legal_actions_known = self._extract_legal_actions(latest_frame, game_state)
+        step_index, step_index_reliable = self._extract_step_index(frames, latest_frame)
+        levels_completed = int(
+            self._get_attr(latest_frame, "levels_completed", "level", default=0) or 0
+        )
+        previous_image_input = self._last_image_input
+        previous_levels_completed = self._last_levels_completed
+        image_input = extract_board_image_input(latest_frame)
+        multi_layer_frame = getattr(latest_frame, "frame", None)
+        if (
+            levels_completed >= 3
+            and isinstance(multi_layer_frame, list)
+            and len(multi_layer_frame) > 1
+        ):
+            first_layer_input = board_image_input_from_source(
+                multi_layer_frame[0],
+                source_attr="frame[0]",
+            )
+            if first_layer_input is not None:
+                image_input = first_layer_input
+        image_input_usable = self._has_usable_image_input(image_input)
+        preserve_late_frame = (
+            not image_input_usable
+            and previous_image_input is not None
+            and previous_levels_completed >= 3
+            and game_state not in self._reset_state_names
+        )
+        if (
+            preserve_late_frame
+            and levels_completed < previous_levels_completed
+        ):
+            image_input = previous_image_input
+            levels_completed = previous_levels_completed
+            image_input_usable = True
+        if image_input_usable:
+            self._last_image_input = image_input
+        self._last_levels_completed = levels_completed
+        board_model_result = self._board_model(image_input)
+        board_model = board_model_result.model
+        board = image_input.board if image_input is not None else []
+        beam_visible = any(4 in row for row in board) if board else False
+        beam_evidence_uncertain = board_model_result.error is not None and beam_visible
+        default_probe = default_click_target(image_input) if image_input is not None else {}
+        derived_features = {
+            "frame_count": len(frames),
+            "legal_actions": list(legal_actions),
+            "legal_actions_known": legal_actions_known,
+            "step_index_reliable": step_index_reliable,
+            "frame_signature": image_input.frame_signature if image_input is not None else None,
+            "board_height": image_input.height if image_input is not None else 0,
+            "board_width": image_input.width if image_input is not None else 0,
+            "board_active_cells": active_cell_count(image_input),
+            "board_default_probe": default_probe,
+            "board_source_attr": image_input.source_attr if image_input is not None else None,
+            "has_image_input": image_input is not None,
+            "player_position": board_model.player_pos if board_model is not None else None,
+            "goal_positions": list(board_model.goal_positions) if board_model is not None else [],
+            "has_beam": bool(board_model.features.has_beam) if board_model is not None else False,
+            "beam_visible": beam_visible,
+            "beam_evidence_uncertain": beam_evidence_uncertain,
+            "analyzer_perception_failed": board_model_result.error is not None,
+            "analyzer_perception_error": board_model_result.error,
+        }
+        shape_recognition = ensure_shape_recognition(image_input, derived_features)
+        return Observation(
+            game_id=self._game_id or str(self._get_attr(latest_frame, "game_id", "")),
+            step_index=step_index,
+            game_state=game_state,
+            levels_completed=levels_completed,
+            last_action=self._normalize_name(
+                self._get_attr(latest_frame, "last_action", "action")
+            ),
+            legal_actions=legal_actions,
+            image_input=image_input,
+            raw_frame_ref=latest_frame,
+            derived_features={
+                **derived_features,
+                "player_position": (
+                    derived_features["player_position"]
+                    or tuple(shape_recognition.get("active_anchor") or ())
+                    or None
+                ),
+                "goal_positions": (
+                    derived_features["goal_positions"]
+                    or [
+                        tuple(cluster.get("center", ()))
+                        for cluster in shape_recognition.get("goal_clusters", [])
+                        if cluster.get("center")
+                    ]
+                ),
+                "has_mirror": bool(shape_recognition.get("mirror", {}).get("present")),
+                "has_beam": derived_features["has_beam"],
+            },
+        )
+
+    def _has_usable_image_input(self, image_input: Any) -> bool:
+        if image_input is None:
+            return False
+        board = getattr(image_input, "board", None)
+        if not isinstance(board, list) or not board:
+            return False
+        first_row = board[0]
+        return isinstance(first_row, list) and len(first_row) > 0
+
+    def _board_model(self, image_input):
+        if image_input is None or not image_input.board:
+            return _BoardModelResult(model=None)
+        try:
+            return _BoardModelResult(model=build_game_model(image_input.board))
+        except Exception as exc:
+            return _BoardModelResult(model=None, error=f"{type(exc).__name__}: {exc}")
+
+    def legal_actions(self, observation: Observation) -> list[str]:
+        return list(observation.legal_actions)
+
+    def fallback_action_name(self, observation: Observation) -> str:
+        if observation.game_state in self._reset_state_names:
+            return "RESET"
+        legal_actions = [name for name in observation.legal_actions if name != "RESET"]
+        if legal_actions:
+            board_probe_action = preferred_board_probe_action(
+                legal_actions,
+                observation.image_input,
+            )
+            if board_probe_action is not None:
+                return board_probe_action
+            if self._deterministic_action in legal_actions:
+                return self._deterministic_action
+            return legal_actions[0]
+        return self._deterministic_action
+
+    def fallback_decision(self, observation: Observation) -> ActionDecision:
+        action_name = self.fallback_action_name(observation)
+        return ActionDecision(
+            action_name=action_name,
+            source="fallback",
+            confidence=0.05,
+            reason="deterministic adapter fallback",
+            subgoal=(
+                "inspect-active-board"
+                if action_name == "ACTION6" and observation.image_input is not None
+                else None
+            ),
+            metadata=self.default_metadata_for_action(action_name),
+            used_fallback=True,
+        )
+
+    def default_metadata_for_action(self, action_name: str) -> dict[str, Any]:
+        return self._default_metadata_for(action_name)
+
+    def to_game_action(self, decision: ActionDecision) -> Any:
+        action_name = self._resolve_game_action_name(decision.action_name)
+        action = self._game_action_cls[action_name]
+        if hasattr(action, "is_complex") and action.is_complex():
+            metadata = self._complex_action_metadata(decision)
+            x = metadata["x"]
+            y = metadata["y"]
+            if hasattr(action, "set_data"):
+                action.set_data({"x": x, "y": y})
+            if hasattr(action, "reasoning"):
+                action.reasoning = {
+                    "source": decision.source,
+                    "subgoal": decision.subgoal,
+                    "reason": decision.reason,
+                }
+        elif hasattr(action, "reasoning"):
+            action.reasoning = (
+                f"{decision.source}: {decision.reason}"
+                if decision.reason
+                else decision.source
+            )
+        return action
+
+    def _discover_default_actions(self) -> list[str]:
+        action_names: list[str] = []
+        try:
+            for action in self._game_action_cls:
+                name = self._normalize_name(action)
+                if name:
+                    action_names.append(name)
+        except TypeError:
+            pass
+        if not action_names:
+            action_names = [
+                "RESET",
+                "ACTION1",
+                "ACTION2",
+                "ACTION3",
+                "ACTION4",
+                "ACTION5",
+                "ACTION6",
+            ]
+        return [name for name in action_names if name != "RESET"]
+
+    def _supported_action_names(self) -> set[str]:
+        return {"RESET", *self._default_legal_actions}
+
+    def _default_metadata_for(self, action_name: str) -> dict[str, Any]:
+        if action_name == "ACTION6":
+            if self._last_image_input is not None and self._last_image_input.width > 0 and self._last_image_input.height > 0:
+                return self._default_complex_click_metadata()
+            return {"x": 32, "y": 32}
+        return {}
+
+    def _complex_action_metadata(self, decision: ActionDecision) -> dict[str, int]:
+        default_metadata = dict(self._default_metadata_for(decision.action_name))
+        metadata = dict(decision.metadata or {})
+        x = self._coerce_coordinate(metadata.get("x"))
+        y = self._coerce_coordinate(metadata.get("y"))
+        if x is None or y is None:
+            x = self._coerce_coordinate(default_metadata.get("x"))
+            y = self._coerce_coordinate(default_metadata.get("y"))
+        return {
+            "x": 32 if x is None else x,
+            "y": 32 if y is None else y,
+        }
+
+    def _coerce_coordinate(self, value: Any) -> int | None:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _default_complex_click_metadata(self) -> dict[str, int]:
+        return default_click_target(self._last_image_input)
+
+    def _extract_legal_actions(self, latest_frame: Any, game_state: str) -> tuple[list[str], bool]:
+        explicit, explicit_known = self._extract_explicit_actions(latest_frame)
+        if game_state in self._reset_state_names:
+            return ["RESET"], True
+        if explicit_known:
+            return explicit, True
+        return [], False
+
+    def _extract_step_index(self, frames: list[Any], latest_frame: Any) -> tuple[int, bool]:
+        for name in ("step_index", "step", "turn_index", "turn", "frame_index"):
+            value = getattr(latest_frame, name, None)
+            try:
+                if value is not None:
+                    return int(value), True
+            except (TypeError, ValueError):
+                continue
+        return max(len(frames) - 1, 0), False
+
+    def _extract_explicit_actions(self, latest_frame: Any) -> tuple[list[str], bool]:
+        for name in ("legal_actions", "available_actions", "valid_actions", "actions"):
+            value = getattr(latest_frame, name, None)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                normalized = self._normalize_name(value)
+                return (
+                    [normalized] if self._is_supported_action_name(normalized) else [],
+                    True,
+                )
+            try:
+                actions = [self._normalize_name(item) for item in value]
+            except TypeError:
+                continue
+            actions = [
+                item for item in actions if self._is_supported_action_name(item)
+            ]
+            return actions, True
+        return [], False
+
+    def _resolve_game_action_name(self, value: Any) -> str:
+        normalized = self._normalize_name(value)
+        if self._is_supported_action_name(normalized):
+            return str(normalized)
+        if self._is_supported_action_name("RESET"):
+            return "RESET"
+        if self._is_supported_action_name(self._deterministic_action):
+            return self._deterministic_action
+        if self._default_legal_actions:
+            return self._default_legal_actions[0]
+        return "RESET"
+
+    def _is_supported_action_name(self, value: Any) -> bool:
+        if not value:
+            return False
+        return str(value) in self._supported_action_names()
+
+    def _get_attr(self, obj: Any, *names: str, default: Any = None) -> Any:
+        for name in names:
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        return default
+
+    def _normalize_name(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return str(value).upper()
+        if isinstance(value, int):
+            if value == 0:
+                return "RESET"
+            return f"ACTION{value}"
+        if hasattr(value, "name"):
+            return str(value.name).upper()
+        text = str(value).strip()
+        if not text:
+            return None
+        if "." in text:
+            text = text.split(".")[-1]
+        return text.upper()
