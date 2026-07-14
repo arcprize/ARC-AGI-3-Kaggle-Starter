@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 CUDA_AVAILABLE: bool = False
 CUDA_DEVICE_NAME: str = ""
 CUDA_DEVICE_ID: int = 0
+_KERNEL_CAPABILITY_NAMES = frozenset(
+    {
+        "salience",
+        "astar",
+        "components",
+        "grid_scale",
+        "mirror_placement",
+        "reflection_scoring",
+    }
+)
 
 
 def detect_components_gpu(
@@ -87,4 +97,18 @@ def is_enabled(config: object | None = None) -> bool:
         return False
     if config is not None:
         return bool(getattr(config, 'cuda_enabled', False))
-    return os.environ.get("AGI_CUDA_ENABLE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get("AGI_CUDA_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def kernel_available(
+    capability: str,
+    config: object | None = None,
+) -> bool:
+    """Return whether a specific CUDA runtime capability should be used.
+
+    This is intentionally conservative: any unknown capability name returns
+    False so runtime callers can fall back to CPU without widening failures.
+    """
+    if capability not in _KERNEL_CAPABILITY_NAMES:
+        return False
+    return is_enabled(config)

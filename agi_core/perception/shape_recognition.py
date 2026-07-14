@@ -7,10 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from agi_core.image_input import BoardImageInput
+from agi_core.perception.gpu_perception import get_cached_perception, gpu_perceive
 
 try:
     from agi_core.cuda import detect_components_gpu as _detect_components_gpu
     from agi_core.cuda import best_reflection_placement_gpu as _best_reflection_placement_gpu
+    from agi_core.cuda import kernel_available as _cuda_kernel_available
     _CUDA_COMPONENTS_AVAILABLE = True
 except ImportError:
     _CUDA_COMPONENTS_AVAILABLE = False
@@ -160,8 +162,24 @@ def _detect_background(board: list[list[int]]) -> int:
 
 
 def _color_components(board: list[list[int]], background_color: int) -> list[_ColorComponent]:
+    if _CUDA_COMPONENTS_AVAILABLE and _cuda_kernel_available("components"):
+        cached_perception = get_cached_perception(board, bg_color=background_color)
+        if cached_perception is None:
+            cached_perception = gpu_perceive(board, bg_color=background_color)
+        if cached_perception is not None and cached_perception.raw_components:
+            return [
+                _ColorComponent(
+                    color=entry["color"],
+                    cells=entry["cells"],
+                    bbox=entry["bbox"],
+                    center=entry["center"],
+                    touches_border=entry["touches_border"],
+                )
+                for entry in cached_perception.raw_components
+            ]
+
     # Try GPU-accelerated path first
-    if _CUDA_COMPONENTS_AVAILABLE:
+    if _CUDA_COMPONENTS_AVAILABLE and _cuda_kernel_available("components"):
         gpu_result = _detect_components_gpu(board, bg_color=background_color)
         if gpu_result is not None:
             return [

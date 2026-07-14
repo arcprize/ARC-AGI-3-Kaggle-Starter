@@ -4,17 +4,19 @@ import heapq
 import logging
 from concurrent.futures import Future
 
+from agi_core.cuda import kernel_available
+
 logger = logging.getLogger(__name__)
 
 # Threshold: problems with more passable cells than this run in the process
 # pool (true parallelism, bypassing the GIL). Smaller problems run inline.
 _PROCESS_POOL_THRESHOLD = 5000
+_CUDA_ASTAR_MIN_PASSABLE = 768
 
 # A* Future cache: {(start, goal) -> Future}.
 # Populated by orchestrator's background pre-computation (process pool).
 # astar() pops the Future and awaits it with a short timeout.
-# Only Futures are stored (not results) — avoids id() reuse issues from
-# stale inline results across garbage collected passable sets.
+# Only Futures are stored (not results) to avoid stale inline results.
 path_cache: dict[tuple[tuple[int, int], tuple[int, int]], Future] = {}
 
 
@@ -34,7 +36,7 @@ def astar(
         return None
     if start == goal:
         return [start]
-    # Check cache for a pre-computed Future (from background process pool).
+
     key = (start, goal)
     cached = path_cache.pop(key, None)
     if cached is not None:
@@ -42,17 +44,60 @@ def astar(
             return cached.result(timeout=0.5)
         except Exception:
             pass
-    # Large search spaces → process pool for true CPU parallelism.
+
+    cuda_path = _astar_via_cuda(start, goal, passable, width, height)
+    if cuda_path is not None:
+        return cuda_path
+
     if should_use_process_pool(len(passable)):
         try:
             from agi_core.orch_or.parallel import ProcessPoolManager
-            f = ProcessPoolManager.submit(
-                _astar_impl, start, goal, passable, width, height, max_steps,
+
+            future = ProcessPoolManager.submit(
+                _astar_impl,
+                start,
+                goal,
+                passable,
+                width,
+                height,
+                max_steps,
             )
-            return f.result()
+            return future.result()
         except Exception:
             pass
+
     return _astar_impl(start, goal, passable, width, height, max_steps)
+
+
+def _astar_via_cuda(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    passable: set[tuple[int, int]],
+    width: int,
+    height: int,
+) -> list[tuple[int, int]] | None:
+    if not kernel_available("astar"):
+        return None
+    if width != 64 or height != 64:
+        return None
+    if len(passable) < _CUDA_ASTAR_MIN_PASSABLE:
+        return None
+    try:
+        from agi_core.cuda.astar import batch_astar_gpu
+
+        results = batch_astar_gpu(
+            [passable],
+            [start],
+            [goal],
+            width=width,
+            height=height,
+        )
+    except Exception as exc:
+        logger.debug("A* CUDA fast path unavailable: %s", exc)
+        return None
+    if not results:
+        return None
+    return results[0]
 
 
 def _astar_impl(
@@ -83,7 +128,7 @@ def _astar_impl(
         if len(g_score) > max_steps:
             return None
         cx, cy = current
-        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             neighbor = (cx + dx, cy + dy)
             if neighbor[0] < 0 or neighbor[0] >= width or neighbor[1] < 0 or neighbor[1] >= height:
                 continue

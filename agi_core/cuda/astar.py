@@ -1,11 +1,10 @@
 """GPU-accelerated batch A* pathfinding with CPU fallback."""
 
 import logging
-from typing import Any
 
 import numpy as np
 
-from agi_core.cuda import CUDA_AVAILABLE, is_enabled
+from agi_core.cuda import CUDA_AVAILABLE, kernel_available
 from agi_core.cuda.kernels import _launch_astar_kernel
 
 logger = logging.getLogger(__name__)
@@ -19,72 +18,87 @@ def batch_astar_gpu(
     height: int = 64,
     config: object | None = None,
 ) -> list[list[tuple[int, int]] | None]:
-    """Run batch A* on the GPU for multiple agents.
-    
-    Each entry in ``walkable_sets``, ``start_positions``, ``goal_positions``
-    represents one search.  Returns a list of paths (list of (x, y) tuples)
-    or None for searches that found no path.
-    
-    Falls back to CPU if CUDA is unavailable.
-    """
-    if not is_enabled(config) or not CUDA_AVAILABLE:
-        return _fallback_cpu(walkable_sets, start_positions, goal_positions)
+    """Run batch A* on the GPU for multiple agents."""
+    if not kernel_available("astar", config) or not CUDA_AVAILABLE:
+        return _fallback_cpu(
+            walkable_sets,
+            start_positions,
+            goal_positions,
+            width=width,
+            height=height,
+        )
 
     n = len(start_positions)
     if n == 0:
         return []
 
     try:
-        # Build binary walkable raster for each search
-        # (we use a single walkable raster for all — the union)
-        walkable_np = np.zeros((height, width), dtype=np.uint8)
-        for ws in walkable_sets:
-            for x, y in ws:
+        walkable_np = np.zeros((n, height, width), dtype=np.uint8)
+        for index, walkable in enumerate(walkable_sets):
+            for x, y in walkable:
                 if 0 <= x < width and 0 <= y < height:
-                    walkable_np[y, x] = 1
+                    walkable_np[index, y, x] = 1
 
-        starts_x = np.array([s[0] for s in start_positions], dtype=np.int32)
-        starts_y = np.array([s[1] for s in start_positions], dtype=np.int32)
-        goals_x = np.array([g[0] for g in goal_positions], dtype=np.int32)
-        goals_y = np.array([g[1] for g in goal_positions], dtype=np.int32)
-
-        paths_out = np.zeros((n, 256), dtype=np.int32)
+        starts_x = np.array([start[0] for start in start_positions], dtype=np.int32)
+        starts_y = np.array([start[1] for start in start_positions], dtype=np.int32)
+        goals_x = np.array([goal[0] for goal in goal_positions], dtype=np.int32)
+        goals_y = np.array([goal[1] for goal in goal_positions], dtype=np.int32)
+        paths_out = np.full((n, 256), -1, dtype=np.int32)
         path_lens = np.zeros(n, dtype=np.int32)
 
-        _launch_astar_kernel(walkable_np, starts_x, starts_y, goals_x, goals_y, paths_out, path_lens)
+        _launch_astar_kernel(
+            walkable_np,
+            starts_x,
+            starts_y,
+            goals_x,
+            goals_y,
+            paths_out,
+            path_lens,
+        )
 
-        # Reconstruct Python paths
         results: list[list[tuple[int, int]] | None] = []
-        for i in range(n):
-            length = int(path_lens[i])
-            if length == 0:
+        for index in range(n):
+            path_len = int(path_lens[index])
+            if path_len <= 0:
                 results.append(None)
-            else:
-                path = []
-                for j in range(length):
-                    idx = int(paths_out[i, j])
-                    if idx < 0:
-                        break
-                    x = idx % width
-                    y = idx // width
-                    path.append((x, y))
-                results.append(path)
+                continue
+            path: list[tuple[int, int]] = []
+            for step in range(path_len):
+                cell_index = int(paths_out[index, step])
+                if cell_index < 0:
+                    break
+                path.append((cell_index % width, cell_index // width))
+            results.append(path or None)
         return results
-
     except Exception as exc:
         logger.debug("CUDA A* failed: %s", exc)
-        return _fallback_cpu(walkable_sets, start_positions, goal_positions)
+        return _fallback_cpu(
+            walkable_sets,
+            start_positions,
+            goal_positions,
+            width=width,
+            height=height,
+        )
 
 
 def _fallback_cpu(
     walkable_sets: list[set[tuple[int, int]]],
     start_positions: list[tuple[int, int]],
     goal_positions: list[tuple[int, int]],
+    *,
+    width: int,
+    height: int,
 ) -> list[list[tuple[int, int]] | None]:
     """CPU fallback: run iterative A* for each search."""
-    from agi_core.orch_or.search import astar
+    from agi_core.orch_or.search import _astar_impl
+
     results: list[list[tuple[int, int]] | None] = []
-    for ws, start, goal in zip(walkable_sets, start_positions, goal_positions):
-        path = astar(start, goal, ws, 64, 64)
-        results.append(path)
+    for walkable, start, goal in zip(walkable_sets, start_positions, goal_positions):
+        if start not in walkable or goal not in walkable:
+            results.append(None)
+            continue
+        if start == goal:
+            results.append([start])
+            continue
+        results.append(_astar_impl(start, goal, walkable, width, height))
     return results

@@ -27,6 +27,7 @@ from agi_core.knowledge.solvers.mirror_solver import (
 )
 from agi_core.knowledge.solvers.beam_coverage_solver import (
     BeamCoverageSolver,
+    find_candidate_placements,
     rank_horizontal_mirror_plans,
     rank_joint_best_placements,
     select_best_horizontal_mirror_plan,
@@ -4800,6 +4801,140 @@ class TestBeamCoverageSolver(unittest.TestCase):
 
         self.assertEqual(solver._active_stage_index, 1)
         self.assertIsNotNone(solver._cached_targets)
+
+    def test_find_candidate_placements_preserves_cpu_top_choice_with_gpu_scores(self) -> None:
+        shape_cells = [(3, 3), (6, 3)]
+        goals = {(18, 15), (18, 18)}
+        mirror_info = {"horizontal": True, "axis_px": 0, "axis_py": 12}
+        current_center = (4, 3)
+        cpu_candidates = find_candidate_placements(
+            shape_cells,
+            goals,
+            mirror_info,
+            24,
+            24,
+            current_center=current_center,
+            gs=3,
+        )
+        self.assertTrue(cpu_candidates)
+        best = cpu_candidates[0]
+        top_left = tuple(best["top_left"])
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.score_reflection_candidates_gpu",
+            return_value=[
+                {
+                    "top_left_x": int(top_left[0]),
+                    "top_left_y": int(top_left[1]),
+                    "center_x": int(best["target_anchor"][0]),
+                    "center_y": int(best["target_anchor"][1]),
+                    "hits": int(best["hits"]),
+                }
+            ],
+        ):
+            gpu_candidates = find_candidate_placements(
+                shape_cells,
+                goals,
+                mirror_info,
+                24,
+                24,
+                current_center=current_center,
+                gs=3,
+            )
+
+        self.assertTrue(gpu_candidates)
+        self.assertEqual(tuple(gpu_candidates[0]["top_left"]), top_left)
+        self.assertEqual(gpu_candidates[0]["hits"], best["hits"])
+
+
+class TestCudaPlannerParity(unittest.TestCase):
+    def test_horizontal_mirror_target_keeps_cpu_choice_with_gpu_scores(self) -> None:
+        gm = game_ar25_level3()
+        solver = MirrorSolver()
+        shape_comps = [c for c in gm.components if _is_interior_shape_piece(c, gm)]
+        mirror_comp = next(c for c in gm.components if c.dominant_color == 10)
+        mirror_py = sum(cy for _, cy in mirror_comp.cells) // len(mirror_comp.cells)
+        cpu_target = solver._best_horizontal_shape_target(
+            gm,
+            gm.player_pos,
+            mirror_py,
+            shape_comps,
+        )
+        self.assertIsNotNone(cpu_target)
+
+        active_shape = _active_shape_component(shape_comps, gm.player_pos)
+        goal_cells = {
+            cell
+            for comp in gm.components
+            if comp.dominant_color == 11 and any(cx < gm.width - 1 for cx, _ in comp.cells)
+            for cell in comp.cells
+        }
+        player_sign = 1 if gm.player_pos[1] >= mirror_py else -1
+        active_cells = {
+            (x, y)
+            for x, y in active_shape.cells
+            if ((y - mirror_py) >= 0) == (player_sign > 0)
+        } or set(active_shape.cells)
+        other_coverage = set()
+        for comp in shape_comps:
+            if comp is active_shape:
+                continue
+            comp_cells = {
+                (x, y)
+                for x, y in comp.cells
+                if ((y - mirror_py) >= 0) == (player_sign > 0)
+            } or set(comp.cells)
+            other_coverage.update({(x, 2 * mirror_py - y) for x, y in comp_cells})
+        remaining_goals = goal_cells - other_coverage
+        xs = [x for x, _ in active_cells]
+        ys = [y for _, y in active_cells]
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        rel_cells = {(x - x1, y - y1) for x, y in active_cells}
+        remaining_scores: list[dict[str, int]] = []
+        total_scores: list[dict[str, int]] = []
+        for tx in range(0, gm.width - (x2 - x1 + 1) + 1):
+            for ty in range(0, gm.height - (y2 - y1 + 1) + 1):
+                placed = {(tx + dx, ty + dy) for dx, dy in rel_cells}
+                reflected = {(x, 2 * mirror_py - y) for x, y in placed}
+                if any(x < 0 or x >= gm.width or y < 0 or y >= gm.height for x, y in reflected):
+                    continue
+                remaining_hits = len(reflected & remaining_goals)
+                total_hits = len(reflected & goal_cells)
+                if remaining_hits > 0:
+                    remaining_scores.append(
+                        {
+                            "top_left_x": tx,
+                            "top_left_y": ty,
+                            "center_x": sum(x for x, _ in placed) // len(placed),
+                            "center_y": sum(y for _, y in placed) // len(placed),
+                            "hits": remaining_hits,
+                        }
+                    )
+                if total_hits > 0:
+                    total_scores.append(
+                        {
+                            "top_left_x": tx,
+                            "top_left_y": ty,
+                            "center_x": sum(x for x, _ in placed) // len(placed),
+                            "center_y": sum(y for _, y in placed) // len(placed),
+                            "hits": total_hits,
+                        }
+                    )
+        with patch(
+            "agi_core.knowledge.solvers.mirror_solver.score_reflection_candidates_gpu",
+            side_effect=[
+                remaining_scores,
+                total_scores,
+            ],
+        ):
+            gpu_target = solver._best_horizontal_shape_target(
+                gm,
+                gm.player_pos,
+                mirror_py,
+                shape_comps,
+            )
+
+        self.assertEqual(gpu_target, cpu_target)
 
 
 GAMES: dict[str, Callable[[], GameModel]] = {

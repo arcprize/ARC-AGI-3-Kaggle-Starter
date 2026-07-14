@@ -194,9 +194,7 @@ def _launch_astar_kernel(walkable, starts_x, starts_y, goals_x, goals_y, paths_o
                         if nx < 0 or nx >= width or ny < 0 or ny >= height:
                             continue
                         ni = ny * width + nx
-                        if closed[ni] or walkable[ni] == 0:
-                            continue
-                        if walkable[ny, nx] == 0:
+                        if closed[ni] or walkable[bid, ny, nx] == 0:
                             continue
                         new_g = g_score[best_idx] + 1.0
                         if new_g < g_score[ni]:
@@ -232,7 +230,7 @@ def _launch_astar_kernel(walkable, starts_x, starts_y, goals_x, goals_y, paths_o
 
     n_searches = len(starts_x)
     _astar_kernel[n_searches, 128](
-        walkable, walkable.shape[1], walkable.shape[0],
+        walkable, walkable.shape[2], walkable.shape[1],
         starts_x, starts_y,
         goals_x, goals_y,
         paths_out, path_lens,
@@ -556,6 +554,61 @@ def _launch_mirror_placement_kernel(
         goal_bitmask, shape_mask, shape_w, shape_h,
         int(horizontal), int(axis), width, height,
         best_out,
+    )
+    cuda.synchronize()
+
+
+def _launch_reflection_score_kernel(
+    goal_bitmask,
+    shape_mask,
+    shape_w,
+    shape_h,
+    horizontal,
+    axis,
+    width,
+    height,
+    score_out,
+):
+    """Score reflected-goal hits for every top-left placement position."""
+    from numba import cuda, int32
+
+    @cuda.jit
+    def _reflection_score_kernel(
+        goal, shape, sw, sh, horiz, axis,
+        width, height, score_out,
+    ):
+        tx, ty = cuda.grid(2)
+        max_tx = width - sw
+        max_ty = height - sh
+        if tx > max_tx or ty > max_ty:
+            return
+
+        hits = 0
+        for dy in range(sh):
+            for dx in range(sw):
+                if shape[dy, dx]:
+                    if horiz:
+                        rx = tx + dx
+                        ry = 2 * axis - (ty + dy)
+                    else:
+                        rx = 2 * axis - (tx + dx)
+                        ry = ty + dy
+                    if 0 <= rx < width and 0 <= ry < height and goal[ry, rx]:
+                        hits += 1
+        score_out[ty, tx] = int32(hits)
+
+    max_tx = max(0, width - shape_w)
+    max_ty = max(0, height - shape_h)
+    tx_dim = min(16, max_tx + 1) if max_tx >= 0 else 1
+    ty_dim = min(16, max_ty + 1) if max_ty >= 0 else 1
+    threads = (max(1, tx_dim), max(1, ty_dim))
+    blocks = (
+        (max_tx + threads[0]) // threads[0] if threads[0] > 0 else 1,
+        (max_ty + threads[1]) // threads[1] if threads[1] > 0 else 1,
+    )
+    _reflection_score_kernel[blocks, threads](
+        goal_bitmask, shape_mask, shape_w, shape_h,
+        int(horizontal), int(axis), width, height, score_out,
     )
     cuda.synchronize()
 

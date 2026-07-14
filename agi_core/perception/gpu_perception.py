@@ -1,28 +1,24 @@
-"""Unified GPU-accelerated perception pipeline.
-
-Uploads the board to GPU once, runs connected-component labeling and
-grid scale detection in a single round-trip, then returns results in the
-formats expected by both ``analyzer.py`` and ``shape_recognition.py``.
-
-Every function has a CPU fallback — CUDA is only used when both the
-``AGI_CUDA_ENABLE`` env var is set AND a compatible GPU is detected.
-"""
+"""Unified GPU-accelerated perception pipeline."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
 from agi_core.cuda import (
     CUDA_AVAILABLE,
-    is_enabled,
     detect_components_gpu,
     detect_grid_scale_gpu,
+    kernel_available,
 )
 from agi_core.orch_or.game_model import Component
 
 logger = logging.getLogger(__name__)
+_PERCEPTION_CACHE_LIMIT = 4
+_PERCEPTION_CACHE: OrderedDict[tuple[str, int, int, int], "PerceptionResult"] = OrderedDict()
 
 
 def _component_confidence_from_gpu_entry(
@@ -49,15 +45,46 @@ def _component_confidence_from_gpu_entry(
     return max(0.1, min(1.0, score))
 
 
+def _board_cache_key(board: list[list[int]], bg_color: int) -> tuple[str, int, int, int]:
+    height = len(board)
+    width = len(board[0]) if board and board[0] else 0
+    payload = bytearray()
+    for row in board:
+        for value in row:
+            payload.extend(int(value).to_bytes(2, "little", signed=True))
+    digest = hashlib.blake2b(payload, digest_size=16).hexdigest()
+    return (digest, width, height, int(bg_color))
+
+
+def _remember_perception(key: tuple[str, int, int, int], result: "PerceptionResult") -> "PerceptionResult":
+    _PERCEPTION_CACHE[key] = result
+    _PERCEPTION_CACHE.move_to_end(key)
+    while len(_PERCEPTION_CACHE) > _PERCEPTION_CACHE_LIMIT:
+        _PERCEPTION_CACHE.popitem(last=False)
+    return result
+
+
+def get_cached_perception(
+    board: list[list[int]],
+    *,
+    bg_color: int = -1,
+) -> "PerceptionResult | None":
+    if not CUDA_AVAILABLE:
+        return None
+    key = _board_cache_key(board, bg_color)
+    cached = _PERCEPTION_CACHE.get(key)
+    if cached is None:
+        return None
+    _PERCEPTION_CACHE.move_to_end(key)
+    return cached
+
+
 @dataclass(slots=True)
 class PerceptionResult:
-    """Unified result from the GPU perception pipeline.
-
-    Both ``analyzer.py`` and ``shape_recognition.py`` can consume this.
-    """
     analyzer_components: list[Component] = field(default_factory=list)
     grid_scale: int = 1
     color_frequencies: dict[int, int] = field(default_factory=dict)
+    raw_components: list[dict[str, Any]] = field(default_factory=list)
 
 
 def gpu_perceive(
@@ -65,33 +92,24 @@ def gpu_perceive(
     bg_color: int = -1,
     config: object | None = None,
 ) -> PerceptionResult | None:
-    """Run the entire perception pipeline on the GPU in one round-trip.
-
-    Parameters
-    ----------
-    board : 64×64 int grid.
-    bg_color : background colour to exclude from colour frequencies.
-    config : optional config with a ``cuda_enabled`` attribute.
-
-    Returns
-    -------
-    A ``PerceptionResult`` or *None* if CUDA is unavailable / fails.
-    """
-    if not is_enabled(config) or not CUDA_AVAILABLE:
+    """Run the perception pipeline on the GPU in one round-trip."""
+    if not CUDA_AVAILABLE or not kernel_available("components", config):
         return None
 
+    cached = get_cached_perception(board, bg_color=bg_color)
+    if cached is not None:
+        return cached
+
     try:
-        # 1. Component detection (GPU CCL) — already unified
-        comp_result = detect_components_gpu(board, bg_color=bg_color)
+        comp_result = detect_components_gpu(board, bg_color=bg_color, config=config)
         if comp_result is None:
             return None
 
-        raw_components = comp_result["components"]
-        color_freq = comp_result["color_frequencies"]
+        raw_components = list(comp_result["components"])
+        color_freq = dict(comp_result["color_frequencies"])
         total_pixels = len(board) * (len(board[0]) if board and board[0] else 0)
 
-        # 2. Build analyzer-style Component list
-        analyzer_comps = [
+        analyzer_components = [
             Component(
                 cells=entry["cells"],
                 bbox=entry["bbox"],
@@ -108,18 +126,19 @@ def gpu_perceive(
             if entry["color"] != bg_color and entry["color"] >= 0
         ]
 
-        # 3. Grid scale detection (GPU)
-        grid_scale = detect_grid_scale_gpu(board)
+        grid_scale = detect_grid_scale_gpu(board, config=config)
         if grid_scale is None:
             from agi_core.orch_or.analyzer import _detect_grid_scale
+
             grid_scale = _detect_grid_scale(board)
 
-        return PerceptionResult(
-            analyzer_components=analyzer_comps,
+        result = PerceptionResult(
+            analyzer_components=analyzer_components,
             grid_scale=grid_scale,
             color_frequencies=color_freq,
+            raw_components=raw_components,
         )
-
+        return _remember_perception(_board_cache_key(board, bg_color), result)
     except Exception as exc:
         logger.debug("GPU perception pipeline failed: %s", exc)
         return None

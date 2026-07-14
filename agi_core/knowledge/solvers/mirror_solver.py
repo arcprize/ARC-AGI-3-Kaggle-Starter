@@ -12,6 +12,7 @@ from agi_core.knowledge.puzzle_memory import (
     query_similar_state,
     store_board_state,
 )
+from agi_core.cuda.mirror_solver import score_reflection_candidates_gpu
 from agi_core.knowledge.solvers import DynamicsSolver, SolverContext, register_solver
 from agi_core.orch_or.analyzer import _component_center
 from agi_core.orch_or.game_model import DIR_TO_ACTION
@@ -773,6 +774,32 @@ class MirrorSolver(DynamicsSolver):
         shape_h = y2 - y1 + 1
         current_cx = sum(x for x, _ in active_cells) // len(active_cells)
         current_cy = sum(y for _, y in active_cells) // len(active_cells)
+        gpu_remaining = score_reflection_candidates_gpu(
+            width=gm.width,
+            height=gm.height,
+            component_cells=list(active_cells),
+            component_bbox=(x1, y1, x2, y2),
+            goal_cells=remaining_goals,
+            horizontal=True,
+            axis=mirror_py,
+        ) or []
+        gpu_total = score_reflection_candidates_gpu(
+            width=gm.width,
+            height=gm.height,
+            component_cells=list(active_cells),
+            component_bbox=(x1, y1, x2, y2),
+            goal_cells=goal_cells,
+            horizontal=True,
+            axis=mirror_py,
+        ) or []
+        gpu_remaining_hits = {
+            (item["top_left_x"], item["top_left_y"]): int(item["hits"])
+            for item in gpu_remaining
+        }
+        gpu_total_hits = {
+            (item["top_left_x"], item["top_left_y"]): int(item["hits"])
+            for item in gpu_total
+        }
         best: tuple[int, int, int, int, int] | None = None
         for tx in range(0, gm.width - shape_w + 1):
             for ty in range(0, gm.height - shape_h + 1):
@@ -780,8 +807,13 @@ class MirrorSolver(DynamicsSolver):
                 reflected = _reflect_horizontal_cells(placed, mirror_py)
                 if any(x < 0 or x >= gm.width or y < 0 or y >= gm.height for x, y in reflected):
                     continue
-                fresh_hits = len(reflected & remaining_goals)
-                total_hits = len((reflected | other_coverage) & goal_cells)
+                fresh_hits = gpu_remaining_hits.get((tx, ty))
+                if fresh_hits is None:
+                    fresh_hits = len(reflected & remaining_goals)
+                total_hits = gpu_total_hits.get((tx, ty))
+                if total_hits is None:
+                    total_hits = len(reflected & goal_cells)
+                total_hits = len((reflected | other_coverage) & goal_cells) if total_hits > 0 else len((reflected | other_coverage) & goal_cells)
                 if fresh_hits <= 0 and total_hits <= 0:
                     continue
                 center_x = sum(x for x, _ in placed) // len(placed)

@@ -6,6 +6,7 @@ from itertools import product
 from pathlib import Path
 from typing import Any
 
+from agi_core.cuda.mirror_solver import score_reflection_candidates_gpu
 from agi_core.knowledge.solvers import DynamicsSolver, SolverContext, register_solver
 from agi_core.orch_or.game_model import DIR_TO_ACTION
 from agi_core.orch_or.search import astar
@@ -378,6 +379,49 @@ def _placed_shape_from_anchor(
     return {(px + dx, py + dy) for dx, dy in rel_set}
 
 
+def _gpu_scored_candidate_positions(
+    *,
+    shape_cells: list[tuple[int, int]],
+    remaining_goals: set[tuple[int, int]],
+    mirror_info: dict[str, Any],
+    board_width: int,
+    board_height: int,
+    forbidden_cells: set[tuple[int, int]] | None,
+    gs: int,
+) -> list[tuple[int, int]]:
+    if not shape_cells or not remaining_goals:
+        return []
+    xs = [x for x, _ in shape_cells]
+    ys = [y for _, y in shape_cells]
+    x1, y1 = min(xs), min(ys)
+    x2, y2 = max(xs), max(ys)
+    candidates = score_reflection_candidates_gpu(
+        width=board_width,
+        height=board_height,
+        component_cells=shape_cells,
+        component_bbox=(x1, y1, x2, y2),
+        goal_cells=remaining_goals,
+        horizontal=bool(mirror_info.get("horizontal")),
+        axis=int(mirror_info.get("axis_py" if mirror_info.get("horizontal") else "axis_px", 0)),
+    )
+    if not candidates:
+        return []
+    rel_set = {(x - x1, y - y1) for x, y in shape_cells}
+    step = max(1, gs)
+    ranked: list[tuple[int, int, int]] = []
+    for candidate in candidates:
+        tx = int(candidate["top_left_x"])
+        ty = int(candidate["top_left_y"])
+        if tx % step != 0 or ty % step != 0:
+            continue
+        placed = {(tx + dx, ty + dy) for dx, dy in rel_set}
+        if forbidden_cells and placed & forbidden_cells:
+            continue
+        ranked.append((int(candidate["hits"]), tx, ty))
+    ranked.sort(reverse=True)
+    return [(tx, ty) for _, tx, ty in ranked]
+
+
 def _score_stage_target_family(
     stage_targets: list[dict[str, Any]],
     shapes: list[list[tuple[int, int]]],
@@ -457,18 +501,31 @@ def find_candidate_placements(
         return []
 
     rel_set = {(x - x1, y - y1) for x, y in shape_cells}
-    candidates: list[dict[str, Any]] = []
-
     step = max(1, gs)
-    for tx in range(0, max(1, board_width - shape_w + 1), step):
-        for ty in range(0, max(1, board_height - shape_h + 1), step):
+    gpu_positions = _gpu_scored_candidate_positions(
+        shape_cells=shape_cells,
+        remaining_goals=remaining_goals,
+        mirror_info=mirror_info,
+        board_width=board_width,
+        board_height=board_height,
+        forbidden_cells=forbidden_cells,
+        gs=gs,
+    )
+    if gpu_positions:
+        scan_positions = gpu_positions
+    else:
+        scan_positions = [
+            (tx, ty)
+            for tx in range(0, max(1, board_width - shape_w + 1), step)
+            for ty in range(0, max(1, board_height - shape_h + 1), step)
+        ]
+
+    candidates: list[dict[str, Any]] = []
+    for tx, ty in scan_positions:
             placed = {(tx + dx, ty + dy) for dx, dy in rel_set}
             # Skip if any placed cell overlaps the mirror
             if forbidden_cells and placed & forbidden_cells:
                 continue
-            covered = predict_beam_coverage(
-                list(placed), mirror_info, board_width, board_height, gs=gs,
-            )
             logical_beam = predict_beam_cells(
                 list(placed), mirror_info, board_width, board_height, gs=gs,
             )

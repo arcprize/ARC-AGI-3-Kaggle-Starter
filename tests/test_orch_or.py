@@ -529,6 +529,70 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(gm.width, 0)
         self.assertIsNone(gm.player_pos)
 
+    def test_gpu_perception_cache_is_reused_by_shape_recognition(self) -> None:
+        from agi_core.image_input import BoardImageInput
+        from agi_core.perception.shape_recognition import recognize_shape_recognition
+
+        board = [
+            [9, 9, 9, 9],
+            [9, 5, 9, 11],
+            [9, 10, 9, 9],
+            [9, 9, 9, 9],
+        ]
+        fake_components = {
+            "components": [
+                {
+                    "cells": [(1, 1)],
+                    "bbox": (1, 1, 1, 1),
+                    "size": 1,
+                    "color": 5,
+                    "center": (1, 1),
+                    "touches_border": False,
+                },
+                {
+                    "cells": [(1, 2)],
+                    "bbox": (1, 2, 1, 2),
+                    "size": 1,
+                    "color": 10,
+                    "center": (1, 2),
+                    "touches_border": False,
+                },
+                {
+                    "cells": [(3, 1)],
+                    "bbox": (3, 1, 3, 1),
+                    "size": 1,
+                    "color": 11,
+                    "center": (3, 1),
+                    "touches_border": False,
+                },
+            ],
+            "color_frequencies": {5: 1, 10: 1, 11: 1},
+        }
+
+        with patch("agi_core.perception.gpu_perception.CUDA_AVAILABLE", True), patch(
+            "agi_core.perception.gpu_perception.kernel_available",
+            return_value=True,
+        ), patch(
+            "agi_core.perception.gpu_perception.detect_components_gpu",
+            return_value=fake_components,
+        ) as detect_components, patch(
+            "agi_core.perception.gpu_perception.detect_grid_scale_gpu",
+            return_value=1,
+        ):
+            build_game_model(board)
+            artifact = recognize_shape_recognition(
+                BoardImageInput(
+                    board=board,
+                    height=4,
+                    width=4,
+                    frame_signature="cache-test",
+                    source_attr="cache-test",
+                )
+            )
+
+        self.assertTrue(artifact["mirror"]["present"])
+        self.assertEqual(detect_components.call_count, 1)
+
     def test_all_background_board_no_components(self) -> None:
         board = [[0] * 6 for _ in range(6)]
         gm = build_game_model(board)
@@ -775,6 +839,53 @@ class SearchTests(unittest.TestCase):
         self.assertIsNotNone(path)
         assert path is not None
         self.assertEqual(path[-1], (3, 1))
+
+    def test_astar_cuda_path_preserves_start_equals_goal(self) -> None:
+        path = astar((2, 2), (2, 2), {(2, 2)}, 64, 64)
+        self.assertEqual(path, [(2, 2)])
+
+    def test_astar_cuda_path_preserves_none_semantics(self) -> None:
+        passable = {(x, y) for x in range(32) for y in range(32)}
+        with patch(
+            "agi_core.cuda.astar.batch_astar_gpu",
+            return_value=[None],
+        ):
+            path = astar((0, 0), (31, 31), passable, 64, 64)
+        self.assertIsNone(path)
+
+    def test_astar_cuda_path_returns_gpu_result_when_available(self) -> None:
+        passable = {(x, y) for x in range(32) for y in range(32)}
+        expected = [(0, 0), (1, 0), (2, 0)]
+        with patch(
+            "agi_core.cuda.astar.batch_astar_gpu",
+            return_value=[expected],
+        ):
+            path = astar((0, 0), (2, 0), passable, 64, 64)
+        self.assertEqual(path, expected)
+
+    def test_astar_cpu_only_large_search_skips_cuda_helper(self) -> None:
+        passable = {(x, y) for x in range(32) for y in range(32)}
+        with patch(
+            "agi_core.orch_or.search.kernel_available",
+            return_value=False,
+        ), patch(
+            "agi_core.cuda.astar.batch_astar_gpu",
+            side_effect=AssertionError("cuda helper should not run"),
+        ):
+            path = astar((0, 0), (31, 31), passable, 64, 64)
+        self.assertIsNone(path)
+
+    def test_astar_cpu_only_matches_plain_impl(self) -> None:
+        from agi_core.orch_or.search import _astar_impl
+
+        passable = {(x, y) for x in range(32) for y in range(32)}
+        with patch(
+            "agi_core.orch_or.search.kernel_available",
+            return_value=False,
+        ):
+            public_path = astar((0, 0), (31, 31), passable, 64, 64)
+        impl_path = _astar_impl((0, 0), (31, 31), passable, 64, 64)
+        self.assertEqual(public_path, impl_path)
 
 # ---------------------------------------------------------------------------
 # Reducer
