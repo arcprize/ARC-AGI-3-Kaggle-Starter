@@ -707,6 +707,8 @@ class BeamCoverageSolver(DynamicsSolver):
         self._reflected_visible_count: int = 0
         self._reflected_goal_count: int = 0
         self._reflection_offscreen: bool = False
+        self._stage_shape_centers: dict[int, tuple[int, int]] = {}
+        self._confirmed_shape_center: tuple[int, int] | None = None
 
     @property
     def has_active_attempt(self) -> bool:
@@ -753,6 +755,8 @@ class BeamCoverageSolver(DynamicsSolver):
         self._final_tuning = False
         self._last_decision_player_pos = None
         self._reset_reflection_recovery()
+        self._stage_shape_centers.clear()
+        self._confirmed_shape_center = None
 
     def _invalidate_target_cache(self) -> None:
         self._cached_targets = None
@@ -801,6 +805,11 @@ class BeamCoverageSolver(DynamicsSolver):
                 list(self._base_targets[0].get("target_anchor", []))
                 if self._base_targets else None
             ),
+            "cached_target_order": [
+                list(stage.get("target_anchor", []))
+                for stage in (self._cached_targets or [])
+                if isinstance(stage, dict)
+            ],
             "tune_step": self._tune_step,
             "attempt_id": self._attempt_id,
             "attempt_reset_reason": self._attempt_reset_reason,
@@ -817,6 +826,15 @@ class BeamCoverageSolver(DynamicsSolver):
             ),
             "active_stage_index": self._active_stage_index,
             "switch_pending": self._switch_pending,
+            "pending_switch_origin": (
+                list(self._pending_switch_origin)
+                if self._pending_switch_origin is not None else None
+            ),
+            "pending_switch_color": self._pending_switch_color,
+            "confirmed_shape_anchor": (
+                list(self._confirmed_shape_center)
+                if self._confirmed_shape_center is not None else None
+            ),
             "reflection_recovery": self._reflection_recovery,
             "recovery_direction": self._recovery_direction,
             "reflected_visible_count": self._reflected_visible_count,
@@ -826,6 +844,140 @@ class BeamCoverageSolver(DynamicsSolver):
         }
         metadata.update(extra)
         return metadata
+
+    def _visible_shape_candidates(
+        self,
+        shapes: list[list[tuple[int, int]]],
+    ) -> list[tuple[list[tuple[int, int]], tuple[int, int]]]:
+        candidates: list[tuple[list[tuple[int, int]], tuple[int, int]]] = []
+        for shape in shapes:
+            center = _shape_center(shape)
+            if center is None:
+                continue
+            candidates.append((shape, center))
+        return candidates
+
+    def _bind_stage_shape(self, stage_index: int, center: tuple[int, int]) -> None:
+        if stage_index < 0:
+            return
+        normalized = (int(center[0]), int(center[1]))
+        self._stage_shape_centers[stage_index] = normalized
+        self._confirmed_shape_center = normalized
+
+    def _select_active_shape_for_stage(
+        self,
+        shapes: list[list[tuple[int, int]]],
+        *,
+        stage_index: int,
+        target: tuple[int, int],
+    ) -> tuple[list[tuple[int, int]] | None, tuple[int, int] | None]:
+        candidates = self._visible_shape_candidates(shapes)
+        if not candidates:
+            return None, None
+        binding = self._stage_shape_centers.get(stage_index)
+        if binding is not None:
+            shape, center = min(
+                candidates,
+                key=lambda item: abs(item[1][0] - binding[0]) + abs(item[1][1] - binding[1]),
+            )
+        else:
+            shape, center = min(
+                candidates,
+                key=lambda item: abs(item[1][0] - target[0]) + abs(item[1][1] - target[1]),
+            )
+        self._bind_stage_shape(stage_index, center)
+        return shape, center
+
+    def _pending_stage_target(self, gs: int) -> tuple[int, int] | None:
+        if (
+            self._pending_stage_index is None
+            or not self._cached_targets
+            or self._pending_stage_index < 0
+            or self._pending_stage_index >= len(self._cached_targets)
+        ):
+            return None
+        stage = self._cached_targets[self._pending_stage_index]
+        if not isinstance(stage, dict):
+            return None
+        target = stage.get("target_anchor")
+        if not isinstance(target, (list, tuple)) or len(target) != 2:
+            return None
+        return (
+            (int(target[0]) // gs) * gs + (gs // 2),
+            (int(target[1]) // gs) * gs + (gs // 2),
+        )
+
+    def _horizontal_final_stage_covered(
+        self,
+        *,
+        active_shape: list[tuple[int, int]] | None,
+        mirror_info: dict[str, Any],
+        goals: list[tuple[int, int]],
+        board_width: int,
+        board_height: int,
+        gs: int,
+    ) -> bool:
+        if active_shape is None:
+            return False
+        beam_cells = predict_beam_cells(
+            active_shape,
+            mirror_info,
+            board_width,
+            board_height,
+            gs=gs,
+        )
+        covered = covered_goal_cells(beam_cells, goals, gs=gs)
+        self._reflected_goal_count = len(covered)
+        total_goals = {(x // max(1, gs), y // max(1, gs)) for x, y in goals}
+        return bool(total_goals) and covered >= total_goals
+
+    def _emit_tuning_action(
+        self,
+        *,
+        gm,
+        gx: int,
+        gy: int,
+        gs: int,
+        target_cx: int,
+        target_cy: int,
+    ) -> ActionDecision:
+        self._final_tuning = True
+        self._tune_step += 1
+        if self._tune_step > self._tune_budget:
+            self._restart_attempt_with_retry("final_tuning_exhausted", gm, gs)
+            return ActionDecision(
+                "ACTION5", "solver:beam-coverage", 0.40,
+                reason="coverage_full_reset",
+                metadata=self._decision_metadata(),
+            )
+        spiral = [
+            (0, -1), (1, 0), (0, 1), (-1, 0),
+            (0, -2), (1, -1), (2, 0), (1, 1),
+            (0, 2), (-1, 1), (-2, 0), (-1, -1),
+        ]
+        idx = (self._tune_step - 1) % len(spiral)
+        dvx, dvy = spiral[idx]
+        ngx, ngy = gx + dvx, gy + dvy
+        g_w = gm.width // gs
+        g_h = gm.height // gs
+        if 0 <= ngx < g_w and 0 <= ngy < g_h:
+            direction = "up" if dvy < 0 else "down" if dvy > 0 else "left" if dvx < 0 else "right"
+            return ActionDecision(
+                DIR_TO_ACTION.get(direction, "ACTION1"), "solver:beam-coverage", 0.45,
+                reason=f"coverage_tune_{direction}",
+                metadata=self._decision_metadata(
+                    target_anchor=[target_cx, target_cy],
+                    shape_stage=self._active_stage_index,
+                ),
+            )
+        return ActionDecision(
+            "ACTION6", "solver:beam-coverage", 0.40,
+            reason="coverage_tune_wait",
+            metadata=self._decision_metadata(
+                target_anchor=[target_cx, target_cy],
+                shape_stage=self._active_stage_index,
+            ),
+        )
 
     def _reset_attempt(self, reason: str) -> None:
         self._attempt_id += 1
@@ -849,6 +1001,8 @@ class BeamCoverageSolver(DynamicsSolver):
         self._mirror_target_gy = None
         self._reset_mirror_phase_progress()
         self._reset_reflection_recovery()
+        self._stage_shape_centers.clear()
+        self._confirmed_shape_center = None
 
     def _reset_mirror_phase_progress(self, *, clear_unreachable: bool = False) -> None:
         self._mirror_phase = False
@@ -856,6 +1010,33 @@ class BeamCoverageSolver(DynamicsSolver):
         self._last_observed_mirror_gy = None
         if clear_unreachable:
             self._unreachable_mirror_rows.clear()
+
+    def _restart_attempt_with_retry(self, reason: str, gm, gs: int) -> None:
+        self._attempt_id += 1
+        self._attempt_reset_reason = reason
+        self._retry_count += 1
+        self._active_stage_index = -1
+        self._switch_pending = False
+        self._pending_stage_index = None
+        self._pending_switch_origin = None
+        self._pending_switch_color = None
+        self._pending_switch_frames = 0
+        self._pending_switch_retries = 0
+        self._pending_switch_scans = 0
+        self._shape_stuck_steps = 0
+        self._both_placed_steps = 0
+        self._tune_step = 0
+        self._final_tuning = False
+        self._last_player_pos = None
+        self._last_decision_player_pos = None
+        self._reset_reflection_recovery()
+        self._stage_shape_centers.clear()
+        self._confirmed_shape_center = None
+        if self._base_targets:
+            self._cached_targets = self._targets_with_retry_offset(self._base_targets, gm, gs)
+            self._cached_frame = self._last_levels_completed or self._cached_frame
+        else:
+            self._invalidate_target_cache()
 
     def _targets_with_retry_offset(
         self,
@@ -928,17 +1109,25 @@ class BeamCoverageSolver(DynamicsSolver):
             self._pending_switch_color is not None
             and player_color != self._pending_switch_color
         )
+        target = self._pending_stage_target(gs) or player_pos
+        candidates = self._visible_shape_candidates(shapes)
         visible_shape_cells = [cell for shape in shapes for cell in shape]
-        controls_shape = (
-            any(
-                abs(player_pos[0] - sx) + abs(player_pos[1] - sy) <= gs * 3
-                for sx, sy in visible_shape_cells
+        controlled_shape = None
+        if candidates:
+            controlled_shape = min(
+                candidates,
+                key=lambda item: abs(item[1][0] - player_pos[0]) + abs(item[1][1] - player_pos[1]),
             )
-            if visible_shape_cells
+        controls_shape = (
+            (
+                controlled_shape is not None
+                and abs(player_pos[0] - controlled_shape[1][0]) + abs(player_pos[1] - controlled_shape[1][1]) <= gs * 3
+            )
+            if candidates
             else player_color == 5
         )
         if visible_shape_cells and (changed_position or changed_color) and not controls_shape:
-            scan_limit = max(2, self._planned_shape_count + 1)
+            scan_limit = 1
             if self._pending_switch_scans < scan_limit:
                 self._pending_switch_scans += 1
                 self._pending_switch_origin = player_pos
@@ -952,11 +1141,16 @@ class BeamCoverageSolver(DynamicsSolver):
                     "solver:beam-coverage",
                     0.62,
                     reason="coverage_switch_scan",
-                    metadata=self._decision_metadata(pending_shape_stage=self._pending_stage_index),
+                    metadata=self._decision_metadata(
+                        pending_shape_stage=self._pending_stage_index,
+                        pending_shape_target=list(target) if target is not None else None,
+                    ),
                 )
 
         if (changed_position or changed_color) and controls_shape:
             self._active_stage_index = int(self._pending_stage_index or 0)
+            if controlled_shape is not None:
+                self._bind_stage_shape(self._active_stage_index, controlled_shape[1])
             self._switch_pending = False
             self._pending_stage_index = None
             self._pending_switch_origin = None
@@ -1240,13 +1434,15 @@ class BeamCoverageSolver(DynamicsSolver):
         # components after ACTION5. For beam puzzles, the active shape is the
         # visible shape nearest its frozen stage target; use that position for
         # navigation while retaining gm.player_pos for switch confirmation.
+        active_shape = None
         if self._active_stage_index >= 0:
-            visible_shapes = [center for center in (_shape_center(shape) for shape in shapes) if center is not None]
-            if visible_shapes:
-                px, py = min(
-                    visible_shapes,
-                    key=lambda center: abs(center[0] - target_cx) + abs(center[1] - target_cy),
-                )
+            active_shape, active_center = self._select_active_shape_for_stage(
+                shapes,
+                stage_index=self._active_stage_index,
+                target=(target_cx, target_cy),
+            )
+            if active_center is not None:
+                px, py = active_center
                 self._last_decision_player_pos = (px, py)
 
         recovery = self._reflection_recovery_decision(
@@ -1300,32 +1496,29 @@ class BeamCoverageSolver(DynamicsSolver):
         # Also compute pixel distance for comparison
         pixel_dist = abs(px - target_cx) + abs(py - target_cy)
         final_stage = self._active_stage_index >= shape_count - 1
+        at_target = arrival_dist == 0
+
+        horizontal_final_covered = True
+        if final_stage and at_target and mirror_info.get("horizontal"):
+            horizontal_final_covered = self._horizontal_final_stage_covered(
+                active_shape=active_shape,
+                mirror_info=mirror_info,
+                goals=goals,
+                board_width=gm.width,
+                board_height=gm.height,
+                gs=gs,
+            )
 
         if final_stage and self._final_tuning:
             self._shape_stuck_steps = 0
             self._both_placed_steps = 0
-            self._tune_step += 1
-            if self._tune_step > self._tune_budget:
-                self._reset_attempt("final_tuning_exhausted")
-                return ActionDecision(
-                    "ACTION5", "solver:beam-coverage", 0.40,
-                    reason="coverage_full_reset",
-                    metadata=self._decision_metadata(),
-                )
-            spiral = [
-                (0, -1), (1, 0), (0, 1), (-1, 0),
-                (0, -2), (1, -1), (2, 0), (1, 1),
-                (0, 2), (-1, 1), (-2, 0), (-1, -1),
-            ]
-            dvx, dvy = spiral[(self._tune_step - 1) % len(spiral)]
-            d = "up" if dvy < 0 else "down" if dvy > 0 else "left" if dvx < 0 else "right"
-            return ActionDecision(
-                DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.45,
-                reason=f"coverage_tune_{d}",
-                metadata=self._decision_metadata(
-                    target_anchor=[target_cx, target_cy],
-                    shape_stage=self._active_stage_index,
-                ),
+            return self._emit_tuning_action(
+                gm=gm,
+                gx=gx,
+                gy=gy,
+                gs=gs,
+                target_cx=target_cx,
+                target_cy=target_cy,
             )
 
         # Track final-stage placement only after the live entity actually
@@ -1334,7 +1527,17 @@ class BeamCoverageSolver(DynamicsSolver):
         # A one-cell tolerance can switch away before the sprite occupies the
         # planned cell.  AR25 checks completion after movement, so confirm the
         # exact logical cell before advancing or tuning the stage.
-        at_target = arrival_dist == 0
+        if final_stage and at_target and mirror_info.get("horizontal") and not horizontal_final_covered:
+            self._shape_stuck_steps = 0
+            self._both_placed_steps = 0
+            return self._emit_tuning_action(
+                gm=gm,
+                gx=gx,
+                gy=gy,
+                gs=gs,
+                target_cx=target_cx,
+                target_cy=target_cy,
+            )
         if final_stage and at_target:
             self._both_placed_steps += 1
         else:
@@ -1373,37 +1576,14 @@ class BeamCoverageSolver(DynamicsSolver):
             # The game engine checks win after each step.
             self._shape_stuck_steps = 0
             self._both_placed_steps = 0
-            self._final_tuning = True
-            self._tune_step += 1
-            if self._tune_step > self._tune_budget:
-                self._reset_attempt("final_tuning_exhausted")
-                return ActionDecision("ACTION5", "solver:beam-coverage", 0.40,
-                                      reason="coverage_full_reset",
-                                      metadata=self._decision_metadata())
-            # Try moving in a spiral pattern around current position
-            spiral = [(0, -1), (1, 0), (0, 1), (-1, 0),  # up, right, down, left
-                      (0, -2), (1, -1), (2, 0), (1, 1), (0, 2), (-1, 1), (-2, 0), (-1, -1)]
-            idx = (self._tune_step - 1) % len(spiral)
-            dvx, dvy = spiral[idx]
-            ngx, ngy = gx + dvx, gy + dvy
-            g_w = gm.width // gs
-            g_h = gm.height // gs
-            if 0 <= ngx < g_w and 0 <= ngy < g_h:
-                d = "up" if dvy < 0 else "down" if dvy > 0 else "left" if dvx < 0 else "right"
-                return ActionDecision(
-                    DIR_TO_ACTION.get(d, "ACTION1"), "solver:beam-coverage", 0.45,
-                    reason=f"coverage_tune_{d}",
-                    metadata=self._decision_metadata(
-                        target_anchor=[target_cx, target_cy],
-                        shape_stage=self._active_stage_index,
-                    ),
-                )
-            return ActionDecision("ACTION6", "solver:beam-coverage", 0.40,
-                                  reason="coverage_tune_wait",
-                                  metadata=self._decision_metadata(
-                                      target_anchor=[target_cx, target_cy],
-                                      shape_stage=self._active_stage_index,
-                                  ))
+            return self._emit_tuning_action(
+                gm=gm,
+                gx=gx,
+                gy=gy,
+                gs=gs,
+                target_cx=target_cx,
+                target_cy=target_cy,
+            )
 
         # Direct axis-priority navigation: prioritize the axis with larger delta
         # to avoid A* oscillation between directions.
@@ -1474,16 +1654,15 @@ class BeamCoverageSolver(DynamicsSolver):
         if not mirror_info.get("horizontal"):
             self._reset_reflection_recovery()
             return None
-        candidates = [shape for shape in shapes if shape]
-        if not candidates:
+        active_shape, _ = self._select_active_shape_for_stage(
+            shapes,
+            stage_index=self._active_stage_index,
+            target=target,
+        )
+        if active_shape is None:
             # A dropout cannot prove that the reflection is still absent.  The
             # frozen attempt remains active and the next observation retries.
             return None
-        active_shape = min(
-            candidates,
-            key=lambda shape: abs(_shape_center(shape)[0] - target[0])
-            + abs(_shape_center(shape)[1] - target[1]),
-        )
         visibility = reflected_visibility(
             active_shape,
             mirror_info,

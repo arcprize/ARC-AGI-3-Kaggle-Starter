@@ -18,6 +18,21 @@ def get_board_data(observation: Any) -> list[list[int]] | None:
     return getattr(image_input, "board", None)
 
 
+def _normalize_stage_targets(stage_targets: Any) -> list[dict[str, Any]]:
+    if not isinstance(stage_targets, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw_stage in stage_targets:
+        if not isinstance(raw_stage, dict):
+            continue
+        stage = dict(raw_stage)
+        target = stage.get("target_anchor")
+        if isinstance(target, (list, tuple)) and len(target) == 2:
+            stage["target_anchor"] = [int(target[0]), int(target[1])]
+        normalized.append(stage)
+    return normalized
+
+
 def sync_solver_episode_facts(context: ExecutiveContext, game_model: Any) -> None:
     try:
         episode = context.hyperon.facts.setdefault("episode", {})
@@ -45,6 +60,15 @@ def build_solver_context(
         if isinstance(shape_recognition, dict)
         else {}
     )
+    frame_cache = getattr(context, "multi_agent_frame_cache", {}) or {}
+    cached_stage_targets = _normalize_stage_targets(frame_cache.get("shape_stage_targets"))
+    shape_stage_targets = (
+        cached_stage_targets
+        if cached_stage_targets
+        else list(mirror_puzzle.get("stage_targets", []))
+        if isinstance(mirror_puzzle, dict)
+        else []
+    )
     plan_context: dict[str, Any] = {
         "non_beam_controllers": getattr(supervisor, "_non_beam_controllers", set()),
         "failed_directions": getattr(supervisor, "_failed_directions", set()),
@@ -64,9 +88,7 @@ def build_solver_context(
         if context.memory_bundle and context.memory_bundle.abstract_memories
         else [],
         "shape_recognition": shape_recognition,
-        "shape_stage_targets": list(mirror_puzzle.get("stage_targets", []))
-        if isinstance(mirror_puzzle, dict)
-        else [],
+        "shape_stage_targets": shape_stage_targets,
     }
     selector = getattr(supervisor, "_solver_selector", None)
     if selector is not None:
@@ -87,16 +109,25 @@ def stabilize_shape_frame_cache(
     mirror_active = bool(frame_cache.get("mirror_puzzle_active"))
     active_target = frame_cache.get("active_shape_target")
     active_stage = int(frame_cache.get("active_shape_stage", 0) or 0)
+    stage_targets = _normalize_stage_targets(frame_cache.get("shape_stage_targets"))
     player_position = (
         getattr(context.observation, "derived_features", {}) or {}
     ).get("player_position")
+    sticky = sticky_shape_target
+    sticky_targets = _normalize_stage_targets(sticky.get("stage_targets")) if isinstance(sticky, dict) else []
+    sticky_stage = int(sticky.get("stage", 0) or 0) if isinstance(sticky, dict) else 0
+    sticky_valid = (
+        sticky is not None
+        and sticky.get("levels_completed") == levels_completed
+        and sticky.get("orientation") == frame_cache.get("mirror_orientation")
+    )
     if mirror_active and active_target:
-        sticky = sticky_shape_target
+        if sticky_valid and sticky_targets and (not stage_targets or active_stage == sticky_stage):
+            frame_cache["shape_stage_targets"] = [dict(stage) for stage in sticky_targets]
+            stage_targets = _normalize_stage_targets(frame_cache.get("shape_stage_targets"))
         if (
-            sticky is not None
-            and sticky.get("levels_completed") == levels_completed
-            and sticky.get("orientation") == frame_cache.get("mirror_orientation")
-            and int(sticky.get("stage", 0) or 0) == active_stage
+            sticky_valid
+            and sticky_stage == active_stage
             and isinstance(sticky.get("target"), tuple)
         ):
             sticky_target = sticky["target"]
@@ -118,17 +149,17 @@ def stabilize_shape_frame_cache(
             "target": active_target,
             "stage": active_stage,
             "orientation": frame_cache.get("mirror_orientation"),
+            "stage_targets": stage_targets,
         }
-    sticky = sticky_shape_target
     if (
         mirror_active
         and not active_target
-        and sticky is not None
-        and sticky.get("levels_completed") == levels_completed
-        and sticky.get("orientation") == frame_cache.get("mirror_orientation")
+        and sticky_valid
     ):
         frame_cache["active_shape_target"] = sticky["target"]
         frame_cache["active_shape_stage"] = sticky["stage"]
+        if sticky_targets:
+            frame_cache["shape_stage_targets"] = [dict(stage) for stage in sticky_targets]
         frame_cache["shape_agent_mode"] = levels_completed >= 2
         return frame_cache, sticky
     if not mirror_active:
@@ -159,9 +190,19 @@ def seed_sticky_shape_target(
     )
     if not isinstance(mirror_puzzle, dict) or not mirror_puzzle.get("active"):
         return sticky_shape_target
+    stage_targets = _normalize_stage_targets(frame_cache.get("shape_stage_targets"))
+    stage = int(metadata.get("shape_stage", 0) or 0)
+    if stage > 0:
+        while len(stage_targets) < stage:
+            stage_targets.append({})
+        stage_targets[stage - 1] = {
+            **dict(stage_targets[stage - 1]),
+            "target_anchor": [int(target[0]), int(target[1])],
+        }
     return {
         "levels_completed": int(getattr(context.observation, "levels_completed", 0) or 0),
         "target": (int(target[0]), int(target[1])),
-        "stage": int(metadata.get("shape_stage", 0) or 0),
+        "stage": stage,
         "orientation": mirror_puzzle.get("orientation"),
+        "stage_targets": stage_targets,
     }

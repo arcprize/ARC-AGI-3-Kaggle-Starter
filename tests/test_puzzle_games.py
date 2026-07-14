@@ -3859,6 +3859,20 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
 
 
 class TestBeamCoverageSolver(unittest.TestCase):
+    def test_stage_binding_prefers_confirmed_shape_over_nearest_target(self) -> None:
+        solver = BeamCoverageSolver()
+        solver._active_stage_index = 1
+        solver._bind_stage_shape(1, (13, 13))
+
+        shape, center = solver._select_active_shape_for_stage(
+            [[(13, 13)], [(49, 46)]],
+            stage_index=1,
+            target=(49, 46),
+        )
+
+        self.assertEqual(center, (13, 13))
+        self.assertEqual(shape, [(13, 13)])
+
     def test_pending_switch_advances_stage_only_after_observed_entity_change(self) -> None:
         gm = game_ar25_level3()
         solver = BeamCoverageSolver()
@@ -3920,6 +3934,10 @@ class TestBeamCoverageSolver(unittest.TestCase):
         gm = game_ar25_level3()
         solver = BeamCoverageSolver()
         solver._planned_shape_count = 2
+        solver._cached_targets = [
+            {"target_anchor": [37, 49]},
+            {"target_anchor": [13, 13]},
+        ]
         ctx = SolverContext(game_model=gm, plan_context={})
         solver._request_switch(
             ctx,
@@ -3943,6 +3961,43 @@ class TestBeamCoverageSolver(unittest.TestCase):
         self.assertEqual(decision.reason, "coverage_switch_scan")
         self.assertTrue(solver._switch_pending)
         self.assertEqual(solver._pending_stage_index, 1)
+        self.assertEqual(decision.metadata["pending_shape_target"], [13, 13])
+
+    def test_pending_switch_scan_budget_is_bounded(self) -> None:
+        gm = game_ar25_level3()
+        solver = BeamCoverageSolver()
+        solver._planned_shape_count = 2
+        solver._cached_targets = [
+            {"target_anchor": [37, 49]},
+            {"target_anchor": [13, 43]},
+        ]
+        ctx = SolverContext(game_model=gm, plan_context={})
+        solver._request_switch(
+            ctx,
+            next_stage=1,
+            player_pos=(20, 17),
+            player_color=5,
+            reason="coverage_switch_next",
+            confidence=0.68,
+        )
+
+        first = solver._observe_pending_switch(
+            ctx,
+            player_pos=(31, 45),
+            player_color=10,
+            shapes=[[(13, 13)], [(49, 46)]],
+            gs=3,
+        )
+        second = solver._observe_pending_switch(
+            ctx,
+            player_pos=(34, 45),
+            player_color=10,
+            shapes=[[(13, 13)], [(49, 46)]],
+            gs=3,
+        )
+
+        self.assertEqual(first[1].reason, "coverage_switch_scan")
+        self.assertEqual(second, (False, None))
 
     def test_failed_switch_confirmation_exits_pending_state_after_one_retry(self) -> None:
         gm = game_ar25_level3()
@@ -3967,6 +4022,89 @@ class TestBeamCoverageSolver(unittest.TestCase):
         self.assertEqual(sum(r[1] is not None for r in results), 1)
         self.assertFalse(solver._switch_pending)
         self.assertEqual(solver._active_stage_index, -1)
+
+    def test_horizontal_final_stage_requires_goal_coverage_before_completion(self) -> None:
+        gm = game_open_path()
+        solver = BeamCoverageSolver()
+        solver._active_stage_index = 1
+        solver._planned_shape_count = 2
+        solver._cached_targets = [
+            {"target_anchor": [10, 10], "covered_goals": [(1, 1)]},
+            {"target_anchor": [40, 43], "covered_goals": [(2, 2)]},
+        ]
+        solver._base_targets = [dict(stage) for stage in solver._cached_targets]
+        solver._last_levels_completed = 4
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "levels_completed": 4,
+                "shape_recognition": {
+                    "mirror_puzzle": {
+                        "goal_cells": [(30, 30), (33, 30)],
+                    }
+                },
+            },
+        )
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._find_mirror_info",
+            return_value={"horizontal": True, "axis_px": 0, "axis_py": 31},
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._get_shape_pixels",
+            return_value=[[(10, 10)], [(40, 43)]],
+        ), patch.object(
+            solver,
+            "_reflection_recovery_decision",
+            return_value=None,
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver.predict_beam_cells",
+            return_value={(10, 10)},
+        ):
+            decision = solver.decide(ctx)
+
+        self.assertIsNotNone(decision)
+        self.assertNotEqual(decision.reason, "coverage_all_placed")
+        self.assertTrue(decision.reason.startswith("coverage_tune_"))
+
+    def test_vertical_final_stage_keeps_existing_completion_path(self) -> None:
+        gm = game_open_path()
+        solver = BeamCoverageSolver()
+        solver._active_stage_index = 1
+        solver._planned_shape_count = 2
+        solver._cached_targets = [
+            {"target_anchor": [10, 10], "covered_goals": [(1, 1)]},
+            {"target_anchor": [40, 43], "covered_goals": [(2, 2)]},
+        ]
+        solver._base_targets = [dict(stage) for stage in solver._cached_targets]
+        solver._last_levels_completed = 4
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "levels_completed": 4,
+                "shape_recognition": {
+                    "mirror_puzzle": {
+                        "goal_cells": [(30, 30), (33, 30)],
+                    }
+                },
+            },
+        )
+
+        with patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._find_mirror_info",
+            return_value={"horizontal": False, "axis_px": 0, "axis_py": 31},
+        ), patch(
+            "agi_core.knowledge.solvers.beam_coverage_solver._get_shape_pixels",
+            return_value=[[(10, 10)], [(40, 43)]],
+        ), patch.object(
+            solver,
+            "_reflection_recovery_decision",
+            return_value=None,
+        ):
+            decision = solver.decide(ctx)
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.action_name, "ACTION6")
+        self.assertEqual(decision.reason, "coverage_all_placed")
 
     def test_select_best_horizontal_mirror_plan_prefers_max_coverage(self) -> None:
         mirror_info = {"horizontal": True, "axis_py": 31}
@@ -4058,6 +4196,22 @@ class TestBeamCoverageSolver(unittest.TestCase):
         self.assertEqual(cached_targets[0]["target_anchor"], [10, 10])
         self.assertEqual(cached_targets[0]["target_bbox"], [9, 9, 11, 11])
         self.assertNotEqual(shifted_targets[0]["target_anchor"], [10, 10])
+
+    def test_restart_attempt_with_retry_reuses_offset_stage_targets(self) -> None:
+        solver = BeamCoverageSolver()
+        gm = game_ar25_level3()
+        solver._base_targets = [{
+            "target_anchor": [10, 10],
+            "target_bbox": [9, 9, 11, 11],
+            "covered_goals": [(1, 1)],
+        }]
+
+        solver._restart_attempt_with_retry("final_tuning_exhausted", gm, 3)
+
+        self.assertEqual(solver._retry_count, 1)
+        self.assertIsNotNone(solver._cached_targets)
+        self.assertNotEqual(solver._cached_targets[0]["target_anchor"], [10, 10])
+        self.assertEqual(solver._attempt_reset_reason, "final_tuning_exhausted")
 
     def test_mirror_phase_stall_marks_target_unreachable_and_falls_through(self) -> None:
         gm = game_ar25_level3()

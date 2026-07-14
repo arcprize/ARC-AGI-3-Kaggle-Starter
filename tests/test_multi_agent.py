@@ -1399,6 +1399,65 @@ class TestMultiAgent(unittest.TestCase):
         cache2 = sup._stabilize_shape_frame_cache(ctx2, prepare_frame_cache(ctx2))
 
         self.assertEqual(cache2["active_shape_target"], (46, 43))
+        self.assertEqual(cache2["shape_stage_targets"][0]["target_anchor"], [46, 43])
+
+    def test_supervisor_keeps_sticky_stage_targets_for_same_stage_attempt(self):
+        config = MagicMock(spec=RuntimeConfig)
+        executive = MagicMock()
+        sup = AgentSupervisor(executive=executive, config=config)
+
+        ctx1 = self._mock_context(
+            legal=["ACTION2", "ACTION4", "ACTION5"],
+            derived_features={
+                "player_position": (20, 20),
+                "shape_recognition": {
+                    "version": 1,
+                    "active_anchor": [20, 20],
+                    "mirror": {"present": True},
+                    "goal_clusters": [{"center": [46, 43]}],
+                    "mirror_puzzle": {
+                        "active": True,
+                        "active_stage": 1,
+                        "orientation": "horizontal",
+                        "stage_targets": [
+                            {"target_anchor": [46, 43]},
+                            {"target_anchor": [13, 43]},
+                        ],
+                    },
+                },
+            },
+        )
+        ctx1.observation.levels_completed = 3
+        sup._stabilize_shape_frame_cache(ctx1, prepare_frame_cache(ctx1))
+
+        ctx2 = self._mock_context(
+            legal=["ACTION2", "ACTION4", "ACTION5"],
+            derived_features={
+                "player_position": (22, 22),
+                "shape_recognition": {
+                    "version": 1,
+                    "active_anchor": [22, 22],
+                    "mirror": {"present": True},
+                    "goal_clusters": [{"center": [36, 48]}],
+                    "mirror_puzzle": {
+                        "active": True,
+                        "active_stage": 1,
+                        "orientation": "horizontal",
+                        "stage_targets": [
+                            {"target_anchor": [36, 48]},
+                            {"target_anchor": [31, 43]},
+                        ],
+                    },
+                },
+            },
+        )
+        ctx2.observation.levels_completed = 3
+
+        cache2 = sup._stabilize_shape_frame_cache(ctx2, prepare_frame_cache(ctx2))
+
+        self.assertEqual(cache2["active_shape_target"], (46, 43))
+        self.assertEqual(cache2["shape_stage_targets"][0]["target_anchor"], [46, 43])
+        self.assertEqual(cache2["shape_stage_targets"][1]["target_anchor"], [13, 43])
 
     def test_supervisor_seeds_sticky_shape_target_from_solver_metadata(self):
         config = MagicMock(spec=RuntimeConfig)
@@ -1437,6 +1496,7 @@ class TestMultiAgent(unittest.TestCase):
                 "target": (46, 43),
                 "stage": 1,
                 "orientation": "vertical",
+                "stage_targets": [{"target_anchor": [46, 43]}],
             },
         )
 

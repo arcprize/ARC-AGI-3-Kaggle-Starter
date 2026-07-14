@@ -136,6 +136,7 @@ def prepare_frame_cache(context: AgentFrameInput) -> dict[str, Any]:
             "mirror_puzzle_active": bool(mirror_puzzle.get("active")),
             "shape_agent_mode": shape_agent_mode,
             "mirror_orientation": mirror_puzzle.get("orientation"),
+            "shape_stage_targets": list(stage_targets) if isinstance(stage_targets, list) else [],
             "active_shape_target": active_target,
             "active_shape_stage": active_stage if stage_targets else 0,
             "active_shape_target_distance": target_distance,
