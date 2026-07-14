@@ -1968,6 +1968,46 @@ class TestPuzzleGamesAdvanced(unittest.TestCase):
         self.assertTrue(solver.should_activate(ctx),
                         "should_activate should be idempotent")
 
+    def test_mirror_solver_activates_for_horizontal_no_beam_level5(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+
+        solver = MirrorSolver()
+        board = make_grid_board()
+        scale = 3
+        for gx in range(21):
+            set_grid_cell(board, gx, 10, 10, scale)
+        for goal in [(8, 6), (9, 6), (10, 6)]:
+            set_grid_cell(board, goal[0], goal[1], 11, scale)
+        _make_shape_piece(board, 8, 14, scale)
+        gm = build_game_model(board)
+        self.assertFalse(gm.features.has_beam)
+
+        ctx = SolverContext(game_model=gm, plan_context={})
+
+        self.assertTrue(
+            solver.should_activate(ctx),
+            "MirrorSolver should activate for horizontal mirror boards before beam coverage takes over",
+        )
+
+    def test_mirror_solver_activates_for_stage_target_border_mirror(self) -> None:
+        from agi_core.knowledge.solvers import SolverContext
+
+        solver = MirrorSolver()
+        gm = game_ar25_level5()
+        ctx = SolverContext(
+            game_model=gm,
+            plan_context={
+                "shape_stage_targets": [
+                    {"target_anchor": [13, 40]},
+                ]
+            },
+        )
+
+        self.assertTrue(
+            solver.should_activate(ctx),
+            "MirrorSolver should trust explicit stage targets for no-beam border-mirror puzzles",
+        )
+
     # --- Iteration 1: Edge passage with various barrier heights ---
 
     def test_edge_barrier_25_percent(self) -> None:
@@ -4282,6 +4322,13 @@ class TestBeamCoverageSolver(unittest.TestCase):
         self.assertEqual(cached_targets[0]["target_anchor"], [10, 10])
         self.assertEqual(cached_targets[0]["target_bbox"], [9, 9, 11, 11])
         self.assertNotEqual(shifted_targets[0]["target_anchor"], [10, 10])
+
+    def test_has_active_attempt_stays_true_during_mirror_positioning_phase(self) -> None:
+        solver = BeamCoverageSolver()
+        solver._mirror_target_gy = 7
+        solver._cached_mirror_info = {"horizontal": True, "axis_py": 22}
+
+        self.assertTrue(solver.has_active_attempt)
 
     def test_restart_attempt_with_retry_reuses_offset_stage_targets(self) -> None:
         solver = BeamCoverageSolver()

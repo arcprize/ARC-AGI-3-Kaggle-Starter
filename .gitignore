@@ -11,7 +11,8 @@ recordings/
 *.log
 
 # Generated artefacts
-out/replays/
+out/
+replays/
 notebooks/submission.ipynb
 notebooks/runtime_bundle/
 reference/

@@ -218,7 +218,10 @@ class ObjectiveReduction:
                 # Failed directions and queued plan steps belong to the old
                 # controller; carrying them across an entity switch can block
                 # the new shape's only route to its placement target.
-                self._reset_controller_state_after_solver_switch(context)
+                self._reset_controller_state_after_solver_switch(
+                    context,
+                    clear_stable_goal=True,
+                )
             logger.debug("solver system primary decision: %s", solver_decision.action_name)
             context.memory.note_decision(solver_decision)
             self._previous_model = game_model
@@ -493,6 +496,11 @@ class ObjectiveReduction:
             metadata=proposal.metadata,
             proposals=[proposal],
         )
+        if decision.action_name == "ACTION5":
+            self._reset_controller_state_after_solver_switch(
+                context,
+                clear_stable_goal=True,
+            )
         context.memory.note_decision(decision)
         self._persist_plan(context)
         try:
@@ -680,11 +688,18 @@ class ObjectiveReduction:
         elif _PLAN_KEY in wm:
             del wm[_PLAN_KEY]
 
-    def _reset_controller_state_after_solver_switch(self, context: ExecutiveContext) -> None:
+    def _reset_controller_state_after_solver_switch(
+        self,
+        context: ExecutiveContext,
+        *,
+        clear_stable_goal: bool = False,
+    ) -> None:
         self._failed_directions.clear()
         self._pending_failed_dir = None
         self._active_plan = None
         self._regenerate_count = 0
+        if clear_stable_goal:
+            self._stable_goal = None
         self._persist_plan(context)
 
     def _get_working_memory(self, context: ExecutiveContext) -> dict[str, Any]:

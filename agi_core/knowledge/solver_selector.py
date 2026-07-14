@@ -62,6 +62,33 @@ class SolverSelector:
         """Whether the retained solver owns an in-progress execution attempt."""
         return bool(getattr(self._active_solver, "has_active_attempt", False))
 
+    def _replace_active_solver(
+        self,
+        solver_cls: type[DynamicsSolver],
+        solver_name: str,
+    ) -> DynamicsSolver:
+        displaced = self._active_solver
+        if displaced is not None:
+            try:
+                displaced.reset_level()
+            except Exception:
+                logger.debug("active solver reset failed during replacement", exc_info=True)
+        self._active_solver = solver_cls(memory_db_path=self._memory_db_path)
+        self._active_name = solver_name
+        return self._active_solver
+
+    def _should_retain_active_solver(
+        self,
+        *,
+        solver_name: str,
+    ) -> bool:
+        if self.active_attempt:
+            return True
+        # Beam-coverage owns AR25 beam boards even when perception briefly
+        # downgrades them to generic beam dynamics between mirror and shape
+        # control frames. Keep that solver until an explicit boundary resets it.
+        return self._active_name == "beam-coverage" and solver_name == "beam"
+
     def select_solver(
         self,
         game_model: GameModel,
@@ -97,18 +124,25 @@ class SolverSelector:
             if type(self._active_solver) is solver_cls:
                 self._active_name = solver_name
                 return self._active_solver
-            # Recommendations can oscillate as perception changes within a
-            # level. Explicit boundary/cooldown hooks clear the active solver;
-            # until then preserve its state rather than silently replacing it.
+            # Keep cross-frame ownership only for solvers that explicitly hold
+            # an in-progress attempt. Stateless solvers should yield as soon as
+            # the board reclassifies to a different dynamics family.
+            if self._should_retain_active_solver(solver_name=solver_name):
+                logger.debug(
+                    "SELECTOR: retaining active solver %s over mid-level recommendation %s",
+                    self._active_name,
+                    solver_name,
+                )
+                return self._active_solver
             logger.debug(
-                "SELECTOR: retaining active solver %s over mid-level recommendation %s",
+                "SELECTOR: switching active solver %s -> %s active_attempt=%s last_action=%s",
                 self._active_name,
                 solver_name,
+                self.active_attempt,
+                getattr(context.observation, "last_action", None),
             )
-            return self._active_solver
-        self._active_solver = solver_cls(memory_db_path=self._memory_db_path)
-        self._active_name = solver_name
-        return self._active_solver
+            return self._replace_active_solver(solver_cls, solver_name)
+        return self._replace_active_solver(solver_cls, solver_name)
 
     def build_solver_context(
         self,

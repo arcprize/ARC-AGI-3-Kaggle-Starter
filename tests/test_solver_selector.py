@@ -8,12 +8,64 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agi_core.knowledge.solver_selector import SolverSelector
+from agi_core.knowledge.solvers import DynamicsSolver, register_solver
 from agi_core.orch_or.game_model import GameFeatures, GameModel
 from agi_core.storage.memory_cache import drop_cache
 from agi_core.types import ActionDecision, ObservedTransition
 
 
+class _DummyNavigationSolver(DynamicsSolver):
+    dynamics = "dummy-navigation"
+
+    def __init__(self, memory_db_path=None) -> None:
+        super().__init__(memory_db_path)
+        self.reset_calls = 0
+
+    def should_activate(self, ctx):
+        return True
+
+    def decide(self, ctx):
+        return None
+
+    def reset_level(self) -> None:
+        self.reset_calls += 1
+
+
+class _DummyMirrorSolver(DynamicsSolver):
+    dynamics = "dummy-mirror"
+
+    def __init__(self, memory_db_path=None) -> None:
+        super().__init__(memory_db_path)
+        self.reset_calls = 0
+
+    def should_activate(self, ctx):
+        return True
+
+    def decide(self, ctx):
+        return None
+
+    def reset_level(self) -> None:
+        self.reset_calls += 1
+
+
+register_solver("dummy-navigation", _DummyNavigationSolver)
+register_solver("dummy-mirror", _DummyMirrorSolver)
+
+
 class SolverSelectorFeedbackTests(unittest.TestCase):
+    def _make_game_model(self, dynamics: str = "navigation") -> GameModel:
+        return GameModel(
+            board=[[0]],
+            height=1,
+            width=1,
+            player_pos=(0, 0),
+            goal_positions=[(0, 0)],
+            obstacles=[],
+            components=[],
+            walkable={(0, 0)},
+            features=GameFeatures(primary_dynamics=dynamics),
+        )
+
     def test_solver_learning_waits_for_observation_and_aggregates_level_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "solver.sqlite3"
@@ -90,6 +142,76 @@ class SolverSelectorFeedbackTests(unittest.TestCase):
             self.assertEqual(row[1], 1)
             self.assertEqual(row[2], 2.0)
             drop_cache(db_path)
+
+    def test_select_solver_switches_when_active_solver_has_no_attempt(self) -> None:
+        hyperon = SimpleNamespace(
+            facts={"episode": {}, "memory": {}},
+            run_rules=lambda query: [{"solver": "dummy-mirror"}] if query == "solver-select" else [],
+        )
+        selector = SolverSelector(hyperon)
+        old_solver = _DummyNavigationSolver()
+        selector._active_solver = old_solver
+        selector._active_name = "dummy-navigation"
+        context = SimpleNamespace(observation=SimpleNamespace(last_action="ACTION1"))
+
+        selected = selector.select_solver(self._make_game_model("puzzle"), context)
+
+        self.assertIsInstance(selected, _DummyMirrorSolver)
+        self.assertEqual(old_solver.reset_calls, 1)
+        self.assertEqual(selector._active_name, "dummy-mirror")
+
+    def test_select_solver_retains_active_attempt_across_recommendation_change(self) -> None:
+        hyperon = SimpleNamespace(
+            facts={"episode": {}, "memory": {}},
+            run_rules=lambda query: [{"solver": "dummy-mirror"}] if query == "solver-select" else [],
+        )
+        selector = SolverSelector(hyperon)
+        old_solver = _DummyNavigationSolver()
+        old_solver.has_active_attempt = True
+        selector._active_solver = old_solver
+        selector._active_name = "dummy-navigation"
+        context = SimpleNamespace(observation=SimpleNamespace(last_action="ACTION1"))
+
+        selected = selector.select_solver(self._make_game_model("puzzle"), context)
+
+        self.assertIs(selected, old_solver)
+        self.assertEqual(old_solver.reset_calls, 0)
+        self.assertEqual(selector._active_name, "dummy-navigation")
+
+    def test_select_solver_switches_after_action5_when_recommendation_changes(self) -> None:
+        hyperon = SimpleNamespace(
+            facts={"episode": {}, "memory": {}},
+            run_rules=lambda query: [{"solver": "dummy-mirror"}] if query == "solver-select" else [],
+        )
+        selector = SolverSelector(hyperon)
+        old_solver = _DummyNavigationSolver()
+        selector._active_solver = old_solver
+        selector._active_name = "dummy-navigation"
+        context = SimpleNamespace(observation=SimpleNamespace(last_action="ACTION5"))
+
+        selected = selector.select_solver(self._make_game_model("puzzle"), context)
+
+        self.assertIsInstance(selected, _DummyMirrorSolver)
+        self.assertEqual(old_solver.reset_calls, 1)
+        self.assertEqual(selector._active_name, "dummy-mirror")
+
+    def test_select_solver_retains_beam_coverage_across_generic_beam_recommendation(self) -> None:
+        hyperon = SimpleNamespace(
+            facts={"episode": {}, "memory": {}},
+            run_rules=lambda query: [{"solver": "beam"}] if query == "solver-select" else [],
+        )
+        selector = SolverSelector(hyperon)
+        old_solver = MagicMock()
+        old_solver.dynamics = "beam-coverage"
+        selector._active_solver = old_solver
+        selector._active_name = "beam-coverage"
+        context = SimpleNamespace(observation=SimpleNamespace(last_action="ACTION1"))
+
+        selected = selector.select_solver(self._make_game_model("beam"), context)
+
+        self.assertIs(selected, old_solver)
+        old_solver.reset_level.assert_not_called()
+        self.assertEqual(selector._active_name, "beam-coverage")
 
 
 if __name__ == "__main__":

@@ -136,17 +136,116 @@ class BackgroundPrecomputeTests(unittest.TestCase):
         orchestrator._pending_failed_dir = "left"
         orchestrator._active_plan = Plan(objective_id="stale", steps=[])
         orchestrator._regenerate_count = 2
+        orchestrator._stable_goal = (9, 9)
         context = SimpleNamespace(
             memory_bundle=SimpleNamespace(working_memory={_PLAN_KEY: {"stale": True}}),
         )
 
-        orchestrator._reset_controller_state_after_solver_switch(context)
+        orchestrator._reset_controller_state_after_solver_switch(
+            context,
+            clear_stable_goal=True,
+        )
 
         self.assertEqual(orchestrator._failed_directions, set())
         self.assertIsNone(orchestrator._pending_failed_dir)
         self.assertIsNone(orchestrator._active_plan)
         self.assertEqual(orchestrator._regenerate_count, 0)
+        self.assertIsNone(orchestrator._stable_goal)
         self.assertEqual(context.memory_bundle.working_memory, {})
+
+    def test_orchestrator_action5_clears_stale_plan_and_goal(self) -> None:
+        orchestrator = ObjectiveReduction(
+            executive=SimpleNamespace(),
+            config=SimpleNamespace(planner_parallel=False),
+        )
+        orchestrator._active_plan = Plan(
+            objective_id="navigate-to-goal",
+            steps=[
+                PlanStep(
+                    action="switch",
+                    params={},
+                    source="monitor_stuck",
+                    preconditions=frozenset(),
+                    expected_effect="switch_entity",
+                )
+            ],
+        )
+        orchestrator._stable_goal = (13, 40)
+
+        gm = GameModel(
+            board=[[0]],
+            height=1,
+            width=1,
+            player_pos=(0, 0),
+            goal_positions=[(0, 0)],
+            obstacles=[],
+            components=[],
+            walkable={(0, 0)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=True,
+                board_type="sliding",
+            ),
+        )
+        context = SimpleNamespace(
+            observation=SimpleNamespace(
+                step_index=1,
+                game_id="ar25",
+                derived_features={"board_grid": [[0]]},
+                image_input=None,
+                legal_actions=["ACTION5"],
+                levels_completed=4,
+            ),
+            memory_bundle=SimpleNamespace(working_memory={_PLAN_KEY: {"stale": True}}),
+            hyperon=SimpleNamespace(
+                run_rules=lambda *_args, **_kwargs: [],
+                update_proposals=lambda *_args, **_kwargs: None,
+                facts={},
+            ),
+            memory=SimpleNamespace(
+                most_recent_action=lambda: "ACTION3",
+                note_decision=lambda _decision: None,
+                _recent_actions=[],
+            ),
+            config=SimpleNamespace(deterministic_fallback_action="ACTION1"),
+        )
+
+        with patch(
+            "agi_core.orch_or.orchestrator.ensure_hyperon_context_synced",
+            return_value=context.memory_bundle,
+        ), patch(
+            "agi_core.orch_or.orchestrator._get_board_data",
+            return_value=[[0]],
+        ), patch(
+            "agi_core.orch_or.orchestrator.compute_board_signature",
+            return_value="sig",
+        ), patch(
+            "agi_core.orch_or.orchestrator.build_game_model",
+            return_value=gm,
+        ), patch.object(
+            ObjectiveReduction,
+            "_load_plan",
+            return_value=None,
+        ), patch.object(
+            ObjectiveReduction,
+            "_try_solver_system",
+            return_value=(None, None),
+        ), patch.object(
+            ObjectiveReduction,
+            "_check_previous_action",
+            return_value=None,
+        ), patch.object(
+            ObjectiveReduction,
+            "_background_precompute",
+            return_value=None,
+        ):
+            decision = orchestrator.decide(context)
+
+        self.assertEqual(decision.action_name, "ACTION5")
+        self.assertIsNone(orchestrator._active_plan)
+        self.assertIsNone(orchestrator._stable_goal)
+        self.assertNotIn(_PLAN_KEY, context.memory_bundle.working_memory)
 
     def test_background_precompute_uses_thread_pool_for_small_search_spaces(self) -> None:
         orchestrator = ObjectiveReduction(

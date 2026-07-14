@@ -262,14 +262,16 @@ class MirrorSolver(DynamicsSolver):
         mirror_comp = next((c for c in gm.components if c.dominant_color == 10), None)
         if mirror_comp is None:
             return False
+        if not gm.features.has_beam and _plan_stage_target(ctx.plan_context, max(self._switch_count, 1)):
+            return True
         if gm.features.has_beam and not self._detect_mirror_axis(mirror_comp):
             return False
         horiz = self._detect_mirror_axis(mirror_comp)
         if horiz:
-            # Horizontal mirrors are handled by BeamCoverageSolver.
-            # The reflection-target model in MirrorSolver doesn't match
-            # the beam-coverage win condition of horizontal-mirror puzzles.
-            return False
+            # Horizontal mirror boards without an active beam still need the
+            # mirror solver to own post-switch shape navigation. Only keep the
+            # old beam-specific exclusion when a live beam board is present.
+            return not gm.features.has_beam
         px, py = gm.player_pos
         mirr_cells = list(mirror_comp.cells)
         mirror_px = sum(cx for cx, _ in mirr_cells) // len(mirr_cells)

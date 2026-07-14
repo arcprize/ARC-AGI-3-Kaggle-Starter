@@ -1013,9 +1013,12 @@ class BeamCoverageSolver(DynamicsSolver):
         return bool(
             self._cached_targets
             or self._base_targets
+            or self._mirror_target_gy is not None
+            or self._cached_mirror_info is not None
             or self._active_stage_index >= 0
             or self._switch_pending
             or self._final_tuning
+            or self._reflection_recovery
         )
 
     def reset_level(self) -> None:
