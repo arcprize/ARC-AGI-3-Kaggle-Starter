@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sqlite3
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,6 +53,11 @@ register_solver("dummy-mirror", _DummyMirrorSolver)
 
 
 class SolverSelectorFeedbackTests(unittest.TestCase):
+    def _workspace_tempdir(self) -> Path:
+        root = Path.cwd() / "tmp" / "test_solver_selector"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
     def _make_game_model(self, dynamics: str = "navigation") -> GameModel:
         return GameModel(
             board=[[0]],
@@ -68,8 +72,11 @@ class SolverSelectorFeedbackTests(unittest.TestCase):
         )
 
     def test_solver_learning_waits_for_observation_and_aggregates_level_success(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "solver.sqlite3"
+        tmpdir = self._workspace_tempdir()
+        db_path = tmpdir / "solver-learning.sqlite3"
+        try:
+            if db_path.exists():
+                db_path.unlink()
             hyperon = SimpleNamespace(facts={"episode": {}, "memory": {}})
             selector = SolverSelector(hyperon, memory_db_path=db_path)
             solver = MagicMock()
@@ -143,6 +150,9 @@ class SolverSelectorFeedbackTests(unittest.TestCase):
             self.assertEqual(row[1], 1)
             self.assertEqual(row[2], 2.0)
             drop_cache(db_path)
+        finally:
+            if db_path.exists():
+                db_path.unlink()
 
     def test_select_solver_switches_when_active_solver_has_no_attempt(self) -> None:
         hyperon = SimpleNamespace(
@@ -178,6 +188,7 @@ class SolverSelectorFeedbackTests(unittest.TestCase):
         self.assertIs(selected, old_solver)
         self.assertEqual(old_solver.reset_calls, 0)
         self.assertEqual(selector._active_name, "dummy-navigation")
+        self.assertEqual(selector.last_retention_reason, "active-attempt")
 
     def test_select_solver_switches_after_action5_when_recommendation_changes(self) -> None:
         hyperon = SimpleNamespace(
@@ -213,6 +224,24 @@ class SolverSelectorFeedbackTests(unittest.TestCase):
         self.assertIs(selected, old_solver)
         old_solver.reset_level.assert_not_called()
         self.assertEqual(selector._active_name, "beam-coverage")
+        self.assertEqual(selector.last_retention_reason, "beam-coverage-ownership")
+
+    def test_select_solver_does_not_retain_generic_beam_coverage_after_action5(self) -> None:
+        hyperon = SimpleNamespace(
+            facts={"episode": {}, "memory": {}},
+            run_rules=lambda query: [{"solver": "beam"}] if query == "solver-select" else [],
+        )
+        selector = SolverSelector(hyperon)
+        old_solver = MagicMock()
+        old_solver.dynamics = "beam-coverage"
+        selector._active_solver = old_solver
+        selector._active_name = "beam-coverage"
+        context = SimpleNamespace(observation=SimpleNamespace(last_action="ACTION5"))
+
+        selected = selector.select_solver(self._make_game_model("beam"), context)
+
+        self.assertIsNot(selected, old_solver)
+        old_solver.reset_level.assert_called_once()
 
     def test_select_solver_retains_mirror_with_active_stage_attempt(self) -> None:
         hyperon = SimpleNamespace(

@@ -28,6 +28,7 @@ from agi_core.types import (
 from agi_core.orch_or.parallel import ThreadPoolManager
 from concurrent.futures import wait
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -60,19 +61,10 @@ class Executive:
         self.chunk_library = chunk_library
 
     def decide(self, context: ExecutiveContext) -> ActionDecision:
-        # Update attention visitation BEFORE hyperon/orchestrator computes salience
-        if self.attention is not None:
-            player_pos = getattr(context.observation, 'player_position', None)
-            if player_pos is not None:
-                self.attention.mark_visited(player_pos)
-        context.memory_bundle = ensure_hyperon_context_synced(context)
-        context.llm_memory_bundle = context.memory_bundle
-        context.llm_subgoal_hint = None
-        context.contextual_memory_bundles = {}
+        self._initialize_decision_context(context)
 
         # ── Cognition integration ──────────────────────────────────
         wm = self.working_memory
-        mc = self.meta_cognition
         context.goal_stack = self.goal_stack
         context.working_memory = self.working_memory
         context.chunk_library = self.chunk_library
@@ -80,36 +72,7 @@ class Executive:
         context.episodic_memory = self.episodic_memory
         if wm is not None:
             wm.tick()
-        if mc is not None:
-            stagnation_steps = int(getattr(context.memory, '_stagnation_steps', 0))
-            recent_raw = wm.recent_actions(5) if wm is not None else []
-            outcomes = []
-            consec = getattr(mc, '_consecutive_failures', 0)
-            for a in recent_raw:
-                if consec > 0:
-                    outcomes.append("failed")
-                else:
-                    outcomes.append("progress" if a not in ("RESET", "ACTION6") else "stalled")
-            wm_load = wm.load if wm is not None else 0.0
-            plan = getattr(context.memory, '_active_plan', None) or getattr(context, '_active_plan', None)
-            has_plan = plan is not None
-            confidence = mc.estimate_confidence(
-                plan_steps=list(getattr(plan, 'steps', []) if plan is not None else []),
-                goal_stack_depth=len(getattr(self.goal_stack, 'active_path', []) if self.goal_stack else []),
-                working_memory_load=wm_load,
-                stagnation_steps=stagnation_steps,
-                recent_outcomes=outcomes,
-                consecutive_failures=getattr(mc, '_consecutive_failures', 0),
-            )
-            goal_progress = getattr(self.goal_stack, 'progress_ratio', 0.0) if self.goal_stack else 0.0
-            strategy = mc.select_strategy(
-                confidence=confidence,
-                stagnation_steps=stagnation_steps,
-                has_plan=has_plan,
-                working_memory_load=wm_load,
-                goal_progress=goal_progress,
-            )
-            context.cognition_strategy = strategy.value
+        self._update_cognition_strategy(context)
         pending_reopen = context.memory.pending_score_floor_reopen(context.observation)
         if pending_reopen is not None and "RESET" in context.observation.legal_actions:
             context.score_floor_debug = dict(pending_reopen.get("score_floor_debug") or {})
@@ -137,52 +100,13 @@ class Executive:
         context.replan_mode = replan_mode
 
         # ── Gate specialists by cognition strategy ────────────────
-        mc = self.meta_cognition
-        cur_strategy = None
-        if mc is not None and hasattr(mc, '_mode_history') and mc._mode_history:
-            cur_strategy = mc._mode_history[-1]
-        use_reactive = not replan_mode and (mc is None or mc.should_use_specialist(cur_strategy))
-        use_symbolic = mc is None or mc.should_use_specialist(cur_strategy)
-
-        reactive_proposals = []
-        symbolic_proposals = []
-        specialist_tasks = {}
-        if use_reactive:
-            reactive_task = ThreadPoolManager.submit_unique(
-                f"executive:{id(self)}:reactive",
-                self.reactive.propose,
-                context,
-            )
-        else:
-            reactive_task = None
-        if use_symbolic:
-            symbolic_task = ThreadPoolManager.submit_unique(
-                f"executive:{id(self)}:symbolic",
-                self.symbolic.propose,
-                context,
-            )
-        else:
-            symbolic_task = None
-        if reactive_task is not None:
-            specialist_tasks["reactive"] = reactive_task
-        if symbolic_task is not None:
-            specialist_tasks["symbolic"] = symbolic_task
-        done = set()
-        if specialist_tasks:
-            done, _ = wait(set(specialist_tasks.values()), timeout=2.0)
-        if reactive_task is not None and reactive_task in done:
-            try:
-                reactive_proposals = reactive_task.result()
-            except Exception:
-                logger.debug("reactive specialist failed", exc_info=True)
-                reactive_proposals = []
-        if symbolic_task is not None and symbolic_task in done:
-            try:
-                symbolic_proposals = symbolic_task.result()
-            except Exception:
-                logger.debug("symbolic specialist failed", exc_info=True)
-                symbolic_proposals = []
-        proposals = list(reactive_proposals) + list(symbolic_proposals)
+        reactive_proposals, symbolic_proposals = self._collect_specialist_proposals(
+            context,
+            replan_mode=replan_mode,
+        )
+        proposals = self._merge_ranked_proposals(
+            list(reactive_proposals) + list(symbolic_proposals)
+        )
         score_floor_fallback_cooldown = context.memory.recent_score_floor_fallback(
             context.observation
         )
@@ -207,59 +131,235 @@ class Executive:
                 and not score_floor_fallback_cooldown
                 and not skip_early_probe_llm
             ):
-                proposals.extend(self.llm.propose(context))
+                proposals = self._merge_ranked_proposals(
+                    proposals + list(self.llm.propose(context))
+                )
         context.hyperon.update_proposals(proposals)
         rescored = self.critic.rescore(context, proposals)
+        selected = self._select_ranked_decision(context, rescored)
+        if selected is not None:
+            selected.proposals = rescored
+            context.memory.note_decision(selected)
+            self._finalize_cognition(context, selected)
+            return selected
+        fallback = self._memory_aware_fallback(context)
+        fallback.metadata = self._attach_decision_debug(
+            context,
+            fallback.metadata,
+            fallback_trigger="no-legal-rescored-proposal",
+            rescored=rescored,
+        )
+        fallback.proposals = rescored
+        context.memory.note_decision(fallback)
+        self._finalize_cognition(context, fallback)
+        return fallback
+
+    def _initialize_decision_context(self, context: ExecutiveContext) -> None:
+        if self.attention is not None:
+            player_pos = getattr(context.observation, "player_position", None)
+            if player_pos is not None:
+                self.attention.mark_visited(player_pos)
+        context.memory_bundle = ensure_hyperon_context_synced(context)
+        context.llm_memory_bundle = context.memory_bundle
+        context.llm_subgoal_hint = None
+        context.contextual_memory_bundles = {}
+
+    def _update_cognition_strategy(self, context: ExecutiveContext) -> None:
+        wm = self.working_memory
+        mc = self.meta_cognition
+        if mc is None:
+            return
+        stagnation_steps = int(getattr(context.memory, "_stagnation_steps", 0))
+        recent_raw = wm.recent_actions(5) if wm is not None else []
+        outcomes = []
+        consec = getattr(mc, "_consecutive_failures", 0)
+        for action_name in recent_raw:
+            if consec > 0:
+                outcomes.append("failed")
+            else:
+                outcomes.append(
+                    "progress" if action_name not in ("RESET", "ACTION6") else "stalled"
+                )
+        wm_load = wm.load if wm is not None else 0.0
+        plan = getattr(context.memory, "_active_plan", None) or getattr(context, "_active_plan", None)
+        has_plan = plan is not None
+        confidence = mc.estimate_confidence(
+            plan_steps=list(getattr(plan, "steps", []) if plan is not None else []),
+            goal_stack_depth=len(
+                getattr(self.goal_stack, "active_path", []) if self.goal_stack else []
+            ),
+            working_memory_load=wm_load,
+            stagnation_steps=stagnation_steps,
+            recent_outcomes=outcomes,
+            consecutive_failures=getattr(mc, "_consecutive_failures", 0),
+        )
+        goal_progress = getattr(self.goal_stack, "progress_ratio", 0.0) if self.goal_stack else 0.0
+        if context.multi_agent_frame_cache.get("solver_has_active_attempt") and has_plan:
+            confidence = min(0.95, confidence + 0.05)
+        strategy = mc.select_strategy(
+            confidence=confidence,
+            stagnation_steps=stagnation_steps,
+            has_plan=has_plan,
+            working_memory_load=wm_load,
+            goal_progress=goal_progress,
+        )
+        context.cognition_strategy = strategy.value
+
+    def _collect_specialist_proposals(
+        self,
+        context: ExecutiveContext,
+        *,
+        replan_mode: bool,
+    ) -> tuple[list, list]:
+        mc = self.meta_cognition
+        cur_strategy = None
+        if mc is not None and hasattr(mc, "_mode_history") and mc._mode_history:
+            cur_strategy = mc._mode_history[-1]
+        use_reactive = not replan_mode and (mc is None or mc.should_use_specialist(cur_strategy))
+        use_symbolic = mc is None or mc.should_use_specialist(cur_strategy)
+        specialist_tasks = {}
+        reactive_task = None
+        symbolic_task = None
+        if use_reactive:
+            reactive_task = ThreadPoolManager.submit_unique(
+                f"executive:{id(self)}:reactive",
+                self.reactive.propose,
+                context,
+            )
+            specialist_tasks["reactive"] = reactive_task
+        if use_symbolic:
+            symbolic_task = ThreadPoolManager.submit_unique(
+                f"executive:{id(self)}:symbolic",
+                self.symbolic.propose,
+                context,
+            )
+            specialist_tasks["symbolic"] = symbolic_task
+        done = set()
+        if specialist_tasks:
+            done, _ = wait(set(specialist_tasks.values()), timeout=2.0)
+        return (
+            self._resolve_specialist_task("reactive", reactive_task, done),
+            self._resolve_specialist_task("symbolic", symbolic_task, done),
+        )
+
+    def _resolve_specialist_task(self, label: str, task, done: set) -> list:
+        if task is None or task not in done:
+            return []
+        try:
+            return list(task.result() or [])
+        except Exception:
+            logger.debug("%s specialist failed", label, exc_info=True)
+            return []
+
+    def _merge_ranked_proposals(self, proposals: list) -> list:
+        merged = []
+        seen: dict[tuple, int] = {}
+        for proposal in proposals:
+            metadata_items = tuple(sorted((proposal.metadata or {}).items()))
+            key = (proposal.action_name, proposal.source, proposal.subgoal, metadata_items)
+            existing_index = seen.get(key)
+            if existing_index is None:
+                seen[key] = len(merged)
+                merged.append(proposal)
+                continue
+            if float(proposal.confidence) > float(merged[existing_index].confidence):
+                merged[existing_index] = proposal
+        return merged
+
+    def _select_ranked_decision(
+        self,
+        context: ExecutiveContext,
+        rescored: list,
+    ) -> ActionDecision | None:
         if self._all_legal_proposals_are_score_floor(context, rescored):
             fallback = self._score_floor_fallback(context, rescored)
-            fallback.proposals = rescored
-            context.memory.note_decision(fallback)
-            self._finalize_cognition(context, fallback)
+            fallback.metadata = self._attach_decision_debug(
+                context,
+                fallback.metadata,
+                fallback_trigger="score-floor",
+                rescored=rescored,
+            )
             return fallback
         probe_dead_end_escape = self._probe_dead_end_escape(context, rescored)
         if probe_dead_end_escape is not None:
-            probe_dead_end_escape.proposals = rescored
-            context.memory.note_decision(probe_dead_end_escape)
-            self._finalize_cognition(context, probe_dead_end_escape)
+            probe_dead_end_escape.metadata = self._attach_decision_debug(
+                context,
+                probe_dead_end_escape.metadata,
+                fallback_trigger="probe-dead-end-escape",
+                rescored=rescored,
+            )
             return probe_dead_end_escape
         probe_dead_end_followup_escape = self._probe_dead_end_followup_escape(
             context,
             rescored,
         )
         if probe_dead_end_followup_escape is not None:
-            probe_dead_end_followup_escape.proposals = rescored
-            context.memory.note_decision(probe_dead_end_followup_escape)
-            self._finalize_cognition(context, probe_dead_end_followup_escape)
+            probe_dead_end_followup_escape.metadata = self._attach_decision_debug(
+                context,
+                probe_dead_end_followup_escape.metadata,
+                fallback_trigger="probe-dead-end-followup",
+                rescored=rescored,
+            )
             return probe_dead_end_followup_escape
         for proposal in rescored:
-            if proposal.legal:
-                metadata = self._finalize_decision_metadata(
-                    context,
-                    proposal.action_name,
-                    dict(proposal.metadata),
-                )
-                subgoal = self._finalize_decision_subgoal(
-                    context,
-                    proposal.action_name,
-                    proposal.subgoal,
-                )
-                decision = ActionDecision(
-                    action_name=proposal.action_name,
-                    source=proposal.source,
-                    confidence=proposal.confidence,
-                    reason=proposal.reason,
-                    subgoal=subgoal,
-                    metadata=metadata,
-                    proposals=rescored,
-                )
-                context.memory.note_decision(decision)
-                self._finalize_cognition(context, decision)
-                return decision
-        fallback = self._memory_aware_fallback(context)
-        fallback.proposals = rescored
-        context.memory.note_decision(fallback)
-        self._finalize_cognition(context, fallback)
-        return fallback
+            if not proposal.legal:
+                continue
+            metadata = self._finalize_decision_metadata(
+                context,
+                proposal.action_name,
+                dict(proposal.metadata),
+            )
+            metadata = self._attach_decision_debug(
+                context,
+                metadata,
+                fallback_trigger="",
+                rescored=rescored,
+            )
+            subgoal = self._finalize_decision_subgoal(
+                context,
+                proposal.action_name,
+                proposal.subgoal,
+            )
+            return ActionDecision(
+                action_name=proposal.action_name,
+                source=proposal.source,
+                confidence=proposal.confidence,
+                reason=proposal.reason,
+                subgoal=subgoal,
+                metadata=metadata,
+            )
+        return None
+
+    def _attach_decision_debug(
+        self,
+        context: ExecutiveContext,
+        metadata: dict,
+        *,
+        fallback_trigger: str,
+        rescored: list,
+    ) -> dict:
+        if os.environ.get("AGI_DEBUG_DECISIONS", "0").strip().lower() not in {
+            "1", "true", "yes", "on"
+        }:
+            return dict(metadata or {})
+        metadata = dict(metadata or {})
+        breakdown_cache = dict(
+            context.multi_agent_frame_cache.get("critic_score_breakdowns", {}) or {}
+        )
+        top_breakdown = {}
+        if rescored:
+            top_breakdown = dict(breakdown_cache.get(id(rescored[0]), {}) or {})
+        metadata["executive_debug"] = {
+            "strategy_mode": str(getattr(context, "cognition_strategy", "") or ""),
+            "fallback_trigger": str(fallback_trigger or ""),
+            "top_sources": [
+                str(getattr(proposal, "source", "") or "")
+                for proposal in rescored[:3]
+            ],
+            "selected_source_family": str(top_breakdown.get("source_family", "") or ""),
+            "top_score_breakdown": top_breakdown,
+        }
+        return metadata
 
     def _finalize_cognition(self, context, decision: ActionDecision) -> None:
         """Update cognition modules after a decision is made.

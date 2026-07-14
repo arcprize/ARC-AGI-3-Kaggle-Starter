@@ -3,6 +3,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from agi_core.image_input import board_probe_click_target, default_click_target, preferred_board_probe_action
+from agi_core.specialists.proposal_evidence import (
+    board_probe_metadata,
+    trained_prior_order,
+    trained_prior_rank,
+)
 from agi_core.types import ActionProposal, ExecutiveContext
 
 
@@ -64,11 +69,7 @@ class ReactiveSpecialist:
         if context.memory.stagnation_steps >= 2:
             ranked_actions = self._rank_stall_break_actions(context, observation.legal_actions)
             for index, action_name in enumerate(ranked_actions[:3]):
-                metadata = {}
-                if hasattr(context.adapter, "default_metadata_for_action"):
-                    metadata = dict(context.adapter.default_metadata_for_action(action_name) or {})
-                if action_name == "ACTION6" and observation.image_input is not None:
-                    metadata = self._board_probe_metadata(context)
+                metadata = self._metadata_for_action(context, action_name)
                 proposals.append(
                     ActionProposal(
                         action_name=action_name,
@@ -86,32 +87,25 @@ class ReactiveSpecialist:
                         metadata=metadata,
                     )
                 )
-            if proposals:
-                return proposals
         memory_baseline = self._memory_informed_baseline(context, observation.legal_actions)
         if memory_baseline is not None:
-            proposals.append(memory_baseline)
-            return proposals
-        fallback = self._deterministic_baseline_action(context, observation.legal_actions)
-        metadata = {}
-        if hasattr(context.adapter, "default_metadata_for_action"):
-            metadata = dict(context.adapter.default_metadata_for_action(fallback) or {})
-        if fallback == "ACTION6" and observation.image_input is not None:
-            metadata = self._board_probe_metadata(context)
-        proposals.append(
-            ActionProposal(
-                action_name=fallback,
-                source=self.source,
-                confidence=0.40,
-                reason="deterministic reactive baseline",
-                subgoal=self._subgoal_for_action(
-                    observation.image_input,
-                    fallback,
-                    default="maintain-control-loop",
-                ),
-                metadata=metadata,
+            proposals = self._append_unique_proposal(proposals, memory_baseline)
+        if not proposals:
+            fallback = self._deterministic_baseline_action(context, observation.legal_actions)
+            proposals.append(
+                ActionProposal(
+                    action_name=fallback,
+                    source=self.source,
+                    confidence=0.40,
+                    reason="deterministic reactive baseline",
+                    subgoal=self._subgoal_for_action(
+                        observation.image_input,
+                        fallback,
+                        default="maintain-control-loop",
+                    ),
+                    metadata=self._metadata_for_action(context, fallback),
+                )
             )
-        )
         return proposals
 
     def _rank_stall_break_actions(
@@ -133,11 +127,11 @@ class ReactiveSpecialist:
         recent_failure_actions: set[str] = set()
         failure_streak_counts: dict[str, int] = {}
         focus_rank: dict[str, int] = {}
-        trained_prior_rank: dict[str, int] = {}
+        trained_prior_ranks: dict[str, int] = {}
         if context.memory_bundle is not None:
             recommended_actions = list(context.memory_bundle.recommended_actions or [])
             suppressed_actions = set(context.memory_bundle.suppressed_actions or [])
-            trained_prior_rank = self._trained_prior_rank(
+            trained_prior_ranks = trained_prior_rank(
                 context.memory_bundle.trained_prior_bucket,
                 legal_actions,
             )
@@ -203,9 +197,9 @@ class ReactiveSpecialist:
                 if action_name in recommended_actions
                 else len(recommended_actions) + 1
             )
-            trained_prior_bonus = trained_prior_rank.get(
+            trained_prior_bonus = trained_prior_ranks.get(
                 action_name,
-                len(trained_prior_rank) + 1,
+                len(trained_prior_ranks) + 1,
             )
             board_probe_penalty = 0 if action_name == board_probe_action else 1
             procedural_bonus = -procedural_bias.get(action_name, 0.0)
@@ -252,7 +246,7 @@ class ReactiveSpecialist:
         ]
         trained_prior_actions = [
             action_name
-            for action_name in self._trained_prior_order(
+            for action_name in trained_prior_order(
                 context.memory_bundle.trained_prior_bucket,
                 legal,
             )
@@ -274,11 +268,6 @@ class ReactiveSpecialist:
         for action_name in recommended:
             if action_name in suppressed:
                 continue
-            metadata = {}
-            if hasattr(context.adapter, "default_metadata_for_action"):
-                metadata = dict(context.adapter.default_metadata_for_action(action_name) or {})
-            if action_name == "ACTION6" and context.observation.image_input is not None:
-                metadata = self._board_probe_metadata(context)
             return ActionProposal(
                 action_name=action_name,
                 source=self.source,
@@ -289,16 +278,11 @@ class ReactiveSpecialist:
                     action_name,
                     default="reuse-known-good-action",
                 ),
-                metadata=metadata,
+                metadata=self._metadata_for_action(context, action_name),
             )
         for action_name in trained_prior_actions:
             if action_name in suppressed:
                 continue
-            metadata = {}
-            if hasattr(context.adapter, "default_metadata_for_action"):
-                metadata = dict(context.adapter.default_metadata_for_action(action_name) or {})
-            if action_name == "ACTION6" and context.observation.image_input is not None:
-                metadata = self._board_probe_metadata(context)
             return ActionProposal(
                 action_name=action_name,
                 source=self.source,
@@ -309,7 +293,7 @@ class ReactiveSpecialist:
                     action_name,
                     default="reuse-known-good-action",
                 ),
-                metadata=metadata,
+                metadata=self._metadata_for_action(context, action_name),
             )
         seen_focus: set[str] = set()
         for action_name in focus_actions:
@@ -320,11 +304,6 @@ class ReactiveSpecialist:
                 continue
             if action_name in suppressed:
                 continue
-            metadata = {}
-            if hasattr(context.adapter, "default_metadata_for_action"):
-                metadata = dict(context.adapter.default_metadata_for_action(action_name) or {})
-            if action_name == "ACTION6" and context.observation.image_input is not None:
-                metadata = self._board_probe_metadata(context)
             return ActionProposal(
                 action_name=action_name,
                 source=self.source,
@@ -335,37 +314,9 @@ class ReactiveSpecialist:
                     action_name,
                     default="reuse-known-good-action",
                 ),
-                metadata=metadata,
+                metadata=self._metadata_for_action(context, action_name),
             )
         return None
-
-    def _trained_prior_order(
-        self,
-        trained_prior_bucket: dict[str, object] | None,
-        legal_actions: Iterable[str],
-    ) -> list[str]:
-        legal = {str(action_name) for action_name in legal_actions if str(action_name)}
-        ranked: list[tuple[int, str]] = []
-        for action_name, count in dict(trained_prior_bucket or {}).items():
-            normalized = str(action_name or "")
-            value = int(count or 0)
-            if not normalized or normalized not in legal or value <= 0:
-                continue
-            ranked.append((-value, normalized))
-        ranked.sort()
-        return [action_name for _, action_name in ranked]
-
-    def _trained_prior_rank(
-        self,
-        trained_prior_bucket: dict[str, object] | None,
-        legal_actions: Iterable[str],
-    ) -> dict[str, int]:
-        return {
-            action_name: index
-            for index, action_name in enumerate(
-                self._trained_prior_order(trained_prior_bucket, legal_actions)
-            )
-        }
 
     def _subgoal_for_action(
         self,
@@ -386,20 +337,50 @@ class ReactiveSpecialist:
         stagnation_decay = min(0.30, max(0, stagnation_steps - 2) * 0.03)
         return max(0.18, 0.55 - stagnation_decay - (proposal_index * 0.05))
 
-    def _board_probe_metadata(self, context: ExecutiveContext) -> dict[str, int]:
-        image_input = context.observation.image_input
-        if image_input is None:
-            return default_click_target(image_input)
-        frame_signature = str(
-            context.observation.derived_features.get("frame_signature", "") or ""
-        ) or None
-        counts = context.memory.context_outcome_counts(
-            "ACTION6",
-            state_name=context.observation.game_state,
-            frame_signature=frame_signature,
+    def _metadata_for_action(
+        self,
+        context: ExecutiveContext,
+        action_name: str,
+    ) -> dict[str, int]:
+        metadata = {}
+        if hasattr(context.adapter, "default_metadata_for_action"):
+            metadata = dict(context.adapter.default_metadata_for_action(action_name) or {})
+        if action_name == "ACTION6" and context.observation.image_input is not None:
+            metadata = board_probe_metadata(context)
+        return metadata
+
+    def _append_unique_proposal(
+        self,
+        proposals: list[ActionProposal],
+        proposal: ActionProposal,
+    ) -> list[ActionProposal]:
+        key = (
+            proposal.action_name,
+            proposal.subgoal,
+            tuple(sorted((proposal.metadata or {}).items())),
         )
-        attempt_index = int(counts.get("failed", 0) or 0) + int(counts.get("stalled", 0) or 0)
-        return board_probe_click_target(image_input, attempt_index=attempt_index)
+        existing_index = next(
+            (
+                index
+                for index, existing in enumerate(proposals)
+                if (
+                    existing.action_name,
+                    existing.subgoal,
+                    tuple(sorted((existing.metadata or {}).items())),
+                ) == key
+            ),
+            None,
+        )
+        if existing_index is None:
+            proposals.append(proposal)
+            return proposals
+        existing = proposals[existing_index]
+        if float(proposal.confidence) > float(existing.confidence):
+            proposals[existing_index] = proposal
+        return proposals
+
+    def _board_probe_metadata(self, context: ExecutiveContext) -> dict[str, int]:
+        return board_probe_metadata(context)
 
     def _deterministic_baseline_action(
         self,

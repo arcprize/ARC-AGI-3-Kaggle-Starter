@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import unittest
+from unittest.mock import patch
 
 from agi_core.config import RuntimeConfig
 from agi_core.executive import Executive, ExecutiveRuntime
@@ -9217,3 +9219,93 @@ class ExecutiveRuntimeOutcomeTests(unittest.TestCase):
         self.assertEqual(transition.local_outcome, "advanced")
         self.assertTrue(transition.player_moved)
         self.assertEqual(transition.action_name, "ACTION1")
+
+    def test_executive_prefers_ranked_symbolic_decision_before_fallback(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=1,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action=None,
+            legal_actions=["ACTION1", "ACTION2"],
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+
+        class FixedReactive:
+            def propose(self, _context):
+                return [
+                    ActionProposal(
+                        action_name="ACTION1",
+                        source="reactive",
+                        confidence=0.22,
+                        reason="weak reactive baseline",
+                    )
+                ]
+
+        class FixedSymbolic:
+            def propose(self, _context):
+                return [
+                    ActionProposal(
+                        action_name="ACTION2",
+                        source="symbolic",
+                        confidence=0.74,
+                        reason="strong symbolic intent",
+                    )
+                ]
+
+        executive = Executive(
+            config=RuntimeConfig.from_env(),
+            reactive=FixedReactive(),
+            symbolic=FixedSymbolic(),
+            llm=LLMSpecialist(),
+            critic=ProposalCritic(),
+        )
+
+        decision = executive.decide(context)
+
+        self.assertEqual(decision.action_name, "ACTION2")
+        self.assertEqual(decision.source, "symbolic")
+        self.assertFalse(decision.used_fallback)
+
+    def test_executive_emits_debug_metadata_when_enabled(self) -> None:
+        memory = EpisodicMemory()
+        observation = Observation(
+            game_id="ls20",
+            step_index=1,
+            game_state="ACTIVE",
+            levels_completed=0,
+            last_action=None,
+            legal_actions=["ACTION1"],
+        )
+        context = build_context(observation, memory, FakeLLMBackend(payload=None, available=False))
+
+        class FixedReactive:
+            def propose(self, _context):
+                return [
+                    ActionProposal(
+                        action_name="ACTION1",
+                        source="reactive",
+                        confidence=0.55,
+                        reason="debug candidate",
+                    )
+                ]
+
+        class EmptySymbolic:
+            def propose(self, _context):
+                return []
+
+        executive = Executive(
+            config=RuntimeConfig.from_env(),
+            reactive=FixedReactive(),
+            symbolic=EmptySymbolic(),
+            llm=LLMSpecialist(),
+            critic=ProposalCritic(),
+        )
+
+        with patch.dict(os.environ, {"AGI_DEBUG_DECISIONS": "1"}, clear=False):
+            decision = executive.decide(context)
+
+        self.assertIn("executive_debug", decision.metadata)
+        self.assertEqual(decision.metadata["executive_debug"]["strategy_mode"], "exploit")
+        self.assertEqual(decision.metadata["executive_debug"]["top_sources"][0], "reactive")

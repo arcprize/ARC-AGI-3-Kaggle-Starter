@@ -5,6 +5,13 @@ from agi_core.image_input import (
     canonical_click_target_bonus,
     click_target_bias,
 )
+from agi_core.specialists.proposal_evidence import (
+    build_evidence_view,
+    bundle_context_bias,
+    recommended_action_bonus,
+    suppressed_action_penalty,
+    trained_prior_bonus,
+)
 from agi_core.types import ActionProposal, ExecutiveContext
 
 
@@ -33,6 +40,10 @@ class ProposalCritic:
             )
         bundle_cache: dict[str, object] = {}
         bundle_view_cache: dict[int, dict[str, object]] = {}
+        breakdown_cache = context.multi_agent_frame_cache.setdefault(
+            "critic_score_breakdowns",
+            {},
+        )
         rescored: list[ActionProposal] = []
         for proposal in proposals:
             proposal_bundle = self._bundle_for_proposal(context, proposal, bundle_cache)
@@ -62,29 +73,49 @@ class ProposalCritic:
                 proposal.score = -1.0
                 rescored.append(proposal)
                 continue
-            score += source_bias.get(proposal.source, 0.0)
-            score -= memory.repeated_failure_penalty(proposal.action_name)
-            score -= memory.loop_penalty(proposal.action_name)
-            score -= memory.context_stall_penalty(
+            breakdown: dict[str, float | str] = {
+                "source_family": self._source_family(proposal.source),
+                "base_confidence": round(float(proposal.confidence), 4),
+            }
+            source_bonus = source_bias.get(proposal.source, 0.0)
+            score += source_bonus
+            breakdown["source_bias"] = round(source_bonus, 4)
+            repeated_failure_penalty = memory.repeated_failure_penalty(proposal.action_name)
+            score -= repeated_failure_penalty
+            breakdown["repeated_failure_penalty"] = round(-repeated_failure_penalty, 4)
+            loop_penalty = memory.loop_penalty(proposal.action_name)
+            score -= loop_penalty
+            breakdown["loop_penalty"] = round(-loop_penalty, 4)
+            context_penalty = memory.context_stall_penalty(
                 proposal.action_name,
                 state_name=game_state,
                 frame_signature=frame_signature,
             )
-            score += memory.success_bonus(proposal.action_name)
-            score += self._recommended_action_bonus(
+            score -= context_penalty
+            breakdown["context_stall_penalty"] = round(-context_penalty, 4)
+            success_bonus = memory.success_bonus(proposal.action_name)
+            score += success_bonus
+            breakdown["success_bonus"] = round(success_bonus, 4)
+            recommendation_bonus = recommended_action_bonus(
                 proposal.action_name,
                 recommended_ranks,
             )
-            score += self._trained_prior_bonus(
+            score += recommendation_bonus
+            breakdown["recommended_bonus"] = round(recommendation_bonus, 4)
+            prior_bonus = trained_prior_bonus(
                 proposal.action_name,
                 trained_prior_bucket,
                 trained_prior_max,
             )
-            score -= self._suppressed_action_penalty(
+            score += prior_bonus
+            breakdown["trained_prior_bonus"] = round(prior_bonus, 4)
+            suppression_penalty = suppressed_action_penalty(
                 proposal.action_name,
                 suppressed_actions,
             )
-            score += self._bundle_context_bias(
+            score -= suppression_penalty
+            breakdown["suppressed_penalty"] = round(-suppression_penalty, 4)
+            basin_bias = bundle_context_bias(
                 basin_action_stats.get(proposal.action_name, {}),
                 success_scale=0.05,
                 failed_scale=0.025,
@@ -92,7 +123,9 @@ class ProposalCritic:
                 positive_cap=0.20,
                 negative_cap=0.12,
             )
-            score += self._bundle_context_bias(
+            score += basin_bias
+            breakdown["basin_bias"] = round(basin_bias, 4)
+            state_bias = bundle_context_bias(
                 state_action_stats.get(proposal.action_name, {}),
                 success_scale=0.03,
                 failed_scale=0.02,
@@ -100,7 +133,9 @@ class ProposalCritic:
                 positive_cap=0.14,
                 negative_cap=0.10,
             )
-            score += self._bundle_context_bias(
+            score += state_bias
+            breakdown["state_bias"] = round(state_bias, 4)
+            subgoal_bias = bundle_context_bias(
                 subgoal_action_stats.get(proposal.action_name, {}),
                 success_scale=0.035,
                 failed_scale=0.02,
@@ -108,27 +143,40 @@ class ProposalCritic:
                 positive_cap=0.16,
                 negative_cap=0.10,
             )
-            score += float(semantic_memory_bonus.get(proposal.action_name, 0.0))
-            score += float(procedural_memory_bonus.get(proposal.action_name, 0.0))
-            score += float(episodic_recall_bonus.get(proposal.action_name, 0.0))
-            score += float(working_memory_focus_bonus.get(proposal.action_name, 0.0))
-            score -= float(working_memory_failure_penalty.get(proposal.action_name, 0.0))
+            score += subgoal_bias
+            breakdown["subgoal_bias"] = round(subgoal_bias, 4)
+            semantic_bonus = float(semantic_memory_bonus.get(proposal.action_name, 0.0))
+            procedural_bonus = float(procedural_memory_bonus.get(proposal.action_name, 0.0))
+            episodic_bonus = float(episodic_recall_bonus.get(proposal.action_name, 0.0))
+            wm_focus_bonus = float(working_memory_focus_bonus.get(proposal.action_name, 0.0))
+            wm_failure_penalty = float(working_memory_failure_penalty.get(proposal.action_name, 0.0))
+            score += semantic_bonus + procedural_bonus + episodic_bonus + wm_focus_bonus
+            score -= wm_failure_penalty
+            breakdown["semantic_bonus"] = round(semantic_bonus, 4)
+            breakdown["procedural_bonus"] = round(procedural_bonus, 4)
+            breakdown["episodic_bonus"] = round(episodic_bonus, 4)
+            breakdown["working_memory_focus_bonus"] = round(wm_focus_bonus, 4)
+            breakdown["working_memory_failure_penalty"] = round(-wm_failure_penalty, 4)
             if (
                 proposal.action_name == "RESET"
                 and game_state not in context.config.reset_state_names
             ):
                 score -= 0.40
+                breakdown["reset_penalty"] = -0.4
             if (
                 stagnation_steps >= 2
                 and most_recent_action is not None
                 and proposal.action_name != most_recent_action
             ):
                 score += 0.05
+                breakdown["stagnation_rotation_bonus"] = 0.05
             if basin_exhausted and proposal.action_name != "RESET":
                 if proposal.source == "symbolic":
                     score -= 0.45
+                    breakdown["basin_exhausted_adjustment"] = -0.45
                 elif proposal.source == "llm":
                     score += 0.20
+                    breakdown["basin_exhausted_adjustment"] = 0.20
             if (
                 proposal.action_name != "RESET"
                 and stagnation_steps >= 4
@@ -136,21 +184,30 @@ class ProposalCritic:
             ):
                 if proposal.source == "symbolic":
                     score -= 0.18
+                    breakdown["replan_adjustment"] = -0.18
                 elif proposal.source == "llm":
                     score += 0.12
+                    breakdown["replan_adjustment"] = 0.12
             if proposal.action_name != "RESET" and context.probe_dead_end_replan:
                 if proposal.source == "symbolic":
                     score -= 0.30
+                    breakdown["probe_dead_end_adjustment"] = -0.30
                 elif proposal.source == "llm":
                     score += 0.22
+                    breakdown["probe_dead_end_adjustment"] = 0.22
             if proposal.action_name == "ACTION6":
                 click_bias = click_target_bias(image_input, proposal.metadata)
                 score += click_bias
-                score += canonical_click_target_bonus(image_input, proposal.metadata)
+                breakdown["click_bias"] = round(click_bias, 4)
+                canonical_bonus = canonical_click_target_bonus(image_input, proposal.metadata)
+                score += canonical_bonus
+                breakdown["canonical_click_bonus"] = round(canonical_bonus, 4)
                 if active_cells > 0 and click_bias > 0:
                     score += 0.08
+                    breakdown["active_board_probe_bonus"] = 0.08
                     if str(proposal.subgoal or "") == "inspect-active-board":
                         score += 0.04
+                        breakdown["inspection_probe_bonus"] = 0.04
                 if (
                     str(proposal.subgoal or "") == "inspect-active-board"
                     and active_cells > 0
@@ -158,28 +215,40 @@ class ProposalCritic:
                     and int(observation.step_index) <= 0
                 ):
                     score += 0.05
+                    breakdown["opening_probe_bonus"] = 0.05
                 if (
                     active_cells > 0
                     and stagnation_steps <= 1
                     and most_recent_action == "ACTION6"
                 ):
                     score += 0.18
+                    breakdown["probe_continuity_bonus"] = 0.18
                 score -= recent_probe_exit
-            score += self._shape_target_bias(context, proposal)
+                if recent_probe_exit:
+                    breakdown["probe_exit_penalty"] = round(-recent_probe_exit, 4)
+            shape_bias = self._shape_target_bias(context, proposal)
+            score += shape_bias
+            if shape_bias:
+                breakdown["shape_target_bias"] = round(shape_bias, 4)
             # Perception confidence weighting
             if game_state not in context.config.reset_state_names:
                 pc = float(getattr(observation, "perception_confidence", 1.0))
                 if pc < 0.4:
                     score -= 0.12
+                    breakdown["perception_adjustment"] = -0.12
                 elif pc > 0.9:
                     score += 0.06
+                    breakdown["perception_adjustment"] = 0.06
                 # Dynamics-specific: solver proposals weighed by dynamics confidence
                 if proposal.source in ("solver:mirror", "solver:beam", "solver:navigation"):
                     dyn_conf = observation.derived_features.get("dynamics_confidence", {})
                     source_dyn = proposal.source.split(":")[-1]
                     dc = float(dyn_conf.get(source_dyn, 0.5))
-                    score *= 0.5 + 0.5 * dc
+                    dyn_adjustment = (dc - 0.5) * 0.20
+                    score += dyn_adjustment
+                    breakdown["dynamics_adjustment"] = round(dyn_adjustment, 4)
             proposal.score = round(max(-1.0, min(score, 1.50)), 4)
+            breakdown_cache[id(proposal)] = breakdown
             rescored.append(proposal)
         rescored.sort(
             key=lambda proposal: (
@@ -201,93 +270,41 @@ class ProposalCritic:
         cached = cache.get(key)
         if cached is not None:
             return cached
-        recommended_actions = [
-            str(action_name)
-            for action_name in list(proposal_bundle.recommended_actions or [])
-            if str(action_name or "")
-        ]
-        trained_prior_bucket = {
-            str(action_name): int(count)
-            for action_name, count in dict(proposal_bundle.trained_prior_bucket or {}).items()
-            if str(action_name) and int(count or 0) > 0
-        }
-        semantic_memories = list(proposal_bundle.semantic_memories or [])
-        procedural_memories = list(proposal_bundle.procedural_memories or [])
-        episodic_recalls = list(proposal_bundle.episodic_recalls or [])
+        evidence = build_evidence_view(proposal_bundle)
         working_memory = dict(proposal_bundle.working_memory or {})
-        semantic_focus_ranks = {
-            action_name: index
-            for index, action_name in enumerate(
-                str(name or "")
-                for name in list(working_memory.get("semantic_focus_actions", []) or [])
-                if str(name or "")
-            )
-        }
-        procedural_focus_ranks = {
-            action_name: index
-            for index, action_name in enumerate(
-                str(name or "")
-                for name in list(working_memory.get("procedural_focus_actions", []) or [])
-                if str(name or "")
-            )
-        }
-        recent_failure_actions = {
-            str(row.get("action_name", "") or "")
-            for row in list(working_memory.get("recent_failures", []) or [])
-            if str(row.get("action_name", "") or "")
-        }
-        open_failure_actions = {
-            str(row.get("action_name", "") or "")
-            for row in list(working_memory.get("open_failure_modes", []) or [])
-            if str(row.get("action_name", "") or "")
-        }
-        failure_streak_counts: dict[str, int] = {}
-        for row in list(working_memory.get("failure_streaks", []) or []):
-            action_name = str(row.get("action_name", "") or "")
-            if action_name and action_name not in failure_streak_counts:
-                failure_streak_counts[action_name] = int(row.get("count", 0) or 0)
-        semantic_memory_bonus = self._memory_row_bonus_map(semantic_memories, scale=0.10)
-        procedural_memory_bonus = self._memory_row_bonus_map(procedural_memories, scale=0.12)
-        episodic_recall_bonus = self._episodic_recall_bonus_map(episodic_recalls)
-        working_memory_focus_bonus = self._working_memory_focus_bonus_map(
-            semantic_focus_ranks,
-            procedural_focus_ranks,
-        )
-        working_memory_failure_penalty = self._working_memory_failure_penalty_map(
-            recent_failure_actions,
-            open_failure_actions,
-            failure_streak_counts,
-        )
-        working_memory["_semantic_focus_ranks"] = semantic_focus_ranks
-        working_memory["_procedural_focus_ranks"] = procedural_focus_ranks
-        working_memory["_recent_failure_actions"] = recent_failure_actions
-        working_memory["_open_failure_actions"] = open_failure_actions
-        working_memory["_failure_streak_counts"] = failure_streak_counts
+        working_memory["_semantic_focus_ranks"] = evidence.semantic_focus_ranks
+        working_memory["_procedural_focus_ranks"] = evidence.procedural_focus_ranks
+        working_memory["_recent_failure_actions"] = evidence.recent_failure_actions
+        working_memory["_failure_streak_counts"] = evidence.failure_streak_counts
         cached = {
-            "basin_status": dict(proposal_bundle.basin_status or {}),
+            "basin_status": evidence.basin_status,
             "working_memory": working_memory,
-            "recommended_ranks": {
-                action_name: index for index, action_name in enumerate(recommended_actions)
-            },
-            "trained_prior_bucket": trained_prior_bucket,
-            "trained_prior_max": max(trained_prior_bucket.values(), default=0),
-            "suppressed_actions": set(proposal_bundle.suppressed_actions or []),
-            "basin_action_stats": dict(proposal_bundle.basin_action_stats or {}),
-            "state_action_stats": dict(proposal_bundle.state_action_stats or {}),
-            "subgoal_action_stats": dict(proposal_bundle.subgoal_action_stats or {}),
-            "semantic_memory_bonus": semantic_memory_bonus,
-            "procedural_memory_bonus": procedural_memory_bonus,
-            "episodic_recall_bonus": episodic_recall_bonus,
-            "semantic_focus_ranks": semantic_focus_ranks,
-            "procedural_focus_ranks": procedural_focus_ranks,
-            "recent_failure_actions": recent_failure_actions,
-            "open_failure_actions": open_failure_actions,
-            "failure_streak_counts": failure_streak_counts,
-            "working_memory_focus_bonus": working_memory_focus_bonus,
-            "working_memory_failure_penalty": working_memory_failure_penalty,
+            "recommended_ranks": evidence.recommended_ranks,
+            "trained_prior_bucket": evidence.trained_prior_bucket,
+            "trained_prior_max": evidence.trained_prior_max,
+            "suppressed_actions": evidence.suppressed_actions,
+            "basin_action_stats": evidence.basin_action_stats,
+            "state_action_stats": evidence.state_action_stats,
+            "subgoal_action_stats": evidence.subgoal_action_stats,
+            "semantic_memory_bonus": evidence.semantic_memory_bonus,
+            "procedural_memory_bonus": evidence.procedural_memory_bonus,
+            "episodic_recall_bonus": evidence.episodic_recall_bonus,
+            "semantic_focus_ranks": evidence.semantic_focus_ranks,
+            "procedural_focus_ranks": evidence.procedural_focus_ranks,
+            "recent_failure_actions": evidence.recent_failure_actions,
+            "open_failure_actions": set(),
+            "failure_streak_counts": evidence.failure_streak_counts,
+            "working_memory_focus_bonus": evidence.working_memory_focus_bonus,
+            "working_memory_failure_penalty": evidence.working_memory_failure_penalty,
         }
         cache[key] = cached
         return cached
+
+    def _source_family(self, source: str) -> str:
+        if ":" in str(source or ""):
+            prefix, _, suffix = str(source).partition(":")
+            return f"{prefix}:{suffix}"
+        return str(source or "")
 
     def _active_cell_count_cached(self, context: ExecutiveContext) -> int:
         cache = context.multi_agent_frame_cache

@@ -43,6 +43,9 @@ def _format_metadata(
     board_context = _format_board_context(memory_summary_loader)
     if board_context:
         extras.append(board_context)
+    executive_debug = dict(metadata.get("executive_debug") or {})
+    if executive_debug:
+        extras.append(_format_executive_debug(executive_debug))
     score_floor_debug = dict(metadata.get("score_floor_debug") or {})
     if not score_floor_debug:
         return "".join(extras)
@@ -146,4 +149,23 @@ def _format_score_floor_debug(
         f" candidates={candidate_actions or '-'}"
         f"{frames}"
         f" counts={count_pairs or '-'}]"
+    )
+
+
+def _format_executive_debug(payload: dict[str, Any]) -> str:
+    strategy_mode = str(payload.get("strategy_mode", "") or "")
+    fallback_trigger = str(payload.get("fallback_trigger", "") or "")
+    selected_source_family = str(payload.get("selected_source_family", "") or "")
+    breakdown = dict(payload.get("top_score_breakdown") or {})
+    breakdown_summary = ",".join(
+        f"{key}:{breakdown[key]}"
+        for key in ("base_confidence", "source_bias", "recommended_bonus", "trained_prior_bonus", "working_memory_failure_penalty", "probe_exit_penalty", "dynamics_adjustment")
+        if key in breakdown
+    )
+    return (
+        " meta[exec"
+        f" strategy={strategy_mode or '-'}"
+        f" source_family={selected_source_family or '-'}"
+        f" fallback={fallback_trigger or '-'}"
+        f" breakdown={breakdown_summary or '-'}]"
     )

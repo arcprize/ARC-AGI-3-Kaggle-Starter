@@ -48,6 +48,7 @@ class SolverSelector:
             GameModel,
             ActionDecision,
         ] | None = None
+        self._last_retention_reason: str = ""
         self._attempt_steps = 0
         self._attempt_game_id = ""
         self._attempt_dynamics = ""
@@ -60,7 +61,12 @@ class SolverSelector:
     @property
     def active_attempt(self) -> bool:
         """Whether the retained solver owns an in-progress execution attempt."""
-        return bool(getattr(self._active_solver, "has_active_attempt", False))
+        value = getattr(self._active_solver, "has_active_attempt", False)
+        return value if isinstance(value, bool) else False
+
+    @property
+    def last_retention_reason(self) -> str:
+        return self._last_retention_reason
 
     def _replace_active_solver(
         self,
@@ -81,13 +87,23 @@ class SolverSelector:
         self,
         *,
         solver_name: str,
+        context: ExecutiveContext,
     ) -> bool:
         if self.active_attempt:
+            self._last_retention_reason = "active-attempt"
             return True
         # Beam-coverage owns AR25 beam boards even when perception briefly
         # downgrades them to generic beam dynamics between mirror and shape
         # control frames. Keep that solver until an explicit boundary resets it.
-        return self._active_name == "beam-coverage" and solver_name == "beam"
+        if (
+            self._active_name == "beam-coverage"
+            and solver_name == "beam"
+            and getattr(context.observation, "last_action", None) != "ACTION5"
+        ):
+            self._last_retention_reason = "beam-coverage-ownership"
+            return True
+        self._last_retention_reason = ""
+        return False
 
     def select_solver(
         self,
@@ -123,17 +139,23 @@ class SolverSelector:
         if self._active_solver is not None:
             if type(self._active_solver) is solver_cls:
                 self._active_name = solver_name
+                self._last_retention_reason = "same-class"
                 return self._active_solver
             # Keep cross-frame ownership only for solvers that explicitly hold
             # an in-progress attempt. Stateless solvers should yield as soon as
             # the board reclassifies to a different dynamics family.
-            if self._should_retain_active_solver(solver_name=solver_name):
+            if self._should_retain_active_solver(
+                solver_name=solver_name,
+                context=context,
+            ):
                 logger.debug(
-                    "SELECTOR: retaining active solver %s over mid-level recommendation %s",
+                    "SELECTOR: retaining active solver %s over mid-level recommendation %s reason=%s",
                     self._active_name,
                     solver_name,
+                    self._last_retention_reason,
                 )
                 return self._active_solver
+            self._last_retention_reason = ""
             logger.debug(
                 "SELECTOR: switching active solver %s -> %s active_attempt=%s last_action=%s",
                 self._active_name,
@@ -240,6 +262,7 @@ class SolverSelector:
                 logger.debug("active solver reset failed", exc_info=True)
         self._active_solver = None
         self._active_name = ""
+        self._last_retention_reason = ""
 
     def _store_observed_board_state(
         self,
