@@ -89,6 +89,33 @@ class ArcAdapterTests(unittest.TestCase):
             compute_board_signature(board),
         )
 
+    def test_observe_prefers_first_frame_layer_over_late_overlay_on_late_levels(self) -> None:
+        visible_board = [
+            [0, 10, 0],
+            [5, 5, 5],
+            [0, 11, 0],
+        ]
+        overlay_board = [
+            [10, 10, 10],
+            [0, 0, 0],
+            [11, 11, 11],
+        ]
+        frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            levels_completed=3,
+            frame=[visible_board, overlay_board],
+        )
+
+        observation = self.adapter.observe([frame], frame)
+
+        assert observation.image_input is not None
+        self.assertEqual(observation.image_input.board, visible_board)
+        self.assertEqual(observation.image_input.source_attr, "frame[0]")
+        self.assertEqual(
+            observation.derived_features["frame_signature"],
+            compute_board_signature(visible_board),
+        )
+
     def test_observe_normalizes_integer_action_ids(self) -> None:
         frame = StubFrame(
             state=StubGameState.ACTIVE,
@@ -331,10 +358,82 @@ class ArcAdapterTests(unittest.TestCase):
         self.assertIsNone(observation.image_input)
         self.assertEqual(observation.derived_features["board_height"], 0)
         self.assertEqual(observation.derived_features["board_width"], 0)
-        self.assertEqual(observation.derived_features["board_active_cells"], 0)
-        self.assertEqual(observation.derived_features["board_default_probe"], {})
-        self.assertIsNone(observation.derived_features["board_source_attr"])
-        self.assertFalse(observation.derived_features["has_image_input"])
+
+    def test_observe_reuses_last_image_input_on_late_level_missing_board(self) -> None:
+        board = [[5, 6, 7], [8, 9, 0]]
+        valid_frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            levels_completed=3,
+            available_actions=[StubGameAction.ACTION1],
+            frame=[board],
+        )
+        missing_board_frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=[StubGameAction.ACTION1],
+        )
+
+        first = self.adapter.observe([valid_frame], valid_frame)
+        second = self.adapter.observe([valid_frame, missing_board_frame], missing_board_frame)
+
+        assert first.image_input is not None
+        assert second.image_input is not None
+        self.assertEqual(second.levels_completed, 3)
+        self.assertEqual(second.image_input.board, board)
+        self.assertEqual(second.image_input.source_attr, "frame")
+        self.assertEqual(
+            second.derived_features["frame_signature"],
+            compute_board_signature(board),
+        )
+        self.assertTrue(second.derived_features["has_image_input"])
+
+    def test_observe_reuses_last_image_input_on_late_level_empty_board_payload(self) -> None:
+        board = [[5, 6, 7], [8, 9, 0]]
+        valid_frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            levels_completed=3,
+            available_actions=[StubGameAction.ACTION1],
+            frame=[board],
+        )
+        degraded_frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            available_actions=[StubGameAction.ACTION1],
+            frame=[[]],
+        )
+
+        first = self.adapter.observe([valid_frame], valid_frame)
+        second = self.adapter.observe([valid_frame, degraded_frame], degraded_frame)
+
+        assert first.image_input is not None
+        assert second.image_input is not None
+        self.assertEqual(second.levels_completed, 3)
+        self.assertEqual(second.image_input.board, board)
+        self.assertEqual(second.image_input.source_attr, "frame")
+        self.assertTrue(second.derived_features["has_image_input"])
+
+    def test_observe_does_not_reuse_missing_board_before_late_levels(self) -> None:
+        board = [[5, 6, 7], [8, 9, 0]]
+        valid_frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            levels_completed=2,
+            available_actions=[StubGameAction.ACTION1],
+            frame=[board],
+        )
+        missing_board_frame = StubFrame(
+            state=StubGameState.ACTIVE,
+            levels_completed=2,
+            available_actions=[StubGameAction.ACTION1],
+        )
+
+        first = self.adapter.observe([valid_frame], valid_frame)
+        second = self.adapter.observe([valid_frame, missing_board_frame], missing_board_frame)
+
+        assert first.image_input is not None
+        self.assertIsNone(second.image_input)
+        self.assertEqual(second.levels_completed, 2)
+        self.assertEqual(second.derived_features["board_active_cells"], 0)
+        self.assertEqual(second.derived_features["board_default_probe"], {})
+        self.assertIsNone(second.derived_features["board_source_attr"])
+        self.assertFalse(second.derived_features["has_image_input"])
 
     def test_default_action6_metadata_uses_board_center_when_available(self) -> None:
         board = [[1, 2, 3, 4], [5, 6, 7, 8]]

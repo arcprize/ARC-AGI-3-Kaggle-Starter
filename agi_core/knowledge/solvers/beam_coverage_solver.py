@@ -447,18 +447,27 @@ def _score_stage_target_family(
         target_anchor = stage.get("target_anchor")
         if not isinstance(target_anchor, (list, tuple)) or len(target_anchor) != 2:
             continue
-        placed = _placed_shape_from_anchor(
-            shapes[shape_index],
-            (int(target_anchor[0]), int(target_anchor[1])),
-        )
-        logical_beam = predict_beam_cells(
-            list(placed),
-            mirror_info,
+        precomputed_hits = _normalize_goal_cells(
+            stage.get("all_covered_goals")
+            if stage.get("all_covered_goals") is not None
+            else stage.get("covered_goals"),
             board_width,
-            board_height,
-            gs=gs,
         )
-        hits = covered_goal_cells(logical_beam, goal_cells, gs=gs)
+        if precomputed_hits:
+            hits = _logical_goal_set(precomputed_hits, gs=gs) & total_goals
+        else:
+            placed = _placed_shape_from_anchor(
+                shapes[shape_index],
+                (int(target_anchor[0]), int(target_anchor[1])),
+            )
+            logical_beam = predict_beam_cells(
+                list(placed),
+                mirror_info,
+                board_width,
+                board_height,
+                gs=gs,
+            )
+            hits = covered_goal_cells(logical_beam, goal_cells, gs=gs)
         covered_goals.update(hits)
         stage_coverage.append(len(hits))
         if current_centers and shape_index < len(current_centers):
@@ -487,6 +496,7 @@ def find_candidate_placements(
     board_height: int,
     current_center: tuple[int, int] | None = None,
     forbidden_cells: set[tuple[int, int]] | None = None,
+    all_goal_cells: set[tuple[int, int]] | list[tuple[int, int]] | None = None,
     gs: int = 3,
 ) -> list[dict[str, Any]]:
     if not shape_cells or not remaining_goals:
@@ -502,6 +512,7 @@ def find_candidate_placements(
 
     rel_set = {(x - x1, y - y1) for x, y in shape_cells}
     step = max(1, gs)
+    all_goals = set(all_goal_cells) if all_goal_cells is not None else set(remaining_goals)
     gpu_positions = _gpu_scored_candidate_positions(
         shape_cells=shape_cells,
         remaining_goals=remaining_goals,
@@ -539,6 +550,10 @@ def find_candidate_placements(
                 cell for cell in remaining_goals
                 if (cell[0] // max(1, gs), cell[1] // max(1, gs)) in logical_beam
             }
+            all_covered_goals = {
+                cell for cell in all_goals
+                if (cell[0] // max(1, gs), cell[1] // max(1, gs)) in logical_beam
+            }
             candidates.append({
                 "top_left": (tx, ty),
                 "target_anchor": [cx, cy],
@@ -549,6 +564,7 @@ def find_candidate_placements(
                     max(y for _, y in placed),
                 ],
                 "covered_goals": sorted(covered_goals),
+                "all_covered_goals": sorted(all_covered_goals),
                 "hits": hits,
                 "distance": dist,
             })
@@ -620,6 +636,7 @@ def rank_joint_best_placements(
             board_height,
             current_center=current_center,
             forbidden_cells=forbidden_cells,
+            all_goal_cells=goal_cells,
             gs=gs,
         )
         if not candidates:
@@ -631,6 +648,7 @@ def rank_joint_best_placements(
                 board_height,
                 current_center=current_center,
                 forbidden_cells=forbidden_cells,
+                all_goal_cells=goal_cells,
                 gs=gs,
             )
         if not candidates:
@@ -656,6 +674,7 @@ def rank_joint_best_placements(
                 "target_anchor": [int(target_anchor[0]), int(target_anchor[1])],
                 "target_bbox": list(candidate.get("target_bbox", [])),
                 "covered_goals": list(candidate.get("covered_goals", [])),
+                "all_covered_goals": list(candidate.get("all_covered_goals", [])),
             })
         order_key = tuple(
             (int(stage["target_anchor"][0]), int(stage["target_anchor"][1]))
@@ -1124,6 +1143,14 @@ class BeamCoverageSolver(DynamicsSolver):
         self._cached_frame = -1
         self._cached_target_key = None
 
+    def _should_preserve_late_ranked_attempt(self) -> bool:
+        return bool(
+            (self._last_levels_completed or 0) >= 3
+            and isinstance(self._cached_mirror_info, dict)
+            and self._cached_mirror_info.get("horizontal")
+            and (self._ranked_target_families or self._base_targets)
+        )
+
     def _reset_reflection_recovery(self) -> None:
         self._reflection_recovery = False
         self._recovery_direction = None
@@ -1139,22 +1166,32 @@ class BeamCoverageSolver(DynamicsSolver):
         plan_context = ctx.plan_context if isinstance(ctx.plan_context, dict) else {}
         recognition = plan_context.get("shape_recognition", {})
         mirror_puzzle = recognition.get("mirror_puzzle", {}) if isinstance(recognition, dict) else {}
-        candidates = []
+        gs = max(1, int(getattr(ctx.game_model.features, "grid_scale", 3) or 3))
+        candidates: list[list[tuple[int, int]]] = []
         if isinstance(mirror_puzzle, dict):
-            candidates.append(mirror_puzzle.get("goal_cells"))
+            normalized = _normalize_goal_cells(mirror_puzzle.get("goal_cells"), ctx.game_model.width)
+            if normalized:
+                candidates.append(normalized)
         if isinstance(recognition, dict):
-            candidates.append(recognition.get("goal_cells"))
+            normalized = _normalize_goal_cells(recognition.get("goal_cells"), ctx.game_model.width)
+            if normalized:
+                candidates.append(normalized)
+        board_goals = get_goal_cells(
+            ctx.game_model.components,
+            ctx.game_model.width,
+            board=board,
+        )
+        if board_goals:
+            candidates.append(board_goals)
         goals: list[tuple[int, int]] = []
+        best_logical_count = -1
         for candidate in candidates:
-            goals = _normalize_goal_cells(candidate, ctx.game_model.width)
-            if goals:
-                break
-        if not goals:
-            goals = get_goal_cells(
-                ctx.game_model.components,
-                ctx.game_model.width,
-                board=board,
-            )
+            logical_count = len(_logical_goal_set(candidate, gs=gs))
+            if logical_count > best_logical_count or (
+                logical_count == best_logical_count and len(candidate) > len(goals)
+            ):
+                goals = list(candidate)
+                best_logical_count = logical_count
         if goals:
             self._planned_goal_cells = list(goals)
         return goals
@@ -1216,6 +1253,10 @@ class BeamCoverageSolver(DynamicsSolver):
             "reflection_offscreen": self._reflection_offscreen,
             "recovery_step": self._recovery_step,
             "final_stage_coverage_incomplete": False,
+            "preserved_ranked_attempt": self._should_preserve_late_ranked_attempt(),
+            "pending_stage_confirmation_source": None,
+            "degraded_switch_observation": False,
+            "suppressed_stage_binding_update": False,
         }
         metadata.update(extra)
         return metadata
@@ -1298,6 +1339,76 @@ class BeamCoverageSolver(DynamicsSolver):
             return None
         return [int(target[0]), int(target[1])]
 
+    def _is_degraded_late_ranked_observation(
+        self,
+        *,
+        shapes: list[list[tuple[int, int]]],
+        goals: list[tuple[int, int]],
+        current_level: int,
+        mirror_info: dict[str, Any] | None,
+    ) -> bool:
+        return bool(
+            current_level >= 3
+            and isinstance(mirror_info, dict)
+            and mirror_info.get("horizontal")
+            and (self._ranked_target_families or self._base_targets)
+            and (len(shapes) < 2 or len(goals) > 100)
+        )
+
+    def _pending_switch_shape_candidate(
+        self,
+        candidates: list[tuple[list[tuple[int, int]], tuple[int, int]]],
+        *,
+        pending_stage_index: int | None,
+        player_pos: tuple[int, int],
+        target: tuple[int, int],
+        gs: int,
+        preserve_ranked_attempt: bool,
+        degraded_observation: bool,
+    ) -> tuple[
+        tuple[list[tuple[int, int]], tuple[int, int]] | None,
+        str,
+        bool,
+    ]:
+        if not candidates:
+            return None, "failed", False
+
+        binding = (
+            self._stage_shape_centers.get(pending_stage_index)
+            if pending_stage_index is not None else None
+        )
+        if binding is not None:
+            bound_shape = min(
+                candidates,
+                key=lambda item: abs(item[1][0] - binding[0]) + abs(item[1][1] - binding[1]),
+            )
+            bound_distance = (
+                abs(bound_shape[1][0] - binding[0]) + abs(bound_shape[1][1] - binding[1])
+            )
+            if bound_distance <= gs * 3:
+                return bound_shape, "bound_center", False
+            if preserve_ranked_attempt and degraded_observation:
+                return None, "failed", True
+
+        target_shape = min(
+            candidates,
+            key=lambda item: abs(item[1][0] - target[0]) + abs(item[1][1] - target[1]),
+        )
+        target_distance = (
+            abs(target_shape[1][0] - target[0]) + abs(target_shape[1][1] - target[1])
+        )
+        if preserve_ranked_attempt:
+            if target_distance <= gs * 3:
+                return target_shape, "pending_target", degraded_observation
+            if degraded_observation:
+                return None, "failed", True
+
+        nearest_shape = min(
+            candidates,
+            key=lambda item: abs(item[1][0] - player_pos[0]) + abs(item[1][1] - player_pos[1]),
+        )
+        return nearest_shape, "nearest_shape", False
+
     def _horizontal_final_stage_covered(
         self,
         *,
@@ -1374,6 +1485,18 @@ class BeamCoverageSolver(DynamicsSolver):
         )
 
     def _reset_attempt(self, reason: str) -> None:
+        preserve_ranked_plan = self._should_preserve_late_ranked_attempt()
+        preserved_base_targets = [dict(stage) for stage in (self._base_targets or [])]
+        preserved_ranked_families = [
+            dict(family) for family in self._ranked_target_families
+        ]
+        preserved_family_index = self._current_family_index
+        preserved_mirror_row = self._mirror_target_gy
+        preserved_goal_cells = list(self._planned_goal_cells or [])
+        preserved_mirror_info = (
+            dict(self._cached_mirror_info)
+            if isinstance(self._cached_mirror_info, dict) else None
+        )
         self._attempt_id += 1
         self._attempt_reset_reason = reason
         self._base_targets = None
@@ -1400,6 +1523,16 @@ class BeamCoverageSolver(DynamicsSolver):
         self._reset_reflection_recovery()
         self._stage_shape_centers.clear()
         self._confirmed_shape_center = None
+        if preserve_ranked_plan:
+            self._base_targets = preserved_base_targets
+            self._ranked_target_families = preserved_ranked_families
+            self._current_family_index = min(
+                preserved_family_index,
+                max(0, len(self._ranked_target_families) - 1),
+            )
+            self._mirror_target_gy = preserved_mirror_row
+            self._planned_goal_cells = preserved_goal_cells or None
+            self._cached_mirror_info = preserved_mirror_info
 
     def _reset_mirror_phase_progress(self, *, clear_unreachable: bool = False) -> None:
         self._mirror_phase = False
@@ -1409,6 +1542,7 @@ class BeamCoverageSolver(DynamicsSolver):
             self._unreachable_mirror_rows.clear()
 
     def _restart_attempt_with_retry(self, reason: str, gm, gs: int) -> None:
+        preserve_current_family = self._should_preserve_late_ranked_attempt()
         self._attempt_id += 1
         self._attempt_reset_reason = reason
         self._active_stage_index = -1
@@ -1430,12 +1564,28 @@ class BeamCoverageSolver(DynamicsSolver):
         self._confirmed_shape_center = None
         if self._base_targets:
             if (
-                self._ranked_target_families
+                not preserve_current_family
+                and self._ranked_target_families
                 and self._current_family_index + 1 < len(self._ranked_target_families)
             ):
                 promoted = self._promote_target_family(gm, gs)
                 if promoted:
                     return
+            if (
+                self._ranked_target_families
+                and preserve_current_family
+                and self._current_family_index < len(self._ranked_target_families)
+            ):
+                self._cached_targets = self._targets_with_retry_offset(
+                    self._base_targets,
+                    gm,
+                    gs,
+                )
+                self._cached_frame = self._last_levels_completed or self._cached_frame
+                self._cached_mirror_info = self._cached_mirror_info or {}
+                self._family_retry_count += 1
+                self._retry_count += 1
+                return
             self._family_retry_count += 1
             self._retry_count += 1
             if self._family_retry_count <= self._family_retry_budget:
@@ -1549,14 +1699,31 @@ class BeamCoverageSolver(DynamicsSolver):
             and player_color != self._pending_switch_color
         )
         target = self._pending_stage_target(gs) or player_pos
+        try:
+            current_level = int(ctx.plan_context.get("levels_completed", 0))
+        except (TypeError, ValueError):
+            current_level = 0
+        goals = self._goal_cells(ctx, getattr(ctx.game_model, "board", None))
+        degraded_observation = self._is_degraded_late_ranked_observation(
+            shapes=shapes,
+            goals=goals,
+            current_level=current_level,
+            mirror_info=self._cached_mirror_info,
+        )
+        preserve_ranked_attempt = self._should_preserve_late_ranked_attempt()
         candidates = self._visible_shape_candidates(shapes)
         visible_shape_cells = [cell for shape in shapes for cell in shape]
-        controlled_shape = None
-        if candidates:
-            controlled_shape = min(
+        controlled_shape, confirmation_source, suppressed_binding_update = (
+            self._pending_switch_shape_candidate(
                 candidates,
-                key=lambda item: abs(item[1][0] - player_pos[0]) + abs(item[1][1] - player_pos[1]),
+                pending_stage_index=self._pending_stage_index,
+                player_pos=player_pos,
+                target=target,
+                gs=gs,
+                preserve_ranked_attempt=preserve_ranked_attempt,
+                degraded_observation=degraded_observation,
             )
+        )
         controls_shape = (
             (
                 controlled_shape is not None
@@ -1583,13 +1750,24 @@ class BeamCoverageSolver(DynamicsSolver):
                     metadata=self._decision_metadata(
                         pending_shape_stage=self._pending_stage_index,
                         pending_shape_target=list(target) if target is not None else None,
+                        preserved_ranked_attempt=preserve_ranked_attempt,
+                        pending_stage_confirmation_source=confirmation_source,
+                        degraded_switch_observation=degraded_observation,
+                        suppressed_stage_binding_update=suppressed_binding_update,
                     ),
                 )
 
         if (changed_position or changed_color) and controls_shape:
             self._active_stage_index = int(self._pending_stage_index or 0)
-            if controlled_shape is not None:
+            if controlled_shape is not None and not (
+                suppressed_binding_update and degraded_observation
+            ):
                 self._bind_stage_shape(self._active_stage_index, controlled_shape[1])
+            elif controlled_shape is not None:
+                self._confirmed_shape_center = (
+                    int(controlled_shape[1][0]),
+                    int(controlled_shape[1][1]),
+                )
             self._switch_pending = False
             self._pending_stage_index = None
             self._pending_switch_origin = None
@@ -1615,7 +1793,13 @@ class BeamCoverageSolver(DynamicsSolver):
                 "solver:beam-coverage",
                 0.50,
                 reason="coverage_switch_retry",
-                metadata=self._decision_metadata(pending_shape_stage=self._pending_stage_index),
+                metadata=self._decision_metadata(
+                    pending_shape_stage=self._pending_stage_index,
+                    preserved_ranked_attempt=preserve_ranked_attempt,
+                    pending_stage_confirmation_source=confirmation_source,
+                    degraded_switch_observation=degraded_observation,
+                    suppressed_stage_binding_update=suppressed_binding_update,
+                ),
             )
 
         self._switch_pending = False
@@ -1623,6 +1807,7 @@ class BeamCoverageSolver(DynamicsSolver):
         self._pending_switch_origin = None
         self._pending_switch_color = None
         self._pending_switch_frames = 0
+        self._pending_switch_scans = 0
         return False, None
 
     # ── Activation ─────────────────────────────────────────────────────
@@ -1718,6 +1903,12 @@ class BeamCoverageSolver(DynamicsSolver):
             logger.debug("beam decide skipped: no goals active=%s planned=%s", self.has_active_attempt, bool(self._planned_goal_cells))
             return None
         self._planned_shape_count = max(self._planned_shape_count, len(shapes))
+        degraded_ranked_observation = self._is_degraded_late_ranked_observation(
+            shapes=shapes,
+            goals=goals,
+            current_level=current_level,
+            mirror_info=mirror_info,
+        )
 
         switch_confirmed, switch_decision = self._observe_pending_switch(
             ctx,
@@ -1729,6 +1920,18 @@ class BeamCoverageSolver(DynamicsSolver):
         if switch_decision is not None:
             return switch_decision
         if self._switch_pending:
+            if self._should_preserve_late_ranked_attempt():
+                return ActionDecision(
+                    "ACTION6",
+                    "solver:beam-coverage",
+                    0.48,
+                    reason="coverage_switch_wait",
+                    metadata=self._decision_metadata(
+                        pending_shape_stage=self._pending_stage_index,
+                        pending_shape_target=self._pending_stage_target_anchor(),
+                        degraded_switch_observation=degraded_ranked_observation,
+                    ),
+                )
             return None
 
         player_jump = (
@@ -1736,7 +1939,8 @@ class BeamCoverageSolver(DynamicsSolver):
             and abs(px - self._last_player_pos[0]) + abs(py - self._last_player_pos[1]) > gs * 4
         )
         execution_started = self._active_stage_index >= 0 or self._switch_pending
-        if player_jump and not switch_confirmed and not execution_started:
+        preserve_ranked_attempt = self._should_preserve_late_ranked_attempt()
+        if player_jump and not switch_confirmed and not execution_started and not preserve_ranked_attempt:
             self._mirror_target_gy = None
             self._retry_count = 0
             self._invalidate_target_cache()
@@ -1758,7 +1962,21 @@ class BeamCoverageSolver(DynamicsSolver):
                 int(self._mirror_target_gy) if self._mirror_target_gy is not None else current_mirror_gy,
                 self._planned_shape_count,
             )
-            if self._mirror_target_gy is None or self._cached_target_key != mirror_cache_key:
+            reuse_ranked_plan = (
+                degraded_ranked_observation
+                and self._mirror_target_gy is not None
+                and bool(self._ranked_target_families or self._base_targets)
+            )
+            if reuse_ranked_plan:
+                if self._cached_targets is None:
+                    if self._base_targets:
+                        self._cached_targets = [dict(stage) for stage in self._base_targets]
+                    elif self._ranked_target_families:
+                        self._adopt_target_family(self._current_family_index, gm, gs)
+                self._cached_target_key = mirror_cache_key
+                self._cached_frame = current_level
+                self._cached_mirror_info = self._cached_mirror_info or dict(mirror_info)
+            elif self._mirror_target_gy is None or self._cached_target_key != mirror_cache_key:
                 if use_ranked_families:
                     selected_plan = rank_horizontal_mirror_plans(
                         shapes,
@@ -1839,36 +2057,46 @@ class BeamCoverageSolver(DynamicsSolver):
 
             target_row = int(self._mirror_target_gy if self._mirror_target_gy is not None else current_mirror_gy)
             if target_row != current_mirror_gy:
-                player_is_mirror = abs(py - mirror_info["axis_py"]) <= gs
-                if not player_is_mirror:
-                    self._unreachable_mirror_rows.add(target_row)
-                    self._mirror_target_gy = current_mirror_gy
-                    self._retry_count += 1
-                    self._reset_attempt("mirror_row_unreachable")
+                if use_ranked_families and self.has_active_attempt:
+                    # Late AR25 horizontal beam boards can transiently emit a
+                    # degraded one-layer observation whose detected mirror row
+                    # no longer matches the already-selected planning row.
+                    # Once a ranked-family attempt is active, keep the chosen
+                    # row authoritative instead of resetting into the
+                    # corrupted observation.
+                    current_mirror_gy = target_row
                     self._reset_mirror_phase_progress()
-                    target_row = current_mirror_gy
                 else:
-                    if self._last_observed_mirror_gy == current_mirror_gy:
-                        self._mirror_stall_steps += 1
-                    else:
-                        self._last_observed_mirror_gy = current_mirror_gy
-                        self._mirror_stall_steps = 0
-                    if self._mirror_stall_steps >= 4:
+                    player_is_mirror = abs(py - mirror_info["axis_py"]) <= gs
+                    if not player_is_mirror:
                         self._unreachable_mirror_rows.add(target_row)
                         self._mirror_target_gy = current_mirror_gy
                         self._retry_count += 1
-                        self._reset_attempt("mirror_row_stalled")
+                        self._reset_attempt("mirror_row_unreachable")
                         self._reset_mirror_phase_progress()
                         target_row = current_mirror_gy
                     else:
-                        direction = "up" if target_row < current_mirror_gy else "down"
-                        return ActionDecision(
-                            DIR_TO_ACTION.get(direction, "ACTION1"),
-                            "solver:beam-coverage",
-                            0.65,
-                            reason=f"coverage_position_mirror_{direction}",
-                            metadata=self._decision_metadata(),
-                        )
+                        if self._last_observed_mirror_gy == current_mirror_gy:
+                            self._mirror_stall_steps += 1
+                        else:
+                            self._last_observed_mirror_gy = current_mirror_gy
+                            self._mirror_stall_steps = 0
+                        if self._mirror_stall_steps >= 4:
+                            self._unreachable_mirror_rows.add(target_row)
+                            self._mirror_target_gy = current_mirror_gy
+                            self._retry_count += 1
+                            self._reset_attempt("mirror_row_stalled")
+                            self._reset_mirror_phase_progress()
+                            target_row = current_mirror_gy
+                        else:
+                            direction = "up" if target_row < current_mirror_gy else "down"
+                            return ActionDecision(
+                                DIR_TO_ACTION.get(direction, "ACTION1"),
+                                "solver:beam-coverage",
+                                0.65,
+                                reason=f"coverage_position_mirror_{direction}",
+                                metadata=self._decision_metadata(),
+                            )
             else:
                 self._reset_mirror_phase_progress()
 

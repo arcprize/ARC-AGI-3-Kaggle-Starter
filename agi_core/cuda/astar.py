@@ -4,7 +4,8 @@ import logging
 
 import numpy as np
 
-from agi_core.cuda import CUDA_AVAILABLE, kernel_available
+import agi_core.cuda as cuda_runtime
+from agi_core.cuda import kernel_available, note_kernel_stat
 from agi_core.cuda.kernels import _launch_astar_kernel
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ def batch_astar_gpu(
     config: object | None = None,
 ) -> list[list[tuple[int, int]] | None]:
     """Run batch A* on the GPU for multiple agents."""
-    if not kernel_available("astar", config) or not CUDA_AVAILABLE:
+    if not kernel_available("astar", config) or not cuda_runtime.CUDA_AVAILABLE:
         return _fallback_cpu(
             walkable_sets,
             start_positions,
@@ -55,6 +56,7 @@ def batch_astar_gpu(
             paths_out,
             path_lens,
         )
+        note_kernel_stat("astar")
 
         results: list[list[tuple[int, int]] | None] = []
         for index in range(n):

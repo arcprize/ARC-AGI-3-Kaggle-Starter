@@ -16,6 +16,7 @@ from agi_core.multi_agent import (
 from agi_core.multi_agent.agents import StrategyAgent, _ordered_mirror_actions, _target_metadata, prepare_frame_cache
 from agi_core.multi_agent.consensus import _consensus_context_signals
 from agi_core.memory import EpisodicMemory
+from agi_core.orch_or.parallel import ProcessPoolManager, ThreadPoolManager
 from agi_core.perception.shape_recognition import recognize_shape_recognition
 from agi_core.runtime_sync import ensure_hyperon_context_synced
 from agi_core.types import (
@@ -83,6 +84,16 @@ class FailingProcessAgent(StrategyAgent):
 
 
 class TestMultiAgent(unittest.TestCase):
+    def tearDown(self) -> None:
+        ThreadPoolManager._shutdown()
+        ThreadPoolManager.set_max_workers(0)
+        ProcessPoolManager._shutdown()
+        ProcessPoolManager.set_max_workers(0)
+        return super().tearDown()
+
+    def _require_process_executor(self, supervisor: AgentSupervisor) -> None:
+        if not supervisor._process_executor:
+            self.skipTest("process executor unavailable on this host")
 
     def test_movement_agent_produces_proposals(self):
         agent = MovementAgent()
@@ -187,7 +198,46 @@ class TestMultiAgent(unittest.TestCase):
         self.assertIn("exploration", sup._agent_map)
         self.assertIn("interaction", sup._agent_map)
         self.assertIn("puzzle", sup._agent_map)
+        self._require_process_executor(sup)
         self.assertTrue(sup._process_executor)
+
+    def test_supervisor_process_mode_does_not_start_workers_during_construction(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_executor = "process"
+        config.cuda_enabled = False
+        with patch(
+            "agi_core.multi_agent.runtime._ProcessAgentWorker.ensure_started"
+        ) as ensure_started:
+            AgentSupervisor(executive=MagicMock(), config=config)
+        ensure_started.assert_not_called()
+
+    def test_supervisor_defers_cuda_init_until_first_decide(self):
+        config = MagicMock(spec=RuntimeConfig)
+        config.multi_agent_workers = 2
+        config.planner_parallel_timeout = None
+        config.multi_agent_executor = "thread"
+        config.cuda_enabled = True
+        config.cuda_device = 0
+        executive = MagicMock()
+        with patch("agi_core.multi_agent.supervisor.init_cuda") as init_cuda:
+            supervisor = AgentSupervisor(executive=executive, config=config)
+            init_cuda.assert_not_called()
+            supervisor._try_solver_direct = MagicMock(return_value=None)
+            supervisor._run_agents = MagicMock(return_value={})
+            supervisor._consensus.collect = MagicMock(return_value=[])
+            context = self._mock_context(legal=["ACTION1"])
+            context.memory.pending_score_floor_reopen.return_value = None
+            context.hyperon.current_memory_bundle.return_value = None
+            executive.decide.return_value = ActionDecision(
+                action_name="ACTION1",
+                source="fallback",
+                confidence=0.1,
+                reason="fallback",
+            )
+
+            supervisor.decide(context)
+
+        init_cuda.assert_called_once_with(0)
 
     def test_supervisor_preserves_bootstrapped_thread_pool_worker_budget(self):
         config = MagicMock(spec=RuntimeConfig)
@@ -333,6 +383,7 @@ class TestMultiAgent(unittest.TestCase):
             config=config,
             agents=[FastProcessTestAgent(), SlowProcessTestAgent()],
         )
+        self._require_process_executor(supervisor)
         supervisor._agent_timeout = 0.2
 
         t0 = time.monotonic()
@@ -357,6 +408,7 @@ class TestMultiAgent(unittest.TestCase):
             config=config,
             agents=[SlowProcessTestAgent()],
         )
+        self._require_process_executor(supervisor)
         supervisor._agent_timeout = 0.05
         context = self._mock_context(legal=["ACTION2"])
 
@@ -376,6 +428,7 @@ class TestMultiAgent(unittest.TestCase):
             config=config,
             agents=[SlowProcessTestAgent()],
         )
+        self._require_process_executor(supervisor)
         supervisor._agent_timeout = 0.05
         context = self._mock_context(legal=["ACTION2"])
 
@@ -398,6 +451,7 @@ class TestMultiAgent(unittest.TestCase):
             config=config,
             agents=[OutcomeAwareProcessAgent()],
         )
+        self._require_process_executor(supervisor)
         context = self._mock_context(legal=["ACTION1", "ACTION2"])
 
         initial = supervisor._run_agents(supervisor._agents, context)
@@ -431,6 +485,7 @@ class TestMultiAgent(unittest.TestCase):
             config=config,
             agents=[OutcomeAwareProcessAgent()],
         )
+        self._require_process_executor(supervisor)
         context = self._mock_context(legal=["ACTION1", "ACTION2"])
         supervisor._pending_agent_credit = {
             "game_id": "ls20",
@@ -464,6 +519,7 @@ class TestMultiAgent(unittest.TestCase):
             config=config,
             agents=[FailingProcessAgent()],
         )
+        self._require_process_executor(supervisor)
 
         proposals = supervisor._run_agents(
             supervisor._agents,
@@ -499,6 +555,7 @@ class TestMultiAgent(unittest.TestCase):
             config=process_config,
             agents=[FastProcessTestAgent(), OutcomeAwareProcessAgent()],
         )
+        self._require_process_executor(process_sup)
         thread_props = thread_sup._run_agents(thread_sup._agents, context)
         process_props = process_sup._run_agents(process_sup._agents, context)
 

@@ -362,7 +362,6 @@ class ProcessMultiAgentExecutor(MultiAgentExecutorBackend):
             if class_path is None:
                 raise ValueError(f"agent {agent!r} is not importable for process execution")
             worker = _ProcessAgentWorker(str(agent.agent_id), class_path)
-            worker.ensure_started()
             self._workers[str(agent.agent_id)] = worker
 
     def active_worker_count(self) -> int:

@@ -1,389 +1,415 @@
-"""CUDA kernels for salience computation, batch A* pathfinding,
-and connected-component labeling.
+"""CuPy-backed CUDA kernels for ARC-AGI-3 runtime hotspots."""
 
-All kernels use ``numba.cuda.jit`` decorators.  Every kernel is designed
-for a 64×64 grid (the standard ARC-AGI-3 board size) but accepts
-dynamic width/height parameters for smaller boards.
-"""
+from __future__ import annotations
 
 import logging
 
 import numpy as np
 
+from agi_core.cuda import get_cupy
+
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Salience kernel
-# 2-D grid: blockDim = (16, 16), gridDim = (4, 4) → 64×64 threads
-# Each thread computes one cell's salience value.
-# ---------------------------------------------------------------------------
+_RAW_KERNELS: dict[str, object] = {}
+
+
+def _cp():
+    return get_cupy()
+
+
+def _raw_kernel(name: str, code: str):
+    kernel = _RAW_KERNELS.get(name)
+    if kernel is not None:
+        return kernel
+    cp = _cp()
+    kernel = cp.RawKernel(code, name)
+    _RAW_KERNELS[name] = kernel
+    return kernel
+
+
+def _to_numpy(arr):
+    cp = _cp()
+    if isinstance(arr, cp.ndarray):
+        return cp.asnumpy(arr)
+    return arr
+
+
+def _assign_array(dst, src) -> None:
+    cp = _cp()
+    if isinstance(dst, cp.ndarray):
+        dst[...] = src
+    else:
+        dst[...] = cp.asnumpy(src) if isinstance(src, cp.ndarray) else src
 
 
 def _launch_salience_kernel(board, px, py, goal_xs, goal_ys, out, prev_board=None):
-    """Launch the CUDA salience kernel if numba is available; else raise."""
-    from numba import cuda, float32, int32
-
-    @cuda.jit
-    def _salience_kernel(
-        board, prev_board, width, height,
-        px, py,
-        goal_xs, goal_ys, n_goals,
-        out,
-    ):
-        x, y = cuda.grid(2)
-        if x >= width or y >= height:
-            return
-
-        s = 0.0
-
-        # 1. Motion (if prev_board provided)
-        if prev_board is not None and prev_board[y, x] != board[y, x]:
-            s += 0.25
-
-        # 2. Player vicinity (Manhattan)
-        dist = abs(x - px) + abs(y - py)
-        if dist < 20:
-            s += 0.30 * (1.0 - dist / 20.0)
-
-        # 3. Goal vicinity (nearest goal)
-        best = 16.0
-        for i in range(n_goals):
-            gx = goal_xs[i]
-            gy = goal_ys[i]
-            d = float(abs(x - gx) + abs(y - gy))
-            if d < best:
-                best = d
-        if best < 16.0:
-            s += 0.20 * (1.0 - best / 16.0)
-
-        # 4. Edge bonus
-        if x < 3 or x >= width - 3 or y < 3 or y >= height - 3:
-            s += 0.10
-
-        out[y, x] = min(1.0, s)
-
-    h, w = board.shape[:2]
-    threads_per_block = (16, 16)
-    blocks_per_grid = (
-        (w + threads_per_block[0] - 1) // threads_per_block[0],
-        (h + threads_per_block[1] - 1) // threads_per_block[1],
+    cp = _cp()
+    board_cp = cp.asarray(board, dtype=cp.int8)
+    prev_cp = cp.asarray(prev_board, dtype=cp.int8) if prev_board is not None else cp.zeros_like(board_cp)
+    goal_xs_cp = cp.asarray(goal_xs, dtype=cp.int32)
+    goal_ys_cp = cp.asarray(goal_ys, dtype=cp.int32)
+    out_cp = cp.zeros(board_cp.shape, dtype=cp.float32)
+    h, w = board_cp.shape
+    kernel = _raw_kernel(
+        "salience_kernel",
+        r"""
+        extern "C" __global__
+        void salience_kernel(
+            const signed char* board,
+            const signed char* prev_board,
+            const int width,
+            const int height,
+            const int px,
+            const int py,
+            const int* goal_xs,
+            const int* goal_ys,
+            const int n_goals,
+            const int has_prev,
+            float* out
+        ) {
+            int x = blockDim.x * blockIdx.x + threadIdx.x;
+            int y = blockDim.y * blockIdx.y + threadIdx.y;
+            if (x >= width || y >= height) {
+                return;
+            }
+            int idx = y * width + x;
+            float s = 0.0f;
+            if (has_prev && prev_board[idx] != board[idx]) {
+                s += 0.25f;
+            }
+            int dist = abs(x - px) + abs(y - py);
+            if (dist < 20) {
+                s += 0.30f * (1.0f - ((float)dist / 20.0f));
+            }
+            float best = 16.0f;
+            for (int i = 0; i < n_goals; ++i) {
+                float d = (float)(abs(x - goal_xs[i]) + abs(y - goal_ys[i]));
+                if (d < best) {
+                    best = d;
+                }
+            }
+            if (best < 16.0f) {
+                s += 0.20f * (1.0f - best / 16.0f);
+            }
+            if (x < 3 || x >= width - 3 || y < 3 || y >= height - 3) {
+                s += 0.10f;
+            }
+            out[idx] = s > 1.0f ? 1.0f : s;
+        }
+        """,
     )
-    _salience_kernel[blocks_per_grid, threads_per_block](
-        board, prev_board, w, h,
-        px, py,
-        goal_xs, goal_ys, len(goal_xs),
-        out,
+    threads = (16, 16, 1)
+    blocks = ((w + 15) // 16, (h + 15) // 16, 1)
+    kernel(
+        blocks,
+        threads,
+        (
+            board_cp,
+            prev_cp,
+            np.int32(w),
+            np.int32(h),
+            np.int32(px),
+            np.int32(py),
+            goal_xs_cp,
+            goal_ys_cp,
+            np.int32(int(goal_xs_cp.size)),
+            np.int32(1 if prev_board is not None else 0),
+            out_cp,
+        ),
     )
-    cuda.synchronize()
-
-
-# ---------------------------------------------------------------------------
-# Batch A* kernel
-# 1-D grid: one block per search (up to 32 concurrent searches)
-# Each block uses shared memory for open/closed sets.
-# ---------------------------------------------------------------------------
+    cp.cuda.runtime.deviceSynchronize()
+    _assign_array(out, out_cp)
 
 
 def _launch_astar_kernel(walkable, starts_x, starts_y, goals_x, goals_y, paths_out, path_lens):
-    """Launch the CUDA A* kernel if numba is available; else raise."""
-    from numba import cuda, int32, uint8
-
-    @cuda.jit
-    def _astar_kernel(
-        walkable, width, height,
-        starts_x, starts_y,
-        goals_x, goals_y,
-        paths_out, path_lens_out,
-    ):
-        """One block per search.  Shared memory layout (42 KB total):
-        
-        - open_set:   256 × 2 int32  = 2 KB  (x, y pairs)
-        - open_count: 1 int32         = 4 B
-        - g_score:    4096 float32   = 16 KB (64×64)
-        - closed:     4096 uint8     = 4 KB
-        - parent:     4096 uint16    = 8 KB
-        - path_buf:   256 uint16     = 0.5 KB
-        Total: ~30.5 KB (fits in 48 KB shared memory)
-        """
-        bid = cuda.blockIdx.x
-        if bid >= path_lens_out.shape[0]:
-            return
-
-        sx = starts_x[bid]
-        sy = starts_y[bid]
-        gx = goals_x[bid]
-        gy = goals_y[bid]
-
-        # Shared memory allocation
-        open_x = cuda.shared.array(256, dtype=int32)
-        open_y = cuda.shared.array(256, dtype=int32)
-        open_count = cuda.shared.array(1, dtype=int32)
-        g_score = cuda.shared.array(4096, dtype=float32)
-        closed = cuda.shared.array(4096, dtype=uint8)
-        parent = cuda.shared.array(4096, dtype=int32)
-
-        tid = cuda.threadIdx.x
-        stride = cuda.blockDim.x
-
-        # Initialise shared memory
-        for i in range(tid, 4096, stride):
-            g_score[i] = 1e18
-            closed[i] = 0
-            parent[i] = -1
-
-        cuda.syncthreads()
-
-        # Start node
-        if tid == 0:
-            start_idx = sy * width + sx
-            g_score[start_idx] = 0.0
-            open_x[0] = sx
-            open_y[0] = sy
-            open_count[0] = 1
-
-        cuda.syncthreads()
-
-        goal_idx = gy * width + gx
-        found = 0
-
-        for _ in range(width * height):  # at most one iteration per cell
-            cuda.syncthreads()
-            if found:
-                break
-
-            # Find minimum f_score in open set (parallel reduction)
-            best_idx = -1
-            best_f = 1e18
-            best_open_pos = -1
-
-            for i in range(tid, open_count[0], stride):
-                ox = open_x[i]
-                oy = open_y[i]
-                oi = oy * width + ox
-                if closed[oi]:
-                    continue
-                h = abs(ox - gx) + abs(oy - gy)
-                f = g_score[oi] + float(h)
-                if f < best_f:
-                    best_f = f
-                    best_idx = oi
-                    best_open_pos = i
-
-            # Parallel reduction to find global minimum
-            # (simplified: thread 0 picks the first found by the lowest thread ID)
-            cuda.syncthreads()
-
-            if tid == 0 and best_idx >= 0:
-                closed[best_idx] = 1
-                # Remove from open set
-                if best_open_pos >= 0 and best_open_pos < open_count[0] - 1:
-                    open_x[best_open_pos] = open_x[open_count[0] - 1]
-                    open_y[best_open_pos] = open_y[open_count[0] - 1]
-                open_count[0] -= 1
-
-                bx = best_idx % width
-                by = best_idx // width
-
-                if best_idx == goal_idx:
-                    found = 1
-                else:
-                    # Expand neighbours (4-directional)
-                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        nx = bx + dx
-                        ny = by + dy
-                        if nx < 0 or nx >= width or ny < 0 or ny >= height:
-                            continue
-                        ni = ny * width + nx
-                        if closed[ni] or walkable[bid, ny, nx] == 0:
-                            continue
-                        new_g = g_score[best_idx] + 1.0
-                        if new_g < g_score[ni]:
-                            g_score[ni] = new_g
-                            parent[ni] = best_idx
-                            # Add to open set
-                            if open_count[0] < 256:
-                                open_x[open_count[0]] = nx
-                                open_y[open_count[0]] = ny
-                                open_count[0] += 1
-
-        # Reconstruct path
-        if tid == 0:
-            if found:
-                total_len = 0
-                cur = goal_idx
-                while cur >= 0 and cur != start_idx and total_len < 256:
-                    paths_out[bid, total_len] = int32(cur)
-                    total_len += 1
-                    cur = parent[cur]
-                if cur == start_idx:
-                    paths_out[bid, total_len] = int32(start_idx)
-                    total_len += 1
-                path_lens_out[bid] = total_len
-                # Reverse path in-place
-                for i in range(total_len // 2):
-                    j = total_len - 1 - i
-                    tmp = paths_out[bid, i]
-                    paths_out[bid, i] = paths_out[bid, j]
-                    paths_out[bid, j] = tmp
-            else:
-                path_lens_out[bid] = 0
-
-    n_searches = len(starts_x)
-    _astar_kernel[n_searches, 128](
-        walkable, walkable.shape[2], walkable.shape[1],
-        starts_x, starts_y,
-        goals_x, goals_y,
-        paths_out, path_lens,
+    cp = _cp()
+    walkable_cp = cp.asarray(walkable, dtype=cp.uint8)
+    starts_x_cp = cp.asarray(starts_x, dtype=cp.int32)
+    starts_y_cp = cp.asarray(starts_y, dtype=cp.int32)
+    goals_x_cp = cp.asarray(goals_x, dtype=cp.int32)
+    goals_y_cp = cp.asarray(goals_y, dtype=cp.int32)
+    paths_out_cp = cp.full(paths_out.shape, -1, dtype=cp.int32)
+    path_lens_cp = cp.zeros(path_lens.shape, dtype=cp.int32)
+    n_searches = int(starts_x_cp.size)
+    kernel = _raw_kernel(
+        "astar_kernel",
+        r"""
+        extern "C" __global__
+        void astar_kernel(
+            const unsigned char* walkable,
+            const int width,
+            const int height,
+            const int* starts_x,
+            const int* starts_y,
+            const int* goals_x,
+            const int* goals_y,
+            const int n_searches,
+            int* paths_out,
+            int* path_lens_out
+        ) {
+            int bid = blockIdx.x;
+            if (bid >= n_searches || threadIdx.x != 0) {
+                return;
+            }
+            const int max_cells = 4096;
+            const int max_open = 256;
+            int open_nodes[max_open];
+            int open_count = 0;
+            float g_score[max_cells];
+            unsigned char closed[max_cells];
+            int parent[max_cells];
+            for (int i = 0; i < max_cells; ++i) {
+                g_score[i] = 1.0e20f;
+                closed[i] = 0;
+                parent[i] = -1;
+            }
+            int sx = starts_x[bid];
+            int sy = starts_y[bid];
+            int gx = goals_x[bid];
+            int gy = goals_y[bid];
+            int start_idx = sy * width + sx;
+            int goal_idx = gy * width + gx;
+            open_nodes[0] = start_idx;
+            open_count = 1;
+            g_score[start_idx] = 0.0f;
+            bool found = false;
+            while (open_count > 0) {
+                int best_pos = 0;
+                int best_idx = open_nodes[0];
+                float best_f = g_score[best_idx] + (float)(abs((best_idx % width) - gx) + abs((best_idx / width) - gy));
+                for (int i = 1; i < open_count; ++i) {
+                    int idx = open_nodes[i];
+                    int x = idx % width;
+                    int y = idx / width;
+                    float f = g_score[idx] + (float)(abs(x - gx) + abs(y - gy));
+                    if (f < best_f) {
+                        best_f = f;
+                        best_idx = idx;
+                        best_pos = i;
+                    }
+                }
+                open_nodes[best_pos] = open_nodes[open_count - 1];
+                --open_count;
+                if (closed[best_idx]) {
+                    continue;
+                }
+                closed[best_idx] = 1;
+                if (best_idx == goal_idx) {
+                    found = true;
+                    break;
+                }
+                int bx = best_idx % width;
+                int by = best_idx / width;
+                const int dxs[4] = {-1, 1, 0, 0};
+                const int dys[4] = {0, 0, -1, 1};
+                for (int n = 0; n < 4; ++n) {
+                    int nx = bx + dxs[n];
+                    int ny = by + dys[n];
+                    if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+                        continue;
+                    }
+                    int ni = ny * width + nx;
+                    if (closed[ni]) {
+                        continue;
+                    }
+                    int walkable_idx = bid * width * height + ny * width + nx;
+                    if (walkable[walkable_idx] == 0) {
+                        continue;
+                    }
+                    float new_g = g_score[best_idx] + 1.0f;
+                    if (new_g < g_score[ni]) {
+                        g_score[ni] = new_g;
+                        parent[ni] = best_idx;
+                        bool present = false;
+                        for (int i = 0; i < open_count; ++i) {
+                            if (open_nodes[i] == ni) {
+                                present = true;
+                                break;
+                            }
+                        }
+                        if (!present && open_count < max_open) {
+                            open_nodes[open_count++] = ni;
+                        }
+                    }
+                }
+            }
+            if (!found) {
+                path_lens_out[bid] = 0;
+                return;
+            }
+            int rev_path[256];
+            int total_len = 0;
+            int cur = goal_idx;
+            while (cur >= 0 && total_len < 256) {
+                rev_path[total_len++] = cur;
+                if (cur == start_idx) {
+                    break;
+                }
+                cur = parent[cur];
+            }
+            if (total_len == 0 || rev_path[total_len - 1] != start_idx) {
+                path_lens_out[bid] = 0;
+                return;
+            }
+            path_lens_out[bid] = total_len;
+            for (int i = 0; i < total_len; ++i) {
+                paths_out[bid * 256 + i] = rev_path[total_len - 1 - i];
+            }
+        }
+        """,
     )
-    cuda.synchronize()
-
-
-# ---------------------------------------------------------------------------
-# Connected-component labeling kernels (GPU Union-Find)
-# 2-D grid: blockDim = (16, 16), gridDim = (4, 4) → 64×64 threads
-# Each thread manages one pixel's label.
-#
-# Algorithm: iterative label propagation (4-connectivity)
-#   Phase 1 — Initialise: each pixel gets label = y * width + x
-#   Phase 2 — Propagate: adopt min label of same-color neighbours, repeat
-#   Phase 3 — Compact: renumber labels to dense 0..N-1 range
-# ---------------------------------------------------------------------------
+    kernel(
+        (max(1, n_searches), 1, 1),
+        (1, 1, 1),
+        (
+            walkable_cp,
+            np.int32(int(walkable_cp.shape[2])),
+            np.int32(int(walkable_cp.shape[1])),
+            starts_x_cp,
+            starts_y_cp,
+            goals_x_cp,
+            goals_y_cp,
+            np.int32(n_searches),
+            paths_out_cp,
+            path_lens_cp,
+        ),
+    )
+    cp.cuda.runtime.deviceSynchronize()
+    _assign_array(paths_out, paths_out_cp)
+    _assign_array(path_lens, path_lens_cp)
 
 
 def _launch_init_labels(board, labels_out, width, height):
-    """Initialise each pixel's label to its linear index."""
-    from numba import cuda, int32
-
-    @cuda.jit
-    def _init_labels_kernel(board, labels, width, height):
-        x, y = cuda.grid(2)
-        if x >= width or y >= height:
-            return
-        val = int(board[y, x])
-        if val < 0:
-            labels[y, x] = -1
-        else:
-            labels[y, x] = y * width + x
-
-    _init_labels_kernel[(height + 15) // 16, (width + 15) // 16, (16, 16)](
-        board, labels_out, width, height,
+    cp = _cp()
+    board_cp = cp.asarray(board, dtype=cp.int8)
+    labels_cp = labels_out if isinstance(labels_out, cp.ndarray) else cp.asarray(labels_out, dtype=cp.int32)
+    kernel = _raw_kernel(
+        "init_labels_kernel",
+        r"""
+        extern "C" __global__
+        void init_labels_kernel(const signed char* board, int* labels, const int width, const int height) {
+            int x = blockDim.x * blockIdx.x + threadIdx.x;
+            int y = blockDim.y * blockIdx.y + threadIdx.y;
+            if (x >= width || y >= height) {
+                return;
+            }
+            int idx = y * width + x;
+            labels[idx] = board[idx] < 0 ? -1 : idx;
+        }
+        """,
     )
-    cuda.synchronize()
+    blocks = ((width + 15) // 16, (height + 15) // 16, 1)
+    kernel(blocks, (16, 16, 1), (board_cp, labels_cp, np.int32(width), np.int32(height)))
+    cp.cuda.runtime.deviceSynchronize()
+    _assign_array(labels_out, labels_cp)
 
 
 def _launch_propagate_labels(board, labels, width, height):
-    """Run one propagation iteration.  Returns True if converged."""
-    from numba import cuda, int32
-
-    @cuda.jit
-    def _propagate_kernel(board, labels, width, height, converged):
-        x, y = cuda.grid(2)
-        if x >= width or y >= height:
-            return
-        my_label = labels[y, x]
-        if my_label < 0:
-            return
-        my_color = int(board[y, x])
-        new_label = my_label
-        # Check 4-neighbours
-        if x > 0:
-            nv = int(board[y, x - 1])
-            if nv == my_color:
-                nl = labels[y, x - 1]
-                if nl >= 0 and nl < new_label:
-                    new_label = nl
-        if x < width - 1:
-            nv = int(board[y, x + 1])
-            if nv == my_color:
-                nl = labels[y, x + 1]
-                if nl >= 0 and nl < new_label:
-                    new_label = nl
-        if y > 0:
-            nv = int(board[y - 1, x])
-            if nv == my_color:
-                nl = labels[y - 1, x]
-                if nl >= 0 and nl < new_label:
-                    new_label = nl
-        if y < height - 1:
-            nv = int(board[y + 1, x])
-            if nv == my_color:
-                nl = labels[y + 1, x]
-                if nl >= 0 and nl < new_label:
-                    new_label = nl
-        if new_label != my_label:
-            labels[y, x] = new_label
-            converged[0] = 0
-
-    d_converged = cuda.device_array(1, dtype=np.int32)
-    d_converged[0] = 1
-    _propagate_kernel[(height + 15) // 16, (width + 15) // 16, (16, 16)](
-        board, labels, width, height, d_converged,
+    cp = _cp()
+    board_cp = cp.asarray(board, dtype=cp.int8)
+    labels_cp = labels if isinstance(labels, cp.ndarray) else cp.asarray(labels, dtype=cp.int32)
+    converged_cp = cp.ones(1, dtype=cp.int32)
+    kernel = _raw_kernel(
+        "propagate_labels_kernel",
+        r"""
+        extern "C" __global__
+        void propagate_labels_kernel(
+            const signed char* board,
+            int* labels,
+            const int width,
+            const int height,
+            int* converged
+        ) {
+            int x = blockDim.x * blockIdx.x + threadIdx.x;
+            int y = blockDim.y * blockIdx.y + threadIdx.y;
+            if (x >= width || y >= height) {
+                return;
+            }
+            int idx = y * width + x;
+            int my_label = labels[idx];
+            if (my_label < 0) {
+                return;
+            }
+            signed char my_color = board[idx];
+            int new_label = my_label;
+            if (x > 0) {
+                int nidx = idx - 1;
+                if (board[nidx] == my_color) {
+                    int nl = labels[nidx];
+                    if (nl >= 0 && nl < new_label) {
+                        new_label = nl;
+                    }
+                }
+            }
+            if (x < width - 1) {
+                int nidx = idx + 1;
+                if (board[nidx] == my_color) {
+                    int nl = labels[nidx];
+                    if (nl >= 0 && nl < new_label) {
+                        new_label = nl;
+                    }
+                }
+            }
+            if (y > 0) {
+                int nidx = idx - width;
+                if (board[nidx] == my_color) {
+                    int nl = labels[nidx];
+                    if (nl >= 0 && nl < new_label) {
+                        new_label = nl;
+                    }
+                }
+            }
+            if (y < height - 1) {
+                int nidx = idx + width;
+                if (board[nidx] == my_color) {
+                    int nl = labels[nidx];
+                    if (nl >= 0 && nl < new_label) {
+                        new_label = nl;
+                    }
+                }
+            }
+            if (new_label != my_label) {
+                labels[idx] = new_label;
+                atomicExch(converged, 0);
+            }
+        }
+        """,
     )
-    cuda.synchronize()
-    return bool(d_converged.copy_to_host()[0])
+    blocks = ((width + 15) // 16, (height + 15) // 16, 1)
+    kernel(
+        blocks,
+        (16, 16, 1),
+        (board_cp, labels_cp, np.int32(width), np.int32(height), converged_cp),
+    )
+    cp.cuda.runtime.deviceSynchronize()
+    _assign_array(labels, labels_cp)
+    return bool(int(cp.asnumpy(converged_cp)[0]))
 
 
 def _launch_compact_labels(board, labels, width, height):
-    """Collect (label, x, y, color) from the GPU and build component metadata.
-
-    Returns the same dict format as ``_compact_labels_cpu``.
-    """
-    from numba import cuda, int32
-
-    max_entries = width * height  # 4096 for 64×64
-
-    @cuda.jit
-    def _compact_kernel(board, labels, width, height, offsets, count, max_entries):
-        x, y = cuda.grid(2)
-        if x >= width or y >= height:
-            return
-        my_label = labels[y, x]
-        if my_label < 0:
-            return
-        pos = cuda.atomic.add(count, 0, 1)
-        if pos < max_entries:
-            offsets[pos, 0] = my_label
-            offsets[pos, 1] = x
-            offsets[pos, 2] = y
-            offsets[pos, 3] = int(board[y, x])
-
-    d_offsets = cuda.device_array((max_entries, 4), dtype=np.int32)
-    d_count = cuda.device_array(1, dtype=np.int32)
-    d_count[0] = 0
-
-    threads = (16, 16)
-    blocks = (
-        (width + 15) // 16,
-        (height + 15) // 16,
-    )
-    _compact_kernel[blocks, threads](
-        board, labels, width, height, d_offsets, d_count, max_entries,
-    )
-    cuda.synchronize()
-
-    n = int(d_count.copy_to_host()[0])
-    if n == 0:
+    cp = _cp()
+    board_np = _to_numpy(board)
+    labels_np = _to_numpy(labels)
+    offsets = []
+    for y in range(height):
+        for x in range(width):
+            my_label = int(labels_np[y, x])
+            if my_label < 0:
+                continue
+            offsets.append((my_label, x, y, int(board_np[y, x])))
+    if not offsets:
         return []
-
-    offsets = d_offsets.copy_to_host()[:n]
-
-    # Sort by label on CPU (fast for ≤ 4096 items)
-    offsets = offsets[offsets[:, 0].argsort()]
-
-    # Build component metadata from sorted array
-    return _components_from_sorted(offsets, board, width, height)
+    offset_np = np.asarray(offsets, dtype=np.int32)
+    offset_np = offset_np[offset_np[:, 0].argsort()]
+    return _components_from_sorted(offset_np, board_np.tolist(), width, height)
 
 
 def _components_from_sorted(
     offsets: np.ndarray,
     board: list[list[int]],
-    width: int, height: int,
+    width: int,
+    height: int,
 ) -> list[dict]:
-    """Build component dicts from a sorted (label, x, y, color) array.
-
-    The array must be sorted by the label column (column 0).
-    Returns the same format as ``_compact_labels_cpu``.
-    """
     results: list[dict] = []
     i = 0
     n = len(offsets)
@@ -397,35 +423,35 @@ def _components_from_sorted(
         while j < n and int(offsets[j, 0]) == label:
             x, y = int(offsets[j, 1]), int(offsets[j, 2])
             cells.append((x, y))
-            if x < min_x: min_x = x
-            if x > max_x: max_x = x
-            if y < min_y: min_y = y
-            if y > max_y: max_y = y
+            if x < min_x:
+                min_x = x
+            if x > max_x:
+                max_x = x
+            if y < min_y:
+                min_y = y
+            if y > max_y:
+                max_y = y
             j += 1
         size = j - i
         sx = sum(c[0] for c in cells) // size
         sy = sum(c[1] for c in cells) // size
-        tb = (min_x == 0 or min_y == 0 or max_x == width - 1 or max_y == height - 1)
-        results.append({
-            "label": label,
-            "color": color,
-            "cells": cells,
-            "bbox": (min_x, min_y, max_x, max_y),
-            "size": size,
-            "center": (sx, sy),
-            "touches_border": tb,
-        })
+        tb = min_x == 0 or min_y == 0 or max_x == width - 1 or max_y == height - 1
+        results.append(
+            {
+                "label": label,
+                "color": color,
+                "cells": cells,
+                "bbox": (min_x, min_y, max_x, max_y),
+                "size": size,
+                "center": (sx, sy),
+                "touches_border": tb,
+            }
+        )
         i = j
     return results
 
 
-# CPU-based label compaction (fallback)
 def _compact_labels_cpu(labels, board, width, height):
-    """Compact GPU labels on CPU and build component metadata.
-    
-    Returns list of dicts with keys:
-        label, color, cells, bbox, size, touches_border, center
-    """
     comp_map: dict[int, dict] = {}
     for y in range(height):
         for x in range(width):
@@ -438,15 +464,21 @@ def _compact_labels_cpu(labels, board, width, height):
                     "label": label,
                     "color": color,
                     "cells": [],
-                    "min_x": x, "max_x": x,
-                    "min_y": y, "max_y": y,
+                    "min_x": x,
+                    "max_x": x,
+                    "min_y": y,
+                    "max_y": y,
                 }
             entry = comp_map[label]
             entry["cells"].append((x, y))
-            if x < entry["min_x"]: entry["min_x"] = x
-            if x > entry["max_x"]: entry["max_x"] = x
-            if y < entry["min_y"]: entry["min_y"] = y
-            if y > entry["max_y"]: entry["max_y"] = y
+            if x < entry["min_x"]:
+                entry["min_x"] = x
+            if x > entry["max_x"]:
+                entry["max_x"] = x
+            if y < entry["min_y"]:
+                entry["min_y"] = y
+            if y > entry["max_y"]:
+                entry["max_y"] = y
 
     results = []
     for entry in comp_map.values():
@@ -455,107 +487,113 @@ def _compact_labels_cpu(labels, board, width, height):
         size = len(cells)
         sx = sum(x for x, _ in cells) // size
         sy = sum(y for _, y in cells) // size
-        tb = (entry["min_x"] == 0 or entry["min_y"] == 0
-              or entry["max_x"] == width - 1 or entry["max_y"] == height - 1)
-        results.append({
-            "label": entry["label"],
-            "color": entry["color"],
-            "cells": cells,
-            "bbox": bbox,
-            "size": size,
-            "center": (sx, sy),
-            "touches_border": tb,
-        })
+        tb = (
+            entry["min_x"] == 0
+            or entry["min_y"] == 0
+            or entry["max_x"] == width - 1
+            or entry["max_y"] == height - 1
+        )
+        results.append(
+            {
+                "label": entry["label"],
+                "color": entry["color"],
+                "cells": cells,
+                "bbox": bbox,
+                "size": size,
+                "center": (sx, sy),
+                "touches_border": tb,
+            }
+        )
     return results
 
 
-# ---------------------------------------------------------------------------
-# Mirror placement brute-force kernel
-# 2-D grid: one thread per (tx, ty) placement position
-# Each thread tests one position, atomic-max updates the global best.
-# ---------------------------------------------------------------------------
-
-
 def _launch_mirror_placement_kernel(
-    goal_bitmask, shape_mask, shape_w, shape_h,
-    horizontal, axis, width, height, best_out,
+    goal_bitmask, shape_mask, shape_w, shape_h, horizontal, axis, width, height, best_out
 ):
-    """Launch the mirror placement kernel.
-    
-    ``goal_bitmask`` : uint8 array (height × width), 1 = goal cell.
-    ``shape_mask``   : uint8 array (shape_h × shape_w), 1 = shape cell.
-    ``best_out``     : int32 array [fresh_hits, center_x, center_y] — in-place update.
-    
-    The kernel writes the best found placement into ``best_out`` via atomic
-    compare-and-swap on a packed score (hit_count << 20 | -distance).
-    """
-    from numba import cuda, int32
-
-    @cuda.jit
-    def _mirror_placement_kernel(
-        goal, shape, sw, sh, horiz, axis,
-        width, height, best,
-    ):
-        tx, ty = cuda.grid(2)
-        max_tx = width - sw
-        max_ty = height - sh
-        if tx > max_tx or ty > max_ty:
-            return
-
-        # Count reflected goal hits for this placement
-        hits = 0
-        for dy in range(sh):
-            for dx in range(sw):
-                if shape[dy, dx]:
-                    if horiz:
-                        rx = tx + dx
-                        ry = 2 * axis - (ty + dy)
-                    else:
-                        rx = 2 * axis - (tx + dx)
-                        ry = ty + dy
-                    if 0 <= rx < width and 0 <= ry < height and goal[ry, rx]:
-                        hits += 1
-
-        if hits == 0:
-            return
-
-        cx = tx + sw // 2
-        cy = ty + sh // 2
-
-        # Pack score: higher hits wins, then smaller distance wins
-        # (use negative distance in packed value)
-        # Score = (hits << 20) | (max_dist - distance)
-        # where max_dist = width + height (safe upper bound)
-        max_dist = width + height
-        dist = abs(cx - tx) + abs(cy - ty)  # approx movement from shape center
-        neg_dist = max_dist - dist
-        packed = (hits << 20) | neg_dist
-
-        # Atomic compare-and-swap: update best if this is better
-        cuda.atomic.max(best, 0, packed)
-        cuda.atomic.max(best, 1, int32(cx))
-        cuda.atomic.max(best, 2, int32(cy))
-        cuda.atomic.max(best, 3, int32(hits))
-
+    cp = _cp()
+    goal_cp = cp.asarray(goal_bitmask, dtype=cp.uint8)
+    shape_cp = cp.asarray(shape_mask, dtype=cp.uint8)
+    best_cp = best_out if isinstance(best_out, cp.ndarray) else cp.asarray(best_out, dtype=cp.int32)
+    kernel = _raw_kernel(
+        "mirror_placement_kernel",
+        r"""
+        extern "C" __global__
+        void mirror_placement_kernel(
+            const unsigned char* goal,
+            const unsigned char* shape,
+            const int sw,
+            const int sh,
+            const int horiz,
+            const int axis,
+            const int width,
+            const int height,
+            int* best
+        ) {
+            int tx = blockDim.x * blockIdx.x + threadIdx.x;
+            int ty = blockDim.y * blockIdx.y + threadIdx.y;
+            int max_tx = width - sw;
+            int max_ty = height - sh;
+            if (tx > max_tx || ty > max_ty) {
+                return;
+            }
+            int hits = 0;
+            for (int dy = 0; dy < sh; ++dy) {
+                for (int dx = 0; dx < sw; ++dx) {
+                    if (shape[dy * sw + dx] == 0) {
+                        continue;
+                    }
+                    int rx;
+                    int ry;
+                    if (horiz) {
+                        rx = tx + dx;
+                        ry = 2 * axis - (ty + dy);
+                    } else {
+                        rx = 2 * axis - (tx + dx);
+                        ry = ty + dy;
+                    }
+                    if (rx >= 0 && rx < width && ry >= 0 && ry < height && goal[ry * width + rx]) {
+                        ++hits;
+                    }
+                }
+            }
+            if (hits <= 0) {
+                return;
+            }
+            int cx = tx + sw / 2;
+            int cy = ty + sh / 2;
+            int max_dist = width + height;
+            int dist = abs(cx - tx) + abs(cy - ty);
+            int neg_dist = max_dist - dist;
+            int packed = (hits << 20) | neg_dist;
+            atomicMax(&best[0], packed);
+            atomicMax(&best[1], cx);
+            atomicMax(&best[2], cy);
+            atomicMax(&best[3], hits);
+        }
+        """,
+    )
     max_tx = max(0, width - shape_w)
     max_ty = max(0, height - shape_h)
-    if max_tx == 0 or max_ty == 0:
-        tx_dim = 1
-        ty_dim = 1
-    else:
-        tx_dim = min(32, max_tx)
-        ty_dim = min(32, max_ty)
-    threads = (tx_dim, ty_dim)
-    blocks = (
-        (max_tx + tx_dim) // tx_dim if tx_dim > 0 else 1,
-        (max_ty + ty_dim) // ty_dim if ty_dim > 0 else 1,
+    tx_dim = max(1, min(16, max_tx + 1))
+    ty_dim = max(1, min(16, max_ty + 1))
+    blocks = ((max_tx + tx_dim) // tx_dim, (max_ty + ty_dim) // ty_dim, 1)
+    kernel(
+        blocks,
+        (tx_dim, ty_dim, 1),
+        (
+            goal_cp,
+            shape_cp,
+            np.int32(shape_w),
+            np.int32(shape_h),
+            np.int32(int(horizontal)),
+            np.int32(axis),
+            np.int32(width),
+            np.int32(height),
+            best_cp,
+        ),
     )
-    _mirror_placement_kernel[blocks, threads](
-        goal_bitmask, shape_mask, shape_w, shape_h,
-        int(horizontal), int(axis), width, height,
-        best_out,
-    )
-    cuda.synchronize()
+    cp.cuda.runtime.deviceSynchronize()
+    _assign_array(best_out, best_cp)
 
 
 def _launch_reflection_score_kernel(
@@ -569,162 +607,172 @@ def _launch_reflection_score_kernel(
     height,
     score_out,
 ):
-    """Score reflected-goal hits for every top-left placement position."""
-    from numba import cuda, int32
-
-    @cuda.jit
-    def _reflection_score_kernel(
-        goal, shape, sw, sh, horiz, axis,
-        width, height, score_out,
-    ):
-        tx, ty = cuda.grid(2)
-        max_tx = width - sw
-        max_ty = height - sh
-        if tx > max_tx or ty > max_ty:
-            return
-
-        hits = 0
-        for dy in range(sh):
-            for dx in range(sw):
-                if shape[dy, dx]:
-                    if horiz:
-                        rx = tx + dx
-                        ry = 2 * axis - (ty + dy)
-                    else:
-                        rx = 2 * axis - (tx + dx)
-                        ry = ty + dy
-                    if 0 <= rx < width and 0 <= ry < height and goal[ry, rx]:
-                        hits += 1
-        score_out[ty, tx] = int32(hits)
-
+    cp = _cp()
+    goal_cp = cp.asarray(goal_bitmask, dtype=cp.uint8)
+    shape_cp = cp.asarray(shape_mask, dtype=cp.uint8)
+    score_cp = score_out if isinstance(score_out, cp.ndarray) else cp.asarray(score_out, dtype=cp.int32)
+    kernel = _raw_kernel(
+        "reflection_score_kernel",
+        r"""
+        extern "C" __global__
+        void reflection_score_kernel(
+            const unsigned char* goal,
+            const unsigned char* shape,
+            const int sw,
+            const int sh,
+            const int horiz,
+            const int axis,
+            const int width,
+            const int height,
+            int* score_out
+        ) {
+            int tx = blockDim.x * blockIdx.x + threadIdx.x;
+            int ty = blockDim.y * blockIdx.y + threadIdx.y;
+            int max_tx = width - sw;
+            int max_ty = height - sh;
+            if (tx > max_tx || ty > max_ty) {
+                return;
+            }
+            int hits = 0;
+            for (int dy = 0; dy < sh; ++dy) {
+                for (int dx = 0; dx < sw; ++dx) {
+                    if (shape[dy * sw + dx] == 0) {
+                        continue;
+                    }
+                    int rx;
+                    int ry;
+                    if (horiz) {
+                        rx = tx + dx;
+                        ry = 2 * axis - (ty + dy);
+                    } else {
+                        rx = 2 * axis - (tx + dx);
+                        ry = ty + dy;
+                    }
+                    if (rx >= 0 && rx < width && ry >= 0 && ry < height && goal[ry * width + rx]) {
+                        ++hits;
+                    }
+                }
+            }
+            score_out[ty * width + tx] = hits;
+        }
+        """,
+    )
     max_tx = max(0, width - shape_w)
     max_ty = max(0, height - shape_h)
-    tx_dim = min(16, max_tx + 1) if max_tx >= 0 else 1
-    ty_dim = min(16, max_ty + 1) if max_ty >= 0 else 1
-    threads = (max(1, tx_dim), max(1, ty_dim))
-    blocks = (
-        (max_tx + threads[0]) // threads[0] if threads[0] > 0 else 1,
-        (max_ty + threads[1]) // threads[1] if threads[1] > 0 else 1,
+    tx_dim = max(1, min(16, max_tx + 1))
+    ty_dim = max(1, min(16, max_ty + 1))
+    blocks = ((max_tx + tx_dim) // tx_dim, (max_ty + ty_dim) // ty_dim, 1)
+    kernel(
+        blocks,
+        (tx_dim, ty_dim, 1),
+        (
+            goal_cp,
+            shape_cp,
+            np.int32(shape_w),
+            np.int32(shape_h),
+            np.int32(int(horizontal)),
+            np.int32(axis),
+            np.int32(width),
+            np.int32(height),
+            score_cp,
+        ),
     )
-    _reflection_score_kernel[blocks, threads](
-        goal_bitmask, shape_mask, shape_w, shape_h,
-        int(horizontal), int(axis), width, height, score_out,
-    )
-    cuda.synchronize()
-
-
-# ---------------------------------------------------------------------------
-# Grid scale detection kernels
-# 1-D grid: 17 blocks × 256 threads for uniformity (one block per scale)
-# 1-D grid: 64 blocks × 64 threads for edge periodicity (one block per row)
-# ---------------------------------------------------------------------------
+    cp.cuda.runtime.deviceSynchronize()
+    _assign_array(score_out, score_cp)
 
 
 def _launch_uniformity_kernel(board, uniformity_out, width, height):
-    """Compute block uniformity for each scale 2–16.
-    
-    ``uniformity_out`` is a 17-element float32 array (index = scale).
-    Each block computes the fraction of scale×scale blocks that are uniform.
-    """
-    from numba import cuda, int32, float32
-
-    @cuda.jit
-    def _uniformity_kernel(board, width, height, uniformity_out):
-        scale = cuda.blockIdx.x
-        if scale < 2 or scale > 16:
-            if cuda.threadIdx.x == 0:
-                uniformity_out[scale] = 0.0
-            return
-
-        bw = width // scale
-        bh = height // scale
-        if bw < 4 or bh < 4:
-            if cuda.threadIdx.x == 0:
-                uniformity_out[scale] = 0.0
-            return
-
-        total = bw * bh
-        tid = cuda.threadIdx.x
-        bdim = cuda.blockDim.x
-
-        # Shared memory for partial counts
-        shared_counts = cuda.shared.array(256, dtype=int32)
-        shared_counts[tid] = 0
-
-        # Each thread checks a strided subset of blocks
-        for idx in range(tid, total, bdim):
-            bx = idx % bw
-            by = idx // bw
-            px = bx * scale
-            py = by * scale
-            block_color = board[py, px]
-            uniform = 1
-            for dy in range(scale):
-                for dx in range(scale):
-                    if board[py + dy, px + dx] != block_color:
-                        uniform = 0
-                        break
-                if not uniform:
-                    break
-            shared_counts[tid] += uniform
-
-        cuda.syncthreads()
-
-        # Parallel reduction
-        s = 128
-        while s > 0:
-            if tid < s:
-                shared_counts[tid] += shared_counts[tid + s]
-            cuda.syncthreads()
-            s //= 2
-
-        if tid == 0:
-            uniformity_out[scale] = float32(shared_counts[0]) / float32(total)
-
-    n_scales = 17
-    _uniformity_kernel[n_scales, 256](
-        board, width, height, uniformity_out,
+    cp = _cp()
+    board_cp = cp.asarray(board, dtype=cp.int8)
+    uniformity_cp = uniformity_out if isinstance(uniformity_out, cp.ndarray) else cp.asarray(uniformity_out, dtype=cp.float32)
+    kernel = _raw_kernel(
+        "uniformity_kernel",
+        r"""
+        extern "C" __global__
+        void uniformity_kernel(
+            const signed char* board,
+            const int width,
+            const int height,
+            float* uniformity_out
+        ) {
+            int scale = blockIdx.x;
+            if (threadIdx.x != 0) {
+                return;
+            }
+            if (scale < 2 || scale > 16) {
+                uniformity_out[scale] = 0.0f;
+                return;
+            }
+            int bw = width / scale;
+            int bh = height / scale;
+            if (bw < 4 || bh < 4) {
+                uniformity_out[scale] = 0.0f;
+                return;
+            }
+            int total = bw * bh;
+            int uniform = 0;
+            for (int by = 0; by < bh; ++by) {
+                for (int bx = 0; bx < bw; ++bx) {
+                    int px = bx * scale;
+                    int py = by * scale;
+                    signed char color = board[py * width + px];
+                    bool ok = true;
+                    for (int dy = 0; dy < scale && ok; ++dy) {
+                        for (int dx = 0; dx < scale; ++dx) {
+                            if (board[(py + dy) * width + (px + dx)] != color) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (ok) {
+                        ++uniform;
+                    }
+                }
+            }
+            uniformity_out[scale] = total > 0 ? ((float)uniform / (float)total) : 0.0f;
+        }
+        """,
     )
-    cuda.synchronize()
+    kernel((17, 1, 1), (1, 1, 1), (board_cp, np.int32(width), np.int32(height), uniformity_cp))
+    cp.cuda.runtime.deviceSynchronize()
+    _assign_array(uniformity_out, uniformity_cp)
 
 
 def _launch_edge_kernel(board, edge_scores_out, width, height):
-    """Count colour-transition gaps of each period (1–9) per row.
-    
-    ``edge_scores_out`` is a 17-element int32 array (index = gap size).
-    """
-    from numba import cuda, int32
-
-    @cuda.jit
-    def _edge_kernel(board, width, height, edge_scores_out):
-        y = cuda.blockIdx.x
-        if y >= height:
-            return
-        tid = cuda.threadIdx.x  # = x position in row
-
-        # Shared memory for gap counts per row
-        shared_gaps = cuda.shared.array(16, dtype=int32)
-        if tid < 16:
-            shared_gaps[tid] = 0
-        cuda.syncthreads()
-
-        # Scan the row looking for colour transitions
-        prev = -2
-        gap = 0
-        for x in range(width):
-            val = int(board[y, x])
-            if val != prev and prev >= 0:
-                if 0 < gap < 16:
-                    cuda.atomic.add(shared_gaps, gap, 1)
-                gap = 0
-            gap += 1
-            prev = val
-
-        cuda.syncthreads()
-
-        # Reduce shared gaps into global output
-        if tid < 16 and shared_gaps[tid] > 0:
-            cuda.atomic.add(edge_scores_out, tid, shared_gaps[tid])
-
-    _edge_kernel[height, width](board, width, height, edge_scores_out)
-    cuda.synchronize()
+    cp = _cp()
+    board_cp = cp.asarray(board, dtype=cp.int8)
+    edge_cp = edge_scores_out if isinstance(edge_scores_out, cp.ndarray) else cp.asarray(edge_scores_out, dtype=cp.int32)
+    kernel = _raw_kernel(
+        "edge_kernel",
+        r"""
+        extern "C" __global__
+        void edge_kernel(
+            const signed char* board,
+            const int width,
+            const int height,
+            int* edge_scores_out
+        ) {
+            int y = blockIdx.x;
+            if (y >= height || threadIdx.x != 0) {
+                return;
+            }
+            int prev = -2;
+            int gap = 0;
+            for (int x = 0; x < width; ++x) {
+                int val = (int)board[y * width + x];
+                if (val != prev && prev >= 0) {
+                    if (gap > 0 && gap < 16) {
+                        atomicAdd(&edge_scores_out[gap], 1);
+                    }
+                    gap = 0;
+                }
+                ++gap;
+                prev = val;
+            }
+        }
+        """,
+    )
+    kernel((height, 1, 1), (1, 1, 1), (board_cp, np.int32(width), np.int32(height), edge_cp))
+    cp.cuda.runtime.deviceSynchronize()
+    _assign_array(edge_scores_out, edge_cp)

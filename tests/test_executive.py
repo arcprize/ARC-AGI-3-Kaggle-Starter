@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from agi_core.config import RuntimeConfig
 from agi_core.executive import Executive, ExecutiveRuntime
 from agi_core.image_input import BoardImageInput, compute_board_signature
 from agi_core.knowledge.hyperon_bridge import HyperonBridge
 from agi_core.memory import EpisodicMemory
+from agi_core.runtime_observation import observation_boundary
 from agi_core.specialists.critic import ProposalCritic
 from agi_core.specialists.llm import LLMSpecialist
 from agi_core.specialists.reactive import ReactiveSpecialist
@@ -111,6 +112,110 @@ class FakeContextualHyperon:
                 }
             ]
         return []
+
+
+class RuntimeObservationBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        root = os.path.abspath("H:\\ARC-AGI-3-Kaggle-Starter")
+        self.config = RuntimeConfig(
+            project_root=root,
+            hyperon_rules_path=os.path.join(root, "arc.metta"),
+            hyperon_learning_path=os.path.join(root, "arc_learned.json"),
+            memory_db_path=os.path.join(root, "memory.sqlite3"),
+            archive_memory_db_path=os.path.join(root, "archive.sqlite3"),
+            trained_priors_db_path=os.path.join(root, "trained.sqlite3"),
+            hyperon_wheel_dir=os.path.join(root, "hyperon"),
+            extra_wheel_dir=os.path.join(root, "wheels"),
+            hyperon_enabled=False,
+            hyperon_skip_probe=True,
+            hyperon_probe_timeout_seconds=0.1,
+            llm_provider="local",
+            llm_model_dir=os.path.join(root, "models"),
+            llm_model_path=os.path.join(root, "models", "executive.gguf"),
+        )
+
+    def _observation(
+        self,
+        *,
+        game_state: str,
+        levels_completed: int,
+        has_image_input: bool,
+        step_index: int = 0,
+    ) -> Observation:
+        image_input = (
+            BoardImageInput(
+                board=[[1]],
+                height=1,
+                width=1,
+                frame_signature="sig",
+                source_attr="frame",
+            )
+            if has_image_input
+            else None
+        )
+        return Observation(
+            game_id="ar25",
+            step_index=step_index,
+            game_state=game_state,
+            levels_completed=levels_completed,
+            last_action=None,
+            legal_actions=["ACTION1"],
+            image_input=image_input,
+            raw_frame_ref=None,
+            derived_features={
+                "has_image_input": has_image_input,
+                "step_index_reliable": True,
+                "frame_signature": "sig" if has_image_input else None,
+            },
+        )
+
+    def test_observation_boundary_marks_late_same_level_game_over_as_soft_reset(self) -> None:
+        previous = self._observation(
+            game_state="ACTIVE",
+            levels_completed=3,
+            has_image_input=True,
+            step_index=10,
+        )
+        current = self._observation(
+            game_state="GAME_OVER",
+            levels_completed=3,
+            has_image_input=True,
+            step_index=11,
+        )
+
+        self.assertEqual(observation_boundary(previous, current, self.config), "soft_reset")
+
+    def test_observation_boundary_marks_late_same_level_resume_as_soft_restart(self) -> None:
+        previous = self._observation(
+            game_state="GAME_OVER",
+            levels_completed=0,
+            has_image_input=False,
+            step_index=12,
+        )
+        current = self._observation(
+            game_state="ACTIVE",
+            levels_completed=3,
+            has_image_input=True,
+            step_index=0,
+        )
+
+        self.assertEqual(observation_boundary(previous, current, self.config), "soft_restart")
+
+    def test_observation_boundary_keeps_empty_followup_game_over_in_soft_reset_sequence(self) -> None:
+        previous = self._observation(
+            game_state="GAME_OVER",
+            levels_completed=3,
+            has_image_input=True,
+            step_index=11,
+        )
+        current = self._observation(
+            game_state="GAME_OVER",
+            levels_completed=0,
+            has_image_input=False,
+            step_index=12,
+        )
+
+        self.assertEqual(observation_boundary(previous, current, self.config), "soft_reset")
 
 
 def build_context(
@@ -9219,6 +9324,92 @@ class ExecutiveRuntimeOutcomeTests(unittest.TestCase):
         self.assertEqual(transition.local_outcome, "advanced")
         self.assertTrue(transition.player_moved)
         self.assertEqual(transition.action_name, "ACTION1")
+
+    def test_runtime_activation_hook_runs_once_across_decisions(self) -> None:
+        class Adapter:
+            def bind_game(self, game_id):
+                return None
+
+            def observe(self, frames, latest_frame):
+                return Observation(
+                    game_id="ls20",
+                    step_index=0,
+                    game_state="ACTIVE",
+                    levels_completed=0,
+                    last_action=None,
+                    legal_actions=["ACTION1"],
+                )
+
+        class Hyperon:
+            def bind_game(self, game_id):
+                return None
+
+            def record_transitions(self, records):
+                return None
+
+        class RuntimeExecutive:
+            def decide(self, context):
+                return ActionDecision(
+                    action_name="ACTION1",
+                    source="agent-movement",
+                    confidence=0.8,
+                    reason="move",
+                )
+
+        runtime = ExecutiveRuntime(
+            adapter=Adapter(),
+            executive=RuntimeExecutive(),
+            memory=EpisodicMemory(),
+            hyperon=Hyperon(),
+            llm_backend=None,
+            config=RuntimeConfig.from_env(),
+        )
+        runtime.bind_game("ls20")
+        hook = MagicMock()
+        runtime.set_activation_hook(hook)
+
+        runtime.decide([], None)
+        runtime.decide([], None)
+
+        hook.assert_called_once()
+
+    def test_runtime_terminal_observation_uses_activation_hook(self) -> None:
+        class Adapter:
+            def bind_game(self, game_id):
+                return None
+
+            def observe(self, frames, latest_frame):
+                return Observation(
+                    game_id="ls20",
+                    step_index=0,
+                    game_state="WIN",
+                    levels_completed=1,
+                    last_action="ACTION1",
+                    legal_actions=["ACTION1"],
+                )
+
+        class Hyperon:
+            def bind_game(self, game_id):
+                return None
+
+            def record_transitions(self, records):
+                return None
+
+        runtime = ExecutiveRuntime(
+            adapter=Adapter(),
+            executive=MagicMock(),
+            memory=EpisodicMemory(),
+            hyperon=Hyperon(),
+            llm_backend=None,
+            config=RuntimeConfig.from_env(),
+        )
+        runtime.bind_game("ls20")
+        hook = MagicMock()
+        runtime.set_activation_hook(hook)
+
+        runtime.note_terminal_observation([], None)
+
+        hook.assert_called_once()
 
     def test_executive_prefers_ranked_symbolic_decision_before_fallback(self) -> None:
         memory = EpisodicMemory()

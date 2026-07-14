@@ -873,6 +873,7 @@ class ObjectiveReduction:
                     "non_beam_controllers": self._non_beam_controllers.copy(),
                     "failed_directions": self._failed_directions.copy(),
                     "stable_goal": self._stable_goal,
+                    "levels_completed": int(getattr(context.observation, "levels_completed", 0) or 0),
                     "switch_attempted": self._switch_count,
                     "action_priors": {},
                     "memory_db_path": _gameplay_memory_db_path(context.config),

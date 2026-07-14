@@ -181,6 +181,116 @@ class MyAgentIntegrationTests(unittest.TestCase):
                     active_action = agent.choose_action([active_frame], active_frame)
                     self.assertEqual(active_action.name, "ACTION1")
 
+    def test_my_agent_construction_defers_cache_pool_and_cuda_warmup(self) -> None:
+        arcengine_module = types.ModuleType("arcengine")
+        arcengine_module.FrameData = StubFrameData
+        arcengine_module.GameAction = StubGameAction
+        arcengine_module.GameState = StubGameState
+
+        agents_module = types.ModuleType("agents")
+        agents_agent_module = types.ModuleType("agents.agent")
+        agents_agent_module.Agent = StubAgent
+
+        module_overrides = {
+            "arcengine": arcengine_module,
+            "agents": agents_module,
+            "agents.agent": agents_agent_module,
+        }
+
+        with patch.dict(sys.modules, module_overrides, clear=False):
+            sys.modules.pop("agent.my_agent", None)
+            module = importlib.import_module("agent.my_agent")
+            module = importlib.reload(module)
+            with (
+                patch.object(module, "build_llm_backend", return_value=FakeLlamaBackend()),
+                patch.object(module, "HyperonBridge", FakeHyperonBridge),
+                patch("agi_core.cuda.init_cuda") as init_cuda,
+                patch("agi_core.orch_or.parallel.ThreadPoolManager.executor") as thread_executor,
+                patch("agi_core.orch_or.parallel.ProcessPoolManager.executor") as process_executor,
+                patch("agi_core.storage.memory_cache.get_cache") as get_cache,
+            ):
+                module.MyAgent(game_id="ls20", agent_name="StubAgent")
+
+        init_cuda.assert_not_called()
+        thread_executor.assert_not_called()
+        process_executor.assert_not_called()
+        get_cache.assert_not_called()
+
+    def test_my_agent_choose_action_activates_runtime_once(self) -> None:
+        arcengine_module = types.ModuleType("arcengine")
+        arcengine_module.FrameData = StubFrameData
+        arcengine_module.GameAction = StubGameAction
+        arcengine_module.GameState = StubGameState
+
+        agents_module = types.ModuleType("agents")
+        agents_agent_module = types.ModuleType("agents.agent")
+        agents_agent_module.Agent = StubAgent
+
+        module_overrides = {
+            "arcengine": arcengine_module,
+            "agents": agents_module,
+            "agents.agent": agents_agent_module,
+        }
+
+        with patch.dict(sys.modules, module_overrides, clear=False):
+            sys.modules.pop("agent.my_agent", None)
+            module = importlib.import_module("agent.my_agent")
+            module = importlib.reload(module)
+            with (
+                patch.object(module, "build_llm_backend", return_value=FakeLlamaBackend()),
+                patch.object(module, "HyperonBridge", FakeHyperonBridge),
+                patch("agi_core.cuda.init_cuda") as init_cuda,
+            ):
+                agent = module.MyAgent(game_id="ls20", agent_name="StubAgent")
+                active_frame = StubFrameData(
+                    state=StubGameState.ACTIVE,
+                    levels_completed=0,
+                    last_action=StubGameAction.ACTION1,
+                    available_actions=[StubGameAction.ACTION1, StubGameAction.ACTION2],
+                )
+
+                agent.choose_action([active_frame], active_frame)
+                agent.choose_action([active_frame], active_frame)
+
+        init_cuda.assert_called_once()
+
+    def test_my_agent_terminal_observation_can_activate_runtime_without_prior_decision(self) -> None:
+        arcengine_module = types.ModuleType("arcengine")
+        arcengine_module.FrameData = StubFrameData
+        arcengine_module.GameAction = StubGameAction
+        arcengine_module.GameState = StubGameState
+
+        agents_module = types.ModuleType("agents")
+        agents_agent_module = types.ModuleType("agents.agent")
+        agents_agent_module.Agent = StubAgent
+
+        module_overrides = {
+            "arcengine": arcengine_module,
+            "agents": agents_module,
+            "agents.agent": agents_agent_module,
+        }
+
+        with patch.dict(sys.modules, module_overrides, clear=False):
+            sys.modules.pop("agent.my_agent", None)
+            module = importlib.import_module("agent.my_agent")
+            module = importlib.reload(module)
+            with (
+                patch.object(module, "build_llm_backend", return_value=FakeLlamaBackend()),
+                patch.object(module, "HyperonBridge", FakeHyperonBridge),
+                patch("agi_core.cuda.init_cuda") as init_cuda,
+            ):
+                agent = module.MyAgent(game_id="ls20", agent_name="StubAgent")
+                win_frame = StubFrameData(
+                    state=StubGameState.WIN,
+                    levels_completed=1,
+                    last_action=StubGameAction.ACTION1,
+                    available_actions=[StubGameAction.ACTION1],
+                )
+
+                self.assertTrue(agent.is_done([win_frame], win_frame))
+
+        init_cuda.assert_called_once()
+
     def test_my_agent_treats_explicit_empty_actions_as_known_empty_legality(self) -> None:
         arcengine_module = types.ModuleType("arcengine")
         arcengine_module.FrameData = StubFrameData

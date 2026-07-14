@@ -5,7 +5,8 @@ from typing import Any
 
 import numpy as np
 
-from agi_core.cuda import CUDA_AVAILABLE, is_enabled
+import agi_core.cuda as cuda_runtime
+from agi_core.cuda import is_enabled, note_kernel_stat
 from agi_core.cuda.kernels import _launch_salience_kernel
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ def compute_salience_gpu(
     Returns a 2-D list[list[float]] or None if CUDA is unavailable / fails
     (caller falls back to CPU).
     """
-    if not is_enabled(config) or not CUDA_AVAILABLE:
+    if not is_enabled(config) or not cuda_runtime.CUDA_AVAILABLE:
         return None
 
     try:
@@ -47,6 +48,7 @@ def compute_salience_gpu(
 
         # Launch kernel (now with prev_board for motion detection)
         _launch_salience_kernel(board_np, px, py, goal_xs, goal_ys, out_np, prev_board=prev_np)
+        note_kernel_stat("salience")
 
         return out_np.tolist()
 

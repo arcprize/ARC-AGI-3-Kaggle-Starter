@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -612,7 +613,10 @@ def _best_reflection_placement(
     if not remaining_goals:
         return None
     # Try GPU-accelerated path first
-    if _CUDA_COMPONENTS_AVAILABLE:
+    if (
+        _CUDA_COMPONENTS_AVAILABLE
+        and os.environ.get("AGI_CUDA_SHAPE_PLACEMENT", "1").strip().lower() not in {"0", "false", "no", "off"}
+    ):
         gpu_result = _best_reflection_placement_gpu(
             width=width, height=height,
             component_cells=component.cells,
@@ -625,10 +629,11 @@ def _best_reflection_placement(
             # Compute side-constrained bbox and cluster IDs on CPU
             x1, y1, x2, y2 = component.bbox
             rel_cells = _normalized_mask(component.cells)
+            rel_center = _center(rel_cells)
             shape_w = x2 - x1 + 1
             shape_h = y2 - y1 + 1
-            tx = gpu_cx - shape_w // 2
-            ty = gpu_cy - shape_h // 2
+            tx = gpu_cx - rel_center[0]
+            ty = gpu_cy - rel_center[1]
             placed = {(tx + dx, ty + dy) for dx, dy in rel_cells}
             reflected = _reflect_cells(placed, horizontal, axis)
             hits_set = reflected & remaining_goals

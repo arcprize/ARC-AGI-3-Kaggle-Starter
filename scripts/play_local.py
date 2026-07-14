@@ -28,6 +28,7 @@ sys.path.insert(0, str(VENDOR))
 
 import arc_agi
 from arc_agi import OperationMode
+from agi_core.cuda import format_kernel_stats, snapshot_kernel_stats
 
 _PROXY_ENV_VARS = (
     "HTTP_PROXY",
@@ -109,6 +110,7 @@ def main() -> None:
         p.error("--record-every and --record-scale must be at least 1")
 
     log_level = logging.DEBUG if os.environ.get("AGI_DEBUG_DECISIONS", "0").strip().lower() in {"1", "true", "yes", "on"} else logging.INFO
+    cuda_debug_stats = log_level == logging.DEBUG or os.environ.get("AGI_CUDA_DEBUG_STATS", "0").strip().lower() in {"1", "true", "yes", "on"}
     logging.basicConfig(level=log_level, format="%(levelname)s:%(name)s:%(message)s")
     if log_level == logging.DEBUG:
         logging.getLogger("agi_core.orch_or").setLevel(logging.DEBUG)
@@ -147,6 +149,8 @@ def main() -> None:
 
     per_game = []
     for i, game_id in enumerate(game_ids, 1):
+        if cuda_debug_stats:
+            snapshot_kernel_stats(reset=True)
         print(f"=== [{i}/{len(game_ids)}] {game_id} ===")
         env = arc.make(game_id, render_mode=args.render)
         if env is None:
@@ -199,6 +203,8 @@ def main() -> None:
                          agent.action_counter))
         print(f"  -> state={final.state}, levels_completed={final.levels_completed}, "
               f"actions={agent.action_counter}")
+        if cuda_debug_stats:
+            print(f"  -> cuda_kernels={format_kernel_stats(reset=True)}")
         if artifacts:
             print(f"  -> replay frames={artifacts['frames_dir']}, gif={artifacts['gif']}, "
                   f"timeline={artifacts['timeline']}")

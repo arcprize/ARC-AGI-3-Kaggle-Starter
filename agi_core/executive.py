@@ -29,6 +29,7 @@ from agi_core.orch_or.parallel import ThreadPoolManager
 from concurrent.futures import wait
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -1590,6 +1591,35 @@ class ExecutiveRuntime:
         self.config = config
         self._bound_game_id = ""
         self._last_observation: Observation | None = None
+        self._activation_hook = None
+        self._activation_complete = False
+        self._debug_startup = os.environ.get("AGI_DEBUG_STARTUP", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._first_observation_logged = False
+        self._first_decision_logged = False
+
+    def set_activation_hook(self, hook) -> None:
+        self._activation_hook = hook
+
+    def _ensure_activated(self) -> None:
+        if self._activation_complete:
+            return
+        hook = self._activation_hook
+        if hook is None:
+            self._activation_complete = True
+            return
+        start = time.perf_counter()
+        hook()
+        self._activation_complete = True
+        if self._debug_startup:
+            logger.debug(
+                "ExecutiveRuntime startup: activation %.2fms",
+                (time.perf_counter() - start) * 1000.0,
+            )
 
     def bind_game(self, game_id: str) -> None:
         game_key = str(game_id or "")
@@ -1607,6 +1637,8 @@ class ExecutiveRuntime:
             self.hyperon.bind_game(game_id)
 
     def decide(self, frames, latest_frame) -> ActionDecision:
+        self._ensure_activated()
+        decision_start = time.perf_counter()
         observation = self._observe_and_persist(frames, latest_frame)
         context = ExecutiveContext(
             observation=observation,
@@ -1618,21 +1650,31 @@ class ExecutiveRuntime:
             config=self.config,
             episode_id=observation.game_id,
         )
-        return self.executive.decide(context)
+        decision = self.executive.decide(context)
+        if self._debug_startup and not self._first_decision_logged:
+            logger.debug(
+                "ExecutiveRuntime startup: first decision %.2fms",
+                (time.perf_counter() - decision_start) * 1000.0,
+            )
+            self._first_decision_logged = True
+        return decision
 
     def note_terminal_observation(self, frames, latest_frame) -> None:
+        self._ensure_activated()
         self._observe_and_persist(frames, latest_frame)
 
     def _observe_and_persist(self, frames, latest_frame):
+        observe_start = time.perf_counter()
         previous = self._last_observation
         observation = self.adapter.observe(frames, latest_frame)
         self.memory.note_observation(observation)
         records = self.memory.drain_new_records()
-        if hasattr(self.hyperon, "record_transitions"):
-            self.hyperon.record_transitions(records)
-        else:
-            for record in records:
-                self.hyperon.record_transition(record)
+        if records:
+            if hasattr(self.hyperon, "record_transitions"):
+                self.hyperon.record_transitions(records)
+            else:
+                for record in records:
+                    self.hyperon.record_transition(record)
         transitions = [
             classify_observed_transition(previous, observation, record, self.config)
             for record in records
@@ -1644,6 +1686,13 @@ class ExecutiveRuntime:
             for transition in transitions:
                 self.executive.note_transition(transition)
         self._last_observation = observation
+        if self._debug_startup and not self._first_observation_logged:
+            logger.debug(
+                "ExecutiveRuntime startup: first observation %.2fms records=%d",
+                (time.perf_counter() - observe_start) * 1000.0,
+                len(records),
+            )
+            self._first_observation_logged = True
         return observation
 
     def default_goals(self) -> list[GoalState]:

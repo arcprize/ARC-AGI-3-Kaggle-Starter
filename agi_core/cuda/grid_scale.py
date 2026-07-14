@@ -12,7 +12,8 @@ from typing import Any
 
 import numpy as np
 
-from agi_core.cuda import CUDA_AVAILABLE, is_enabled
+import agi_core.cuda as cuda_runtime
+from agi_core.cuda import get_cupy, is_enabled, note_kernel_stat
 from agi_core.cuda.kernels import _launch_uniformity_kernel, _launch_edge_kernel
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,11 @@ def _best_scale(
 ) -> int:
     """Combine uniformity (70 %) and edge periodicity (30 %) to pick the
     best scale.  Returns 1 if no scale exceeds 50 % uniformity."""
+    if (
+        float(np.max(edge_scores[2:17])) <= 0.0
+        and float(np.max(uniformity[2:17])) >= 0.999
+    ):
+        return 1
     best_scale = 1
     best_score = 0.0
     for scale in range(2, 17):
@@ -52,28 +58,29 @@ def detect_grid_scale_gpu(
     -------
     int (the detected scale) or *None* if CUDA is unavailable / fails.
     """
-    if not is_enabled(config) or not CUDA_AVAILABLE:
+    if not is_enabled(config) or not cuda_runtime.CUDA_AVAILABLE:
         return None
 
     try:
-        from numba import cuda
-
         height = len(board)
         width = len(board[0]) if height and board[0] else 0
         if height == 0 or width == 0:
             return None
 
+        cp = get_cupy()
         board_np = np.asarray(board, dtype=np.int8)
-        d_board = cuda.to_device(board_np)
+        d_board = cp.asarray(board_np, dtype=cp.int8)
 
-        d_uniformity = cuda.device_array(17, dtype=np.float32)
-        d_edge_scores = cuda.device_array(17, dtype=np.int32)
+        d_uniformity = cp.zeros(17, dtype=cp.float32)
+        d_edge_scores = cp.zeros(17, dtype=cp.int32)
 
         _launch_uniformity_kernel(d_board, d_uniformity, width, height)
+        note_kernel_stat("grid_scale.uniformity")
         _launch_edge_kernel(d_board, d_edge_scores, width, height)
+        note_kernel_stat("grid_scale.edge")
 
-        uniformity = d_uniformity.copy_to_host()
-        edge_scores = d_edge_scores.copy_to_host()
+        uniformity = cp.asnumpy(d_uniformity)
+        edge_scores = cp.asnumpy(d_edge_scores)
 
         return _best_scale(uniformity, edge_scores, total_cells=width * height)
 

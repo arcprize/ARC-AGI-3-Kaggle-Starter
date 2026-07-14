@@ -12,7 +12,8 @@ from typing import Any
 
 import numpy as np
 
-from agi_core.cuda import CUDA_AVAILABLE, is_enabled
+import agi_core.cuda as cuda_runtime
+from agi_core.cuda import get_cupy, is_enabled, note_kernel_stat
 from agi_core.cuda.kernels import (
     _compact_labels_cpu,
     _launch_compact_labels,
@@ -51,35 +52,40 @@ def detect_components_gpu(
     Returns *None* if CUDA is unavailable or the kernel fails (caller falls
     back to the respective CPU implementation).
     """
-    if not is_enabled(config) or not CUDA_AVAILABLE:
+    if not is_enabled(config) or not cuda_runtime.CUDA_AVAILABLE:
         return None
 
     try:
-        from numba import cuda
-
         height = len(board)
         width = len(board[0]) if height and board[0] else 0
         if height == 0 or width == 0:
             return None
 
+        cp = get_cupy()
         board_np = np.asarray(board, dtype=np.int8)
-        d_board = cuda.to_device(board_np)
-        d_labels = cuda.device_array((height, width), dtype=np.int32)
+        if bg_color >= 0:
+            board_np = board_np.copy()
+            board_np[board_np == int(bg_color)] = -1
+        d_board = cp.asarray(board_np, dtype=cp.int8)
+        d_labels = cp.empty((height, width), dtype=cp.int32)
 
         # Phase 1: initialise labels
         _launch_init_labels(d_board, d_labels, width, height)
+        note_kernel_stat("components.init")
 
         # Phase 2: iterative propagation (max 64 iterations)
         for _ in range(64):
+            note_kernel_stat("components.propagate")
             if _launch_propagate_labels(d_board, d_labels, width, height):
                 break
 
         # Phase 3: GPU label compaction (collect label/x/y/color tuples on GPU,
         # then sort and build component metadata on CPU from compacted data)
         raw = _launch_compact_labels(d_board, d_labels, width, height)
+        note_kernel_stat("components.compact")
         if not raw:
             # Fall back to CPU compaction if GPU returned empty
-            labels = d_labels.copy_to_host()
+            labels = cp.asnumpy(d_labels)
             raw = _compact_labels_cpu(labels, board, width, height)
 
         # Build colour frequencies (excluding bg_color and negative values)

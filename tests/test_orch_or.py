@@ -451,6 +451,82 @@ class BackgroundPrecomputeTests(unittest.TestCase):
         self.assertTrue(pctx["mirror_puzzle_active"])
         self.assertEqual(pctx["shape_stage_targets"][0]["target_anchor"], [13, 40])
 
+    def test_try_solver_system_includes_levels_completed_in_solver_plan_context(self) -> None:
+        orchestrator = ObjectiveReduction(
+            executive=SimpleNamespace(),
+            config=SimpleNamespace(),
+        )
+        solver = _FrameCacheMirrorSolver()
+        seen_contexts: list[dict[str, Any]] = []
+        selector = SimpleNamespace(
+            select_solver=lambda *_args, **_kwargs: solver,
+            build_solver_context=lambda game_model, plan_context, _context: SimpleNamespace(
+                game_model=game_model,
+                plan_context=plan_context,
+                episode={},
+                memory={},
+            ),
+            record_outcome=lambda _context, _game_model, _decision, plan_context: seen_contexts.append(dict(plan_context)),
+        )
+        orchestrator._solver_selector = selector
+        gm = GameModel(
+            board=[[9, 10, 9], [9, 9, 9], [9, 11, 9]],
+            height=3,
+            width=3,
+            player_pos=(0, 1),
+            goal_positions=[(1, 2)],
+            obstacles=[],
+            components=[
+                Component(
+                    cells=((1, 0),),
+                    bbox=(1, 0, 1, 0),
+                    size=1,
+                    dominant_color=10,
+                    touches_border=True,
+                ),
+            ],
+            walkable={(0, 1), (1, 1), (1, 2)},
+            features=GameFeatures(
+                player_detectable=True,
+                goal_detectable=True,
+                path_to_goal_possible=True,
+                board_type="puzzle",
+                primary_dynamics="puzzle",
+                has_beam=False,
+            ),
+        )
+        context = SimpleNamespace(
+            observation=SimpleNamespace(
+                image_input=None,
+                derived_features={
+                    "shape_recognition": {
+                        "version": 2,
+                        "mirror": {"present": True},
+                        "mirror_puzzle": {
+                            "active": True,
+                            "stage_targets": [{"switch_stage": 1, "target_anchor": [13, 40]}],
+                        },
+                    }
+                },
+                levels_completed=4,
+                last_action="ACTION5",
+            ),
+            memory_bundle=SimpleNamespace(
+                abstract_memories=[],
+                working_memory={},
+            ),
+            hyperon=SimpleNamespace(facts={}),
+            config=SimpleNamespace(memory_db_path=None),
+            multi_agent_frame_cache={},
+        )
+
+        decision, pctx = orchestrator._try_solver_system(context, gm)
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(pctx["levels_completed"], 4)
+        self.assertTrue(seen_contexts)
+        self.assertEqual(seen_contexts[0]["levels_completed"], 4)
+
     def test_background_precompute_uses_thread_pool_for_small_search_spaces(self) -> None:
         orchestrator = ObjectiveReduction(
             executive=SimpleNamespace(),
@@ -569,7 +645,7 @@ class AnalyzerTests(unittest.TestCase):
             "color_frequencies": {5: 1, 10: 1, 11: 1},
         }
 
-        with patch("agi_core.perception.gpu_perception.CUDA_AVAILABLE", True), patch(
+        with patch("agi_core.perception.gpu_perception.cuda_runtime.CUDA_AVAILABLE", True), patch(
             "agi_core.perception.gpu_perception.kernel_available",
             return_value=True,
         ), patch(

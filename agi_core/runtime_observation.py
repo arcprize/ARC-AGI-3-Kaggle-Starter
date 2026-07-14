@@ -6,6 +6,65 @@ from agi_core.config import RuntimeConfig
 from agi_core.types import EpisodeRecord, Observation, ObservedTransition
 
 
+def _has_observation_board(observation: Observation | None) -> bool:
+    if observation is None:
+        return False
+    derived = getattr(observation, "derived_features", {}) or {}
+    if bool(derived.get("has_image_input")):
+        return True
+    image_input = getattr(observation, "image_input", None)
+    board = getattr(image_input, "board", None)
+    return bool(isinstance(board, list) and board and isinstance(board[0], list) and board[0])
+
+
+def _is_late_same_level_soft_reset(
+    previous: Observation | None,
+    current: Observation,
+    reset_states: set[str],
+) -> bool:
+    if previous is None:
+        return False
+    previous_state = str(previous.game_state or "").upper()
+    current_state = str(current.game_state or "").upper()
+    if current_state not in reset_states:
+        return False
+    previous_level = int(previous.levels_completed or 0)
+    current_level = int(current.levels_completed or 0)
+    if previous_state not in reset_states:
+        return (
+            previous_level >= 3
+            and current_level == previous_level
+            and _has_observation_board(current)
+        )
+    return (
+        previous_level >= 3
+        and current_level < previous_level
+        and _has_observation_board(previous)
+        and not _has_observation_board(current)
+    )
+
+
+def _is_late_same_level_soft_restart(
+    previous: Observation | None,
+    current: Observation,
+    reset_states: set[str],
+) -> bool:
+    if previous is None:
+        return False
+    previous_state = str(previous.game_state or "").upper()
+    current_state = str(current.game_state or "").upper()
+    if previous_state not in reset_states or current_state in reset_states:
+        return False
+    previous_level = int(previous.levels_completed or 0)
+    current_level = int(current.levels_completed or 0)
+    return (
+        current_level >= 3
+        and previous_level <= current_level
+        and not _has_observation_board(previous)
+        and _has_observation_board(current)
+    )
+
+
 def observation_boundary(
     previous: Observation | None,
     current: Observation,
@@ -18,9 +77,13 @@ def observation_boundary(
     state = str(current.game_state or "").upper()
     if state == str(config.win_state_name or "").upper():
         return "win"
+    reset_states = {str(name or "").upper() for name in config.reset_state_names}
+    if _is_late_same_level_soft_restart(previous, current, reset_states):
+        return "soft_restart"
     if int(current.levels_completed or 0) > int(previous.levels_completed or 0):
         return "level"
-    reset_states = {str(name or "").upper() for name in config.reset_state_names}
+    if _is_late_same_level_soft_reset(previous, current, reset_states):
+        return "soft_reset"
     if state in reset_states:
         return "game_over"
     previous_state = str(previous.game_state or "").upper()
@@ -78,7 +141,7 @@ def classify_observed_transition(
         outcome = "progress"
     elif boundary == "game_over" or str(record.outcome or "") == "failed":
         outcome = "failed"
-    elif boundary in {"restart", "game"}:
+    elif boundary in {"restart", "game", "soft_reset", "soft_restart"}:
         outcome = "unknown"
     elif player_moved:
         outcome = "advanced"

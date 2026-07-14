@@ -8,12 +8,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
-from agi_core.cuda import (
-    CUDA_AVAILABLE,
-    detect_components_gpu,
-    detect_grid_scale_gpu,
-    kernel_available,
-)
+import agi_core.cuda as cuda_runtime
+from agi_core.cuda import detect_components_gpu, detect_grid_scale_gpu, kernel_available
 from agi_core.orch_or.game_model import Component
 
 logger = logging.getLogger(__name__)
@@ -69,7 +65,7 @@ def get_cached_perception(
     *,
     bg_color: int = -1,
 ) -> "PerceptionResult | None":
-    if not CUDA_AVAILABLE:
+    if not cuda_runtime.CUDA_AVAILABLE:
         return None
     key = _board_cache_key(board, bg_color)
     cached = _PERCEPTION_CACHE.get(key)
@@ -93,7 +89,7 @@ def gpu_perceive(
     config: object | None = None,
 ) -> PerceptionResult | None:
     """Run the perception pipeline on the GPU in one round-trip."""
-    if not CUDA_AVAILABLE or not kernel_available("components", config):
+    if not cuda_runtime.CUDA_AVAILABLE or not kernel_available("components", config):
         return None
 
     cached = get_cached_perception(board, bg_color=bg_color)

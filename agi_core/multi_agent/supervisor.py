@@ -101,9 +101,14 @@ class AgentSupervisor(ObjectiveReduction):
         self._solver_cooldown: int = 0  # frames to skip solver after stagnation
         self._solver_recent_states: list[tuple[str, tuple[int, int] | None]] = []
         self._sticky_shape_target: dict[str, Any] | None = None
-        # Initialise CUDA if enabled
-        if getattr(config, 'cuda_enabled', False):
-            init_cuda(getattr(config, 'cuda_device', 0))
+        self._runtime_ready = False
+
+    def ensure_runtime_ready(self) -> None:
+        if self._runtime_ready:
+            return
+        if getattr(self._config, 'cuda_enabled', False):
+            init_cuda(getattr(self._config, 'cuda_device', 0))
+        self._runtime_ready = True
 
     # ── public API ────────────────────────────────────────────────────
 
@@ -115,6 +120,7 @@ class AgentSupervisor(ObjectiveReduction):
         - Consensus confidence is below threshold
         - An agent-free fallback is needed (score-floor reopen etc.)
         """
+        self.ensure_runtime_ready()
         # Set cognition strategy early (before any early return paths)
         context.cognition_strategy = "multi-agent"
 

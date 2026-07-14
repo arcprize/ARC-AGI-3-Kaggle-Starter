@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from agi_core.orch_or.analyzer import build_game_model
 from agi_core.image_input import (
     active_cell_count,
+    board_image_input_from_source,
     default_click_target,
     extract_board_image_input,
     preferred_board_probe_action,
@@ -33,6 +34,7 @@ class ArcAdapter:
         self._game_action_cls = game_action_cls
         self._game_id = default_game_id
         self._last_image_input = None
+        self._last_levels_completed = 0
         self._reset_state_names = {str(name or "").upper() for name in reset_state_names}
         self._default_legal_actions = self._discover_default_actions()
         if deterministic_action in self._default_legal_actions:
@@ -49,8 +51,41 @@ class ArcAdapter:
         game_state = self._normalize_name(self._get_attr(latest_frame, "state"))
         legal_actions, legal_actions_known = self._extract_legal_actions(latest_frame, game_state)
         step_index, step_index_reliable = self._extract_step_index(frames, latest_frame)
+        levels_completed = int(
+            self._get_attr(latest_frame, "levels_completed", "level", default=0) or 0
+        )
+        previous_image_input = self._last_image_input
+        previous_levels_completed = self._last_levels_completed
         image_input = extract_board_image_input(latest_frame)
-        self._last_image_input = image_input
+        multi_layer_frame = getattr(latest_frame, "frame", None)
+        if (
+            levels_completed >= 3
+            and isinstance(multi_layer_frame, list)
+            and len(multi_layer_frame) > 1
+        ):
+            first_layer_input = board_image_input_from_source(
+                multi_layer_frame[0],
+                source_attr="frame[0]",
+            )
+            if first_layer_input is not None:
+                image_input = first_layer_input
+        image_input_usable = self._has_usable_image_input(image_input)
+        preserve_late_frame = (
+            not image_input_usable
+            and previous_image_input is not None
+            and previous_levels_completed >= 3
+            and game_state not in self._reset_state_names
+        )
+        if (
+            preserve_late_frame
+            and levels_completed < previous_levels_completed
+        ):
+            image_input = previous_image_input
+            levels_completed = previous_levels_completed
+            image_input_usable = True
+        if image_input_usable:
+            self._last_image_input = image_input
+        self._last_levels_completed = levels_completed
         board_model_result = self._board_model(image_input)
         board_model = board_model_result.model
         board = image_input.board if image_input is not None else []
@@ -82,9 +117,7 @@ class ArcAdapter:
             game_id=self._game_id or str(self._get_attr(latest_frame, "game_id", "")),
             step_index=step_index,
             game_state=game_state,
-            levels_completed=int(
-                self._get_attr(latest_frame, "levels_completed", "level", default=0) or 0
-            ),
+            levels_completed=levels_completed,
             last_action=self._normalize_name(
                 self._get_attr(latest_frame, "last_action", "action")
             ),
@@ -110,6 +143,15 @@ class ArcAdapter:
                 "has_beam": derived_features["has_beam"],
             },
         )
+
+    def _has_usable_image_input(self, image_input: Any) -> bool:
+        if image_input is None:
+            return False
+        board = getattr(image_input, "board", None)
+        if not isinstance(board, list) or not board:
+            return False
+        first_row = board[0]
+        return isinstance(first_row, list) and len(first_row) > 0
 
     def _board_model(self, image_input):
         if image_input is None or not image_input.board:

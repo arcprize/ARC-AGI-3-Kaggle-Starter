@@ -15,6 +15,7 @@ Contract (enforced by the ARC-AGI-3-Agents framework):
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from arcengine import FrameData, GameAction, GameState
@@ -28,7 +29,6 @@ from agi_core.knowledge.hyperon_bridge import HyperonBridge
 from agi_core.llm import build_llm_backend
 from agi_core.memory import EpisodicMemory
 from agi_core.orch_or import ObjectiveReduction
-from agi_core.orch_or.parallel import ThreadPoolManager
 from agi_core.specialists.critic import ProposalCritic
 from agi_core.specialists.llm import LLMSpecialist
 from agi_core.specialists.reactive import ReactiveSpecialist
@@ -59,8 +59,15 @@ class MyAgent(Agent):
         "yes",
         "on",
     }
+    DEBUG_STARTUP = os.environ.get("AGI_DEBUG_STARTUP", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        startup_started = time.perf_counter()
         super().__init__(*args, **kwargs)
         config = RuntimeConfig.from_env()
         adapter = ArcAdapter(
@@ -87,31 +94,11 @@ class MyAgent(Agent):
             probe_timeout_seconds=config.hyperon_probe_timeout_seconds,
         )
         llm_backend = build_llm_backend(config) if config.llm_enabled else None
-        from agi_core.orch_or.parallel import ProcessPoolManager, ThreadPoolManager, sync_pool_worker_counts
+        from agi_core.orch_or.parallel import sync_pool_worker_counts
         sync_pool_worker_counts(
             config.planner_workers,
             thread_workers=_resolve_parallel_thread_workers(config),
         )
-        # Pre-warm SQLite caches only when live gameplay explicitly allows disk I/O.
-        if config.gameplay_disk_io_enabled:
-            from agi_core.storage.memory_cache import get_cache
-            for _db in (
-                config.gameplay_memory_db_path(),
-                config.gameplay_archive_memory_db_path(),
-                config.gameplay_trained_priors_db_path(),
-            ):
-                if _db:
-                    get_cache(_db)
-        # Pre-warm both pools so worker threads/processes exist before first frame.
-        ThreadPoolManager.executor()
-        try:
-            ProcessPoolManager.executor()
-        except Exception:
-            pass
-        # Initialise CUDA if enabled
-        if config.cuda_enabled:
-            from agi_core.cuda import init_cuda
-            init_cuda(config.cuda_device)
 
         # Human-like cognition modules
         from agi_core.cognition import (
@@ -162,7 +149,17 @@ class MyAgent(Agent):
             llm_backend=llm_backend,
             config=config,
         )
+        self._runtime_ready = False
+        self._cache_prewarmed = False
+        self._cuda_initialized = False
+        self.runtime.set_activation_hook(self._activate_runtime)
         self.runtime.bind_game(self.game_id)
+        if self.DEBUG_STARTUP:
+            import logging
+            logging.getLogger(__name__).debug(
+                "MyAgent startup: constructed in %.2fms",
+                (time.perf_counter() - startup_started) * 1000.0,
+            )
 
     @property
     def name(self) -> str:
@@ -224,3 +221,34 @@ class MyAgent(Agent):
         if summary_fn is None:
             return {}
         return dict(summary_fn() or {})
+
+    def _activate_runtime(self) -> None:
+        if self._runtime_ready:
+            return
+        start = time.perf_counter()
+        if self.runtime.config.gameplay_disk_io_enabled and not self._cache_prewarmed:
+            from agi_core.storage.memory_cache import get_cache
+
+            for db_path in (
+                self.runtime.config.gameplay_memory_db_path(),
+                self.runtime.config.gameplay_archive_memory_db_path(),
+                self.runtime.config.gameplay_trained_priors_db_path(),
+            ):
+                if db_path:
+                    get_cache(db_path)
+            self._cache_prewarmed = True
+        if self.runtime.config.cuda_enabled and not self._cuda_initialized:
+            from agi_core.cuda import init_cuda
+
+            init_cuda(self.runtime.config.cuda_device)
+            self._cuda_initialized = True
+        ensure_runtime_ready = getattr(self.runtime.executive, "ensure_runtime_ready", None)
+        if callable(ensure_runtime_ready):
+            ensure_runtime_ready()
+        self._runtime_ready = True
+        if self.DEBUG_STARTUP:
+            import logging
+            logging.getLogger(__name__).debug(
+                "MyAgent startup: runtime activation %.2fms",
+                (time.perf_counter() - start) * 1000.0,
+            )

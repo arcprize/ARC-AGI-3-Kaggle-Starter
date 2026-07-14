@@ -1,12 +1,33 @@
 from __future__ import annotations
 
+import importlib.util
+import os
+import pathlib
 import unittest
 import types
 from unittest.mock import patch
 
 import numpy as np
 
-from agi_core.cuda import CUDA_AVAILABLE, init_cuda, is_enabled
+from agi_core.cuda import (
+    CUDA_AVAILABLE,
+    format_kernel_stats,
+    get_cupy,
+    init_cuda,
+    is_enabled,
+    note_kernel_stat,
+    snapshot_kernel_stats,
+)
+
+
+def _load_live_ar25_opening_board() -> list[list[int]]:
+    env_path = pathlib.Path("environment_files/ar25/0c556536/ar25.py")
+    spec = importlib.util.spec_from_file_location("test_ar25_env", env_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    game = module.Ar25()
+    return game.camera.render(game.current_level.get_sprites()).tolist()
 
 
 class TestCudaModule(unittest.TestCase):
@@ -39,6 +60,41 @@ class TestCudaModule(unittest.TestCase):
     def test_is_enabled_defaults_env_to_on(self):
         with patch("agi_core.cuda.CUDA_AVAILABLE", True), patch.dict("os.environ", {}, clear=True):
             self.assertTrue(is_enabled(config=None))
+
+    def test_get_cupy_importable(self):
+        cp = get_cupy()
+        self.assertTrue(hasattr(cp, "asarray"))
+
+    def test_init_cuda_uses_cupy_device_probe(self):
+        fake_cp = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                Device=lambda idx: types.SimpleNamespace(use=lambda: None),
+                runtime=types.SimpleNamespace(
+                    getDeviceProperties=lambda idx: {"name": b"Fake GPU"},
+                ),
+                is_available=lambda: True,
+            )
+        )
+        with patch("agi_core.cuda.get_cupy", return_value=fake_cp):
+            self.assertTrue(init_cuda(0))
+
+    def test_kernel_stats_snapshot_and_reset(self):
+        snapshot_kernel_stats(reset=True)
+        note_kernel_stat("astar")
+        note_kernel_stat("components.propagate", 3)
+        self.assertEqual(
+            snapshot_kernel_stats(),
+            {"astar": 1, "components.propagate": 3},
+        )
+        self.assertEqual(
+            format_kernel_stats(),
+            "astar=1, components.propagate=3",
+        )
+        self.assertEqual(
+            snapshot_kernel_stats(reset=True),
+            {"astar": 1, "components.propagate": 3},
+        )
+        self.assertEqual(snapshot_kernel_stats(), {})
 
 
 class TestSalienceGpu(unittest.TestCase):
@@ -111,7 +167,7 @@ class TestAstarGpu(unittest.TestCase):
             path_lens[0] = 2
             path_lens[1] = 0
 
-        with patch("agi_core.cuda.astar.CUDA_AVAILABLE", True), patch(
+        with patch("agi_core.cuda.astar.cuda_runtime.CUDA_AVAILABLE", True), patch(
             "agi_core.cuda.astar.kernel_available",
             return_value=True,
         ), patch(
@@ -159,7 +215,7 @@ class TestCpuFallback(unittest.TestCase):
         from agi_core.cuda.astar import batch_astar_gpu
 
         walkable = {(x, y) for x in range(4) for y in range(4)}
-        with patch("agi_core.cuda.astar.CUDA_AVAILABLE", True), patch(
+        with patch("agi_core.cuda.astar.cuda_runtime.CUDA_AVAILABLE", True), patch(
             "agi_core.cuda.astar.kernel_available",
             return_value=True,
         ), patch(
@@ -182,7 +238,7 @@ class TestCpuFallback(unittest.TestCase):
         from agi_core.cuda.astar import batch_astar_gpu
 
         walkable = {(x, y) for x in range(4) for y in range(4)}
-        with patch("agi_core.cuda.astar.CUDA_AVAILABLE", False), patch(
+        with patch("agi_core.cuda.astar.cuda_runtime.CUDA_AVAILABLE", False), patch(
             "agi_core.orch_or.search.astar",
             side_effect=AssertionError("public astar should not be re-entered"),
         ):
@@ -466,36 +522,25 @@ class TestMirrorSolverGpu(unittest.TestCase):
     def test_reflection_scoring_helper_returns_candidate_grid(self):
         from agi_core.cuda.mirror_solver import score_reflection_candidates_gpu
 
-        class _FakeDeviceArray:
-            def __init__(self, array):
-                self.array = array
-
-            def __getitem__(self, key):
-                return self.array[key]
-
-            def __setitem__(self, key, value):
-                self.array[key] = value
-
-            def copy_to_host(self):
-                return self.array
-
         def fake_launch(_goal, _shape, shape_w, shape_h, _horizontal, _axis, _width, _height, score_out):
             self.assertEqual((shape_w, shape_h), (2, 1))
             score_out[4, 3] = 2
             score_out[5, 3] = 1
 
-        fake_numba = types.ModuleType("numba")
-        fake_numba.cuda = types.SimpleNamespace(
-                to_device=lambda arr: arr,
-                device_array=lambda shape, dtype: _FakeDeviceArray(np.zeros(shape, dtype=dtype)),
+        fake_cupy = types.SimpleNamespace(
+            uint8=np.uint8,
+            int32=np.int32,
+            asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+            zeros=lambda shape, dtype=None: np.zeros(shape, dtype=dtype),
+            asnumpy=lambda arr: arr,
         )
 
-        with patch("agi_core.cuda.mirror_solver.CUDA_AVAILABLE", True), patch(
+        with patch("agi_core.cuda.mirror_solver.cuda_runtime.CUDA_AVAILABLE", True), patch(
             "agi_core.cuda.mirror_solver.kernel_available",
             return_value=True,
-        ), patch.dict(
-            "sys.modules",
-            {"numba": fake_numba},
+        ), patch(
+            "agi_core.cuda.mirror_solver.get_cupy",
+            return_value=fake_cupy,
         ), patch(
             "agi_core.cuda.mirror_solver._launch_reflection_score_kernel",
             side_effect=fake_launch,
@@ -518,31 +563,20 @@ class TestMirrorSolverGpu(unittest.TestCase):
     def test_reflection_scoring_falls_back_on_exception(self):
         from agi_core.cuda.mirror_solver import score_reflection_candidates_gpu
 
-        class _FakeDeviceArray:
-            def __init__(self, array):
-                self.array = array
-
-            def __getitem__(self, key):
-                return self.array[key]
-
-            def __setitem__(self, key, value):
-                self.array[key] = value
-
-            def copy_to_host(self):
-                return self.array
-
-        fake_numba = types.ModuleType("numba")
-        fake_numba.cuda = types.SimpleNamespace(
-                to_device=lambda arr: arr,
-                device_array=lambda shape, dtype: _FakeDeviceArray(np.zeros(shape, dtype=dtype)),
+        fake_cupy = types.SimpleNamespace(
+            uint8=np.uint8,
+            int32=np.int32,
+            asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+            zeros=lambda shape, dtype=None: np.zeros(shape, dtype=dtype),
+            asnumpy=lambda arr: arr,
         )
 
-        with patch("agi_core.cuda.mirror_solver.CUDA_AVAILABLE", True), patch(
+        with patch("agi_core.cuda.mirror_solver.cuda_runtime.CUDA_AVAILABLE", True), patch(
             "agi_core.cuda.mirror_solver.kernel_available",
             return_value=True,
-        ), patch.dict(
-            "sys.modules",
-            {"numba": fake_numba},
+        ), patch(
+            "agi_core.cuda.mirror_solver.get_cupy",
+            return_value=fake_cupy,
         ), patch(
             "agi_core.cuda.mirror_solver._launch_reflection_score_kernel",
             side_effect=RuntimeError("boom"),
@@ -558,6 +592,60 @@ class TestMirrorSolverGpu(unittest.TestCase):
             )
 
         self.assertIsNone(result)
+
+    def test_best_reflection_placement_uses_true_shape_center_for_live_like_shape(self):
+        from agi_core.cuda.mirror_solver import best_reflection_placement_gpu
+        from agi_core.perception.shape_recognition import _color_components, _detect_background
+
+        board = _load_live_ar25_opening_board()
+        background = _detect_background(board)
+        components = _color_components(board, background)
+        component = next(
+            item
+            for item in components
+            if item.color in (0, 5) and 4 <= len(item.cells) <= 100 and not item.touches_border
+        )
+        goal_cells = {
+            cell
+            for item in components
+            if item.color == 11
+            and not item.touches_border
+            and any(x < len(board[0]) - 1 for x, _ in item.cells)
+            for cell in item.cells
+        }
+
+        def fake_launch(_goal, _shape, _shape_w, _shape_h, _horizontal, _axis, _width, _height, score_out):
+            score_out[45, 3] = 40
+
+        fake_cupy = types.SimpleNamespace(
+            uint8=np.uint8,
+            int32=np.int32,
+            asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+            zeros=lambda shape, dtype=None: np.zeros(shape, dtype=dtype),
+            asnumpy=lambda arr: arr,
+        )
+
+        with patch("agi_core.cuda.mirror_solver.cuda_runtime.CUDA_AVAILABLE", True), patch(
+            "agi_core.cuda.mirror_solver.kernel_available",
+            return_value=True,
+        ), patch(
+            "agi_core.cuda.mirror_solver.get_cupy",
+            return_value=fake_cupy,
+        ), patch(
+            "agi_core.cuda.mirror_solver._launch_reflection_score_kernel",
+            side_effect=fake_launch,
+        ):
+            result = best_reflection_placement_gpu(
+                width=len(board[0]),
+                height=len(board),
+                component_cells=component.cells,
+                component_bbox=component.bbox,
+                remaining_goals=goal_cells,
+                horizontal=False,
+                axis=31,
+            )
+
+        self.assertEqual(result, (40, 8, 47))
 
 
 class TestGpuPerceptionPipeline(unittest.TestCase):
@@ -591,7 +679,7 @@ class TestGpuPerceptionPipeline(unittest.TestCase):
             "color_frequencies": {5: 2},
         }
 
-        with patch("agi_core.perception.gpu_perception.CUDA_AVAILABLE", True), patch(
+        with patch("agi_core.perception.gpu_perception.cuda_runtime.CUDA_AVAILABLE", True), patch(
             "agi_core.perception.gpu_perception.kernel_available",
             return_value=True,
         ), patch(
@@ -650,7 +738,7 @@ class TestGpuPerceptionPipeline(unittest.TestCase):
             "color_frequencies": {5: 1},
         }
 
-        with patch("agi_core.perception.gpu_perception.CUDA_AVAILABLE", True), patch(
+        with patch("agi_core.perception.gpu_perception.cuda_runtime.CUDA_AVAILABLE", True), patch(
             "agi_core.perception.gpu_perception.kernel_available",
             return_value=True,
         ), patch(
@@ -670,7 +758,7 @@ class TestGpuPerceptionPipeline(unittest.TestCase):
     def test_get_cached_perception_skips_board_key_when_cuda_unavailable(self):
         from agi_core.perception.gpu_perception import get_cached_perception
 
-        with patch("agi_core.perception.gpu_perception.CUDA_AVAILABLE", False), patch(
+        with patch("agi_core.perception.gpu_perception.cuda_runtime.CUDA_AVAILABLE", False), patch(
             "agi_core.perception.gpu_perception._board_cache_key",
             side_effect=AssertionError("board key should not be computed"),
         ):
