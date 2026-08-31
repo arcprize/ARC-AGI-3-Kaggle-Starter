@@ -1,0 +1,104 @@
+Agents
+Build a custom agent for ARC-AGI-3 games
+Create Your Own Agent
+ Copy page
+Create AI agents that can play ARC-AGI-3 games by implementing the required interface
+methods. The following is based off the .
+Step 1: Create Your Agent File
+First, head over to the  repo and clone it
+Make sure you have your ARC_API_KEY populated in your environment variables. You
+can obtain this key by signing up for an account on the .
+Next, create a new Python file for your agent inside the agents/ directory. For this
+example, letʼs copy the random_agent.py template.
+Now, modify agents/my_awesome_agent.py and rename the class to MyAwesomeAgent.
+git clone https://github.com/arcprize/ARC-AGI-3-Agents.git
+cp agents/templates/random_agent.py agents/my_awesome_agent.py
+ARC-AGI-3 Agents repo
+ARC-AGI-3-Agents
+ARC-AGI-3 website
+Agents Create Your Own Agent
+7/2/26, 9:47 PM Create Your Own Agent - ARC-AGI-3 Docs
+https://docs.arcprize.org/create-agent 1/4
+Step 2: Register Your Agent
+To make your agent available to run, add an import statement to agents/__init__.py
+and add it to the AVAILABLE_AGENTS dictionary:
+# agents/my_awesome_agent.py
+from .agent import Agent # Make sure to change from `..` imports
+from .structs import FrameData, GameAction, GameState # Make sure to change fr
+import random
+# Rename the class
+class MyAwesomeAgent(Agent):
+    """A simple agent that chooses random actions."""
+    def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> boo
+        # Your logic to determine if the game is finished
+        return latest_frame.state is GameState.WIN
+    def choose_action(self, frames: list[FrameData], latest_frame: FrameData) 
+        # Your custom decision-making logic goes here
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            # Start or restart the game
+            action = GameAction.RESET
+        else:
+            # Choose a random action (except RESET)
+            action = random.choice([a for a in GameAction if a is not GameActi
+        # Add reasoning for simple actions
+        if action.is_simple():
+            action.reasoning = f"Chose {action.value} randomly"
+        # For complex actions, set coordinates
+        elif action.is_complex():
+            action.set_data({
+                "x": random.randint(0, 63),
+                "y": random.randint(0, 63),
+            })
+            action.reasoning = {"action": action.value, "reason": "Random choi
+        return action
+7/2/26, 9:47 PM Create Your Own Agent - ARC-AGI-3 Docs
+https://docs.arcprize.org/create-agent 2/4
+Step 3: Run Your Agent
+Your agent is now registered and ready to run. Use the class name in lower case as the
+value for the --agent argument.
+You can also run it against all available games:
+The  of your agent is available at the end of the run. Make sure to watch your agent
+at play.
+Troubleshooting
+Relative Import Errors
+If you move an agent file or create a new one outside the agents/ directory, you may
+encounter ImportError exceptions related to relative imports.
+# agents/__init__.py
+# ... existing imports ...
+from .my_awesome_agent import MyAwesomeAgent
+__all__ = [
+    # ... existing agents ...
+    "MyAwesomeAgent",
+    "AVAILABLE_AGENTS",
+]
+# Run your custom agent on the 'ls20' game
+uv run main.py --agent=myawesomeagent --game=ls20
+# Run your agent on all games
+uv run main.py --agent=myawesomeagent
+replay
+7/2/26, 9:47 PM Create Your Own Agent - ARC-AGI-3 Docs
+https://docs.arcprize.org/create-agent 3/4
+Was this page helpful?
+ Yes
+ No
+ Suggest edits
+GPT OSS on Kaggle Local vs Online
+Powered by
+Solution: Ensure your import statements use the correct relative pathing. The .. prefix
+goes up one directory level.
+For example, if your agent is in agents/my_agents/my_file.py, the imports should look
+like this:
+Agent Not Found Errors
+If you see ValueError: Agent '<your-agent>' not found, double-check the following:
+1. Your agent class is correctly located in the agents directory (or a subdirectory).
+2. The class name is correctly spelled and matches the name you provided to the --
+agent flag (in lower case).
+3. You have saved your changes to your agent file.
+# agents/my_agents/my_file.py
+# Correct: Go up one level to the 'agents' package root
+from ..agent import Agent
+from ..structs import FrameData
+# Incorrect: Assumes the file is in the 'agents' root
+# from .agent import Agent
+7/2/26, 9:47 PM Create Your Own Agent - ARC-AGI-3 Docs
+https://docs.arcprize.org/create-agent 4/4

@@ -1,0 +1,42 @@
+arc3x: the experiment log answers the flag question, and it changes the notebook
+
+Sam asked why GRAFT_FLAGS arms only 3 of the 10 flags composite.install accepts.
+docs/EXPERIMENT_LOG.md answers it: all seven others were tested on the real
+leaderboard over Exp 3-11 and every combination scored below the three-flag
+baseline (banking 1.10, helpers+void+transfer 1.06, state_dedup 0.77, schema_notes
+0.47). The three are the survivors of a finished ablation, not an oversight.
+
+Sam is also right that some of those experiments were good: Exp 11 set the highest
+local score ever recorded (2.6848) and produced the first m0r0 level-0 clear, then
+scored 0.60 on Kaggle. The log names the mechanism - 57K context plus verbose
+per-turn notes caused vLLM prefill timeouts on the shared GPU, stranding games at
+zero. Good locally, destroyed by latency remotely.
+
+Two findings from reading the grafts change what ships:
+
+recovery is separable. Both recovery regressions are attributed by the log to R2's
+probe tax alone, and R2 spends up to 16 actions per stalled level. R1 (clear a
+death-spiralled history, rewrite the world model) and R3 (carry mechanics across
+the vendor level wipe via cross_level_notes) cost zero actions by construction.
+build_probe_plan returns plan[:PROBE_MAX_ACTIONS] and _do_probe returns on an empty
+plan, so PROBE_MAX_ACTIONS = 0 kills R2 through a guard that already exists. R3 is
+the only mechanism in the bundle aimed at level 1+, and level-0 breadth is capped
+at 3.52. The arming order is load-bearing and verified: kill R2, then arm recovery,
+then install - a failure anywhere leaves the byte-exact 2.14 config.
+
+The efficiency note is economically wrong. It opens every turn with "every wasted
+action costs you quadratically" and reports "you are 38.0x over the target" on a
+level the agent has not cleared, where the ratio costs nothing at all. The four
+holdout games that do clear level 0 clear it at 38-45x for ~0.06 each, strictly
+better than the 0.00 they score by giving up. One appended clause, in the most
+salient channel there is.
+
+Also folds in the two measured priors still missing from the prompt: RESET is a
+one-action rewind of the current level on a deterministic engine, and the default
+button convention with its avatar-less fallbacks.
+
+Verified: 9 cells compile, arming order holds, addendum intact at 5799 chars.
+Smoked against real shipped source: probe plan 8 -> 0 actions, rider present on a
+loud note and absent on a silent one, prompt +5799, level probe writes 11 fields.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

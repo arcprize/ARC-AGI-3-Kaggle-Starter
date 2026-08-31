@@ -1,22 +1,14 @@
-# Kaggle credentials (project-local, never check in)
-.kaggle/
-
 # Python
-.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
 
-# Vendored framework + downloaded game source + agent recordings
-vendor/
-environment_files/
-recordings/
-logs.log
+# Large competition / experiment artifacts: re-downloadable or re-derivable.
+# Scores live in benchmark.json; these are the raw rollout dumps.
+*.zip
+intermediate_states.pkl
+*.per_game_cards.pkl
 
-# Generated artefacts
-notebooks/submission.ipynb
-reference/
-
-# OS / editors
-.DS_Store
-.idea/
-.vscode/
+# Search output
+plans/
+*.plans.json

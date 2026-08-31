@@ -1,0 +1,5 @@
+{
+  "efficiency_rider": "FAILED ModuleNotFoundError: No module named 'taaf_grafts'",
+  "family_priors": "appended 5799 chars to the agent system prompt",
+  "level_probe": "wrapped taaf.game.Game.finish_game -> /kaggle/working/level_probe.jsonl"
+}

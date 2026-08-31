@@ -1,0 +1,38 @@
+Core Concepts
+Viewing your agentʼs gameplay
+Recordings & Replays
+ Copy page
+Recordings let you view and share your agentʼs gameplay sessions.
+When Recordings Are Available
+Method Recordings Available
+API Yes — viewable online via scorecard
+Swarm Yes — saved locally and viewable online
+Local Toolkit No — running locally without API does not generate recordings
+Online Replays
+For games played via the API, you can view recordings online through your scorecard:
+https://arcprize.org/scorecards/<scorecard_id>
+Here is an example .
+Local Recording Files
+When running a , agent gameplay is recorded by default and stored in the
+recordings/ directory with GUID-based filenames:
+ls20-6cbb1acf0530.random.100.a1b2c3d4-e5f6-7890-abcd-ef1234567890.recording.js
+recording
+swarm
+Core Concepts Recordings & Replays
+7/2/26, 9:48 PM Recordings & Replays - ARC-AGI-3 Docs
+https://docs.arcprize.org/recordings 1/2
+Was this page helpful?
+ Yes
+ No
+ Suggest edits
+Scorecards Quickstart
+Powered by
+The filename format is: {game_id}.{agent_type}.{max_actions}.
+{guid}.recording.jsonl
+Recording File Format
+JSONL Format
+Recordings are stored in JSONL format with timestamped entries:
+{"timestamp": "2024-01-15T10:30:45.123456+00:00", "data": {"game_id": "ls20-01
+{"timestamp": "2024-01-15T10:30:46.234567+00:00", "data": {"game_id": "ls20-01
+7/2/26, 9:48 PM Recordings & Replays - ARC-AGI-3 Docs
+https://docs.arcprize.org/recordings 2/2

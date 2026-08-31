@@ -1,0 +1,65 @@
+env_dir : D:\AI_ARMY\arc_agi3_solver\datasets\arc-prize-2026-arc-agi-3\environment_files
+games   : 25   budget 300s each   workers 4
+wall-clock estimate: 31 min
+
+[ 1/25] cn04-2fe56bfb    1/6 levels  score   4.76  actions/level [14]  19,599 sim steps
+[ 2/25] cd82-fb555c5d    2/6 levels  score  14.29  actions/level [5,6]  17,334 sim steps
+[ 3/25] bp35-0a0ad940    1/9 levels  score   1.57  actions/level [25]  11,545 sim steps
+[ 4/25] ar25-0c556536    2/8 levels  score   8.33  actions/level [21,17]  18,371 sim steps
+[ 5/25] dc22-fdcac232    0/6 levels  score   0.00  actions/level [-]  11,906 sim steps
+[ 6/25] ft09-0d8bbf25    1/6 levels  score   4.76  actions/level [4]  6,748 sim steps
+[ 7/25] ka59-38d34dbb    0/7 levels  score   0.00  actions/level [-]  5,545 sim steps
+[ 8/25] g50t-5849a774    0/7 levels  score   0.00  actions/level [-]  2,162 sim steps
+[ 9/25] lf52-271a04aa    1/10 levels  score   1.82  actions/level [21]  5,431 sim steps
+[10/25] lp85-305b61c3    1/8 levels  score   2.78  actions/level [5]  3,780 sim steps
+[11/25] ls20-9607627b    0/7 levels  score   0.00  actions/level [-]  2,407 sim steps
+[12/25] m0r0-492f87ba    1/6 levels  score   4.76  actions/level [25]  4,470 sim steps
+[13/25] r11l-495a7899    1/6 levels  score   4.76  actions/level [3]  3,232 sim steps
+[14/25] re86-8af5384d    0/8 levels  score   0.00  actions/level [-]  9,145 sim steps
+[15/25] s5i5-18d95033    1/8 levels  score   2.78  actions/level [13]  8,095 sim steps
+[16/25] sb26-7fbdac44    0/8 levels  score   0.00  actions/level [-]  4,586 sim steps
+[17/25] sc25-635fd71a    0/6 levels  score   0.00  actions/level [-]  15,759 sim steps
+[18/25] su15-1944f8ab    0/9 levels  score   0.00  actions/level [-]  8,576 sim steps
+[19/25] sp80-589a99af    2/6 levels  score  14.29  actions/level [8,26]  15,731 sim steps
+[20/25] sk48-d8078629    1/8 levels  score   2.78  actions/level [20]  15,619 sim steps
+[21/25] tn36-ef4dde99    0/7 levels  score   0.00  actions/level [-]  17,135 sim steps
+[22/25] tr87-cd924810    0/6 levels  score   0.00  actions/level [-]  24,406 sim steps
+[23/25] vc33-5430563c    2/7 levels  score  10.71  actions/level [3,7]  35,808 sim steps
+[24/25] tu93-0768757b    1/9 levels  score   2.22  actions/level [8]  42,287 sim steps
+[25/25] wa30-ee6fef47    0/9 levels  score   0.00  actions/level [-]  46,982 sim steps
+
+================================================================
+games with >=1 level solved : 14/25
+total levels completed      : 18
+MEAN ESTIMATED SCORE        : 3.224
+wall clock                  : 27.4 min
+================================================================
+
+game               lvls   score
+cd82-fb555c5d    2/6      14.29
+sp80-589a99af    2/6      14.29
+vc33-5430563c    2/7      10.71
+ar25-0c556536    2/8       8.33
+cn04-2fe56bfb    1/6       4.76
+ft09-0d8bbf25    1/6       4.76
+m0r0-492f87ba    1/6       4.76
+r11l-495a7899    1/6       4.76
+lp85-305b61c3    1/8       2.78
+s5i5-18d95033    1/8       2.78
+sk48-d8078629    1/8       2.78
+tu93-0768757b    1/9       2.22
+lf52-271a04aa    1/10      1.82
+bp35-0a0ad940    1/9       1.57
+dc22-fdcac232    0/6       0.00
+ka59-38d34dbb    0/7       0.00
+g50t-5849a774    0/7       0.00
+ls20-9607627b    0/7       0.00
+re86-8af5384d    0/8       0.00
+sb26-7fbdac44    0/8       0.00
+sc25-635fd71a    0/6       0.00
+su15-1944f8ab    0/9       0.00
+tn36-ef4dde99    0/7       0.00
+tr87-cd924810    0/6       0.00
+wa30-ee6fef47    0/9       0.00
+
+wrote plans_all25.json

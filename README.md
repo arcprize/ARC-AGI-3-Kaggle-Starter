@@ -1,249 +1,236 @@
-# ARC Prize 2026 — Local Dev Starter
+# ARC-AGI-3 Agent Optimization Research
 
-**Go from zero to your first Kaggle submission in about 10 minutes, without
-ever opening the Kaggle notebook editor.**
+> A Qwen-led ARC-AGI-3 solver with a deliberately bounded online world-model sidecar, plus the historical graft experiments that informed it.
 
-This is a starter kit for the [ARC Prize 2026 — ARC-AGI-3](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3)
-competition. You'll edit one Python file on your laptop, see it actually play
-the real game environments locally, and push it to Kaggle as a submission with
-a single command.
+## Research Overview
 
-No Docker. No `submission.json` to hand-write. No copy-pasting between your
-editor and a notebook.
+This repository documents our end-to-end research pipeline for building, analyzing, and iteratively improving an autonomous AI agent that solves interactive video-game-style reasoning puzzles in the [ARC-AGI-3](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3) competition. Our approach treats agent performance as a function of controllable variables — context memory capacity, prompt-level deliberation strategies, action-batch discipline, and cross-instance knowledge transfer — and applies rigorous single-variable ablation methodology to isolate causal effects on the competition scoring metric.
 
----
+### Research Methodology
 
-## What you need before you start
+Our work follows a structured experimental pipeline:
 
-- **Python 3.12** (the competition's `arc-agi` package requires it)
-  - macOS: `brew install python@3.12`
-  - Ubuntu: `sudo apt install python3.12 python3.12-venv`
-  - Windows: install from [python.org](https://www.python.org/downloads/)
-- **git** (to clone the official agent framework)
-- **A Kaggle account** with the competition rules accepted
-  ([accept here](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/rules))
+1. **Hypothesis Formation**: Each experiment targets a specific bottleneck identified through transcript forensics, scoring formula analysis, or competitive intelligence from top-performing agents.
+2. **Single-Variable Isolation**: We change exactly one configuration parameter per experiment to establish causal attribution (not just correlation) between changes and score movements.
+3. **Quantitative Evaluation**: Every experiment is evaluated against the quadratic RHAE scoring formula: $\text{Score}_{\text{level}} = \min\bigl(115,\;(\text{baseline}/\text{actions})^2 \times 100\bigr)$, ensuring we measure what matters.
+4. **Post-Mortem Analysis**: Failed experiments are analyzed for root cause — we extract more signal from regressions than from successes.
 
-That's it. No GPU required for the starter agent.
+### Key Research Findings
 
----
-
-## Quick start
-
-```bash
-# 1.  Clone this repo and step in
-git clone https://github.com/arcprize/ARC-AGI-3-Kaggle-Starter.git
-cd ARC-AGI-3-Kaggle-Starter
-
-# 2.  Drop your Kaggle API token (kaggle.com → Settings → Create New Token)
-#     into the project-local .kaggle/ folder (NOT your home directory)
-mkdir -p .kaggle && echo "KGAT_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" > .kaggle/access_token
-chmod 600 .kaggle/access_token
-
-# 3.  One-time setup: venv, dependencies, framework
-make setup
-
-# 4.  Open agent/my_agent.py to see the random-action starter, then edit
-#     it to make a better submission. This is the only file you change.
-
-# 5.  Run it locally against every game in the competition (takes seconds)
-make play-local
-
-# 6.  Push it to Kaggle as a submission notebook
-make submit
-
-# 7.  Watch the run
-make status
-
-# 8.  When status shows "complete", open the notebook on kaggle.com,
-#     find your kernel, click "Submit to Competition" in the top
-#     right, and pick `submission.parquet` from the Output File
-#     dropdown. That's one of your 5 daily submissions.
-```
-
-That's the entire loop. Steps 4–7 are what you'll repeat as you iterate;
-step 8 is the deliberate moment when you spend a daily submission.
-
----
-
-## The one file you edit: `agent/my_agent.py`
-
-This is the only file you normally touch. It defines a class called `MyAgent`
-with two methods:
-
-```python
-class MyAgent(Agent):
-    def is_done(self, frames, latest_frame) -> bool:
-        """Return True when your agent wants to stop playing."""
-        ...
-
-    def choose_action(self, frames, latest_frame) -> GameAction:
-        """Look at the game state and return the next action."""
-        ...
-```
-
-The starter version picks random actions — a baseline that proves your whole
-pipeline works end-to-end. Replace the body of `choose_action` with your
-strategy. Everything else (Kaggle plumbing, submission file format, game
-orchestration) is handled for you.
-
----
-
-## What happens when you run `make submit`
-
-The competition is a *code* competition: you submit a notebook, Kaggle runs it
-twice.
-
-```diagram
-   make submit
-       │
-       ▼
-   ┌─────────────────────────────────────┐
-   │  Kaggle Phase A: Save & Run All     │
-   │  ─ Runs your notebook in their      │
-   │    real environment                 │
-   │  ─ Validates that your code         │
-   │    executes without errors          │
-   │  ─ make status shows "complete"     │
-   └─────────────────┬───────────────────┘
-                     │
-                     │  You click "Submit to Competition"
-                     │  on the kernel page
-                     ▼
-   ┌─────────────────────────────────────┐
-   │  Kaggle Phase B: Competition Rerun  │
-   │  ─ Your agent actually plays the    │
-   │    hidden game set                  │
-   │  ─ Your leaderboard score appears   │
-   └─────────────────────────────────────┘
-```
-
-`make submit` builds and uploads the notebook (Phase A). After
-`make status` reports `complete`, open the kernel on kaggle.com and click
-**"Submit to Competition"** to enter Phase B and get a leaderboard score.
-
-> **You only get 5 official submissions per day**, so it pays to be
-> confident before you submit: get `make play-local` passing, then submit.
-
-> **Heads up:** Before your first `make submit`, open
-> [`notebooks/kernel-metadata.json`](notebooks/kernel-metadata.json) and
-> replace `REPLACE_WITH_YOUR_USERNAME` with your Kaggle handle. The Makefile
-> will refuse to push until you do.
-
-### Choosing an accelerator
-
-The notebook is generated with a **T4 GPU** by default (matches Kaggle's
-sample submission). To change it, open
-[`scripts/build_notebook.py`](scripts/build_notebook.py) and edit **one
-line** near the top:
-
-```python
-ACCELERATOR = "t4"     # change "t4" to one of: cpu, t4, p100, rtx6000
-```
-
-Then re-run `make submit`. That's it — both the notebook metadata and
-[`notebooks/kernel-metadata.json`](notebooks/kernel-metadata.json) get
-updated automatically.
-
-| Value | Hardware | When to use |
+| Finding | Method | Impact |
 |---|---|---|
-| `"cpu"` | No GPU | The random starter, or any non-ML agent |
-| `"t4"` | Nvidia T4 ×2 | **Default.** Small models, fast iteration |
-| `"p100"` | Nvidia P100 | Single big-memory GPU |
-| `"rtx6000"` | Nvidia RTX 6000 (`g4-standard-48`) | Heavy ML; **ARC-AGI-3 exclusive**, burns GPU quota faster |
+| **Recovery R2 probe is net-negative** | Controlled ablation (Exp 1 vs 2) | Injecting 16 scripted probe actions at `PROBE_MIN_ACTS=120` destroys ~97% of level score due to quadratic penalty. Proven causal. |
+| **Context window 57344 is too aggressive** | Real Kaggle submission (Exp 4) | 88% context utilization causes throughput degradation. Optimal calibration: 51200 tokens (78% of vLLM server capacity). |
+| **Schema grafts ARE active** | Source code audit (corrected prior assumption) | `schema_void.py`, `schema_notes.py`, `schema_helpers.py` all exist in the deployed dataset and are processed by `composite.py`. Previous documentation incorrectly classified them as inert. |
+| **Multi-variable stacking masks causal signals** | Post-mortem of Exp 3 (0.82 regression) | Stacking `recovery` + `banking` + `transfer` + 3 schema flags in one submission made it impossible to attribute the 1.33→0.82 regression to any single change. |
 
-RTX 6000 is reserved for ARC-AGI-3 notebooks only — don't use it for early
-iteration. All accelerated Kaggle sessions have internet disabled, which is
-already the default in this kit.
+## Experiment Results
 
----
+| # | Configuration Delta | Kaggle Score | Direction | Key Observation |
+|---|---|---|---|---|
+| Baseline | `{efficiency, retry_guard, shortcircuit}` | **1.33** | — | Floor configuration |
+| Exp 2 | + `recovery: True` | (local only) | ↓ 0.89→0.03 | R2 probe tax on tn36: 183→244 actions |
+| Exp 3 | + `recovery` + `banking` + `transfer` + schema flags | **0.82** | ↓ 39% | Multi-variable confound; `recovery` dominant |
+| Exp 4 | + `context_window: 57344` | **0.91** | ↓ 32% | Context too aggressive; throughput degraded |
+| Exp 5 | + `context_window: 51200` + `schema_notes` + `schema_void` + `transfer` (NO recovery) | **PENDING** | Expected ↑ | Removes proven negatives, adds validated positives |
 
-## All the commands
+## Technical Architecture
 
-| Command | What it does |
+The agent is built on the [Tufa Labs TAAF framework](https://www.kaggle.com/datasets/thtennant/taaf-kaggle-source-share-fork) with a modular graft composition system:
+
+```
+┌─────────────────────────────────────────────────┐
+│  Benchmark.run()                                │
+│  ├── ShortCircuitHarnessSolver (no-op trimmer)  │
+│  │   └── SchemaVoidMixin (batch tail trimmer)   │
+│  ├── TransferHarnessSolver (cross-clone replay) │
+│  │   └── BankingHarnessSolver (win-then-replay) │
+│  └── Analyzer Chain:                            │
+│      ├── RetryGuard (outermost)                 │
+│      └── EfficiencyToolAgent (innermost)        │
+│          └── SchemaNotesToolAgent (prompt note)  │
+│              └── ToolAgent + Qwen3.6-27B-FP8    │
+└─────────────────────────────────────────────────┘
+```
+
+Each graft is individually flag-gated, blanket-guarded (any error degrades to stock behavior), and composable via the `composite.install(bm, flags={})` entry point.
+
+### Current v20/v21 submission paths
+
+The diagram above describes the historical graft research. The active Kaggle
+candidate keeps the exact, measured v12 Qwen run as its primary planner and
+adds no dependency on the unavailable `taaf_grafts` package.
+
+```text
+Qwen primary planner
+        │ action/frame history
+        ▼
+online world model ──► movement + passability + click semantics + HUD filtering
+        │
+        ├── verified cross-level route/click: at most 4 single actions per level
+        └── otherwise: return control to Qwen unchanged
+```
+
+The v20 sidecar waits for at least 24 history entries, then learns only from
+observed transitions. At level boundaries it retains stable mechanics but clears
+board-specific state. It can act only when it has strong evidence from an
+earlier completed level: replaying a route toward a proven goal color, or
+issuing one central click after a high-confidence `step` classification.
+
+The separate v21 candidate adds the intended mental loop: it grades a learned
+forward model against real, held-out movement transitions; searches candidate
+routes in that model for free; and intervenes only if a complete rollout lowers
+a learned objective. It then executes **one** predicted action, observes its
+outcome, and re-plans. v20 skips even this mental-model observation path, so it
+remains the conservative control. Neither candidate is a claim of private-score
+improvement until independently submitted to Kaggle.
+
+## Repository Structure
+
+```
+├── docs/
+│   ├── IDEAS.md              # Prioritized experiment roadmap (11 experiments, 4 tiers)
+│   ├── EXPERIMENT_LOG.md     # Chronological experiment results with quantitative analysis
+│   ├── ARCHITECTURE.md       # Four-codebase architectural breakdown
+│   ├── MODULES.md            # Per-file module documentation with flag mappings
+│   └── QUESTIONS.md          # Open research questions with resolution tracking
+├── experiment a/             # Exp 4: context_window=57344 (scored 0.91)
+│   ├── sam-learning.ipynb    # Submission notebook
+│   └── results (3).zip      # Full benchmark output (events, prompts, diagnostics)
+├── experiment e/             # Exp 3: full stack with recovery (scored 0.82)
+│   ├── sam-agent-33.ipynb    # Submission notebook
+│   └── results (3).zip      # Full benchmark output
+├── 1.33 scored in .../       # Reference baseline notebook (scored 1.33)
+│   ├── arc3-duck-v12 (1).ipynb
+│   └── archive (2).zip      # Source bundle with all graft modules
+├── datasets/                 # Deployed Kaggle dataset bundle (taaf source share fork)
+├── arc3x/                    # Online world-model sidecar
+│   ├── percept.py            # Frame deltas, object masks, HUD filtering
+│   ├── mind.py               # Movement and passability hypotheses
+│   ├── clicks.py             # Learned click semantics
+│   ├── dream.py              # Self-grading forward model and free rollouts
+│   └── autopilot.py          # Conservative Qwen-compatible controller
+├── tools/                    # Notebook build and validation tooling
+├── create_experiment_notebook.py  # Automated notebook generator for experiments A-E
+├── verify_grafts.py          # Local graft installation verification suite
+└── parse_exp_*.py            # Benchmark result analysis scripts
+```
+
+## Scoring Formula & Optimization Target
+
+The ARC-AGI-3 competition scores agents using a **quadratic efficiency-weighted** formula:
+
+$$\text{Score}_{\text{level}} = \min\left(115,\;\left(\frac{\text{human\_baseline\_actions}}{\text{ai\_actions}}\right)^2 \times 100\right)$$
+
+This means:
+- Reducing actions from 200→100 yields a **4× score improvement**
+- Reducing actions from 100→50 yields another **4× improvement**
+- A single wasted action batch can destroy an entire level's score contribution
+
+Our optimization strategy targets all three levers:
+1. **Reduce wasted actions** (context window, schema void, shortcircuit)
+2. **Improve action quality** (schema notes prompt steering)
+3. **Multiply efficiency across clones** (transfer/banking cross-instance replay)
+
+## Tools & Infrastructure
+
+| Tool | Purpose |
 |---|---|
-| `make setup` | One-time install: Python venv, `arc-agi`, `kaggle` CLI, clones the framework |
-| `make play-local` | Runs your agent against every game in the dataset, locally |
-| `make play-local GAME=ls20` | Same, but only one game (faster while debugging) |
-| `make verify-local` | 30-second smoke test on two games |
-| `make list-games` | Print every game id available |
-| `make pull-sample` | Download the official sample agent for reference |
-| `make notebook` | Build the Kaggle notebook from your agent (no push) |
-| `make submit` | Build the notebook **and** push it to Kaggle |
-| `make status` | Check the status of your most recent Kaggle run |
-| `make clean` | Remove the venv, downloads, and generated notebook |
+| `create_experiment_notebook.py` | One-command notebook generation for any experiment config (A-E) |
+| `verify_grafts.py` | Offline graft installation verification with mocked Kaggle dependencies |
+| `parse_exp_a.py` / `parse_exp_e.py` | Automated benchmark.json score extraction and analysis |
 
----
+## Competition Context
 
-## Why this setup, instead of editing in the Kaggle notebook?
+- **Competition**: [ARC Prize 2026 — ARC-AGI-3](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3)
+- **Current v12-derived candidates**: Qwen3.8-27B-FP8 served through the original Kaggle/vLLM setup
+- **Agent Framework**: Tufa Labs TAAF (The Agent Architecture Framework)
+- **Runtime**: ~2h 20m per submission, ~110 clones across ~25 game families
 
-Three reasons:
+## Current state and local validation
 
-1. **Iteration speed.** Editing in your normal IDE, then `make play-local`,
-   gives you a real-game-engine feedback loop in seconds. The Kaggle editor's
-   loop is *minutes* per change.
-2. **No environment surprises.** The local `arc-agi` PyPI package hosts the
-   same game engine the Kaggle gateway runs. If it works locally, it works on
-   Kaggle.
-3. **Your code stays in git.** Notebooks are awful for diffs and code review.
-   Here your real work lives in [`agent/my_agent.py`](agent/my_agent.py); the
-   notebook is just an auto-generated deployment artifact.
+The checked-in `arc3x` solver is the active research implementation. The
+frame-0 marker detector remains experimental: its diagnostic currently passes
+23/25 coverage but fails the source-grounded `tu93` check, so it is not wired
+into the planner. This is intentional until an objective detector is validated.
+The human-mind learner in `arc3x/mindgraft.py` now treats level changes as scene
+cuts and excludes them from motion and geometry learning, preventing a new board
+from poisoning the previous level's internal model.
+`arc3x/pilot.py` also maintains a history-only progress ledger: colors that
+ratchet down or up across ordinary play can become objective evidence without
+hard-coding a game or color. This is guarded against large floods and clock-like
+HUD counters, and has regression tests in `tests/test_progress_pilot.py`.
+On laboratory levels it now also covers the learned-reachable map and tries
+context-sensitive non-movement actions at adjacent unknown objects. Both rules
+use only observed controls, geometry, and transitions. Board-specific state is
+cleared at a level transition while the learned mechanics model is retained for
+the next level.
 
----
+The current local pilot benchmark is a development diagnostic, not a claim of
+general solving. Under the fixed 25-game public suite and a 60-turn/3,000-action
+pilot harness, it clears at least one level in **6/25** games and at least two
+levels in **1/25**, for a mean score of **0.662**. The cleared games are
+`lp85`, `ls20`, `m0r0`, `r11l`, `sc25`, and `tn36`; `tn36` clears two levels.
+This is up from 3/25 and 0.156 before online click semantics. The pre-defined
+public split is 4/17 clears on tuning games and 2/8 on the holdout, so the
+change is not confined to the games used for iteration, but the private
+competition score and all-games coverage remain unknown until Kaggle runs the
+notebook. It does not yet meet a 10-game target.
 
-## Project layout
+Run the fast validation checks from the repository root:
 
+```powershell
+$env:PYTHONPATH = "."
+.venv\Scripts\python.exe -m compileall -q arc3x tools
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+.venv\Scripts\python.exe arc3x\why_markers.py --steps 400
 ```
-.
-├── agent/
-│   └── my_agent.py             ★ The file you edit
-├── scripts/
-│   ├── play_local.py           Runs your agent against real games
-│   ├── build_notebook.py       Packages your agent into a Kaggle notebook
-│   └── slim_framework.py       Trims framework deps so install is light
-├── notebooks/
-│   ├── kernel-metadata.json    Edit once: your Kaggle username
-│   └── submission.ipynb        Auto-generated, never edit by hand
-├── vendor/                     Cloned framework (gitignored)
-├── .venv/                      Python 3.12 venv (gitignored)
-├── .kaggle/                    Your project-local Kaggle token (gitignored)
-└── Makefile
+
+The full scored suite is intentionally separate because it is CPU-intensive:
+`arc3x\suite.py --split both -w 10 --budget 3000`.
+
+To regenerate the v20/v21 Kaggle notebooks from the known 2.14-scoring v12 base:
+
+```powershell
+.venv\Scripts\python.exe tools\build_mind_notebook.py
 ```
 
----
+This produces three notebooks:
 
-## Troubleshooting
+- `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v20-v12-baseline-safety.ipynb`
+  is code-identical to the v12 benchmark configuration, with only historic
+  execution outputs cleared. Use this if maintaining the measured 2.14 private
+  baseline is the priority.
+- `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v20-v12-sidecar.ipynb`
+  retains the same v12 Qwen3.8 model attachment metadata and source-bundle
+  configuration, and adds a cautious sidecar after the first 24 observed
+  transitions. The sidecar is limited to four single-action, high-confidence
+  interventions per level and has no dependency on the later `taaf_grafts`
+  import, which failed in the recorded v15 run.
+- `1.33 scored in arc agi 3 competiotn in kaggle\arc3-duck-v21-v12-mental-simulation.ipynb`
+  is the separate mental-simulation experiment. It preserves Qwen's opening,
+  requires either eight held-out movement predictions or four held-out
+  paint/teleport click predictions at >=80% accuracy, and executes only the
+  first action of an objective-improving simulated plan before observing and
+  re-planning.
 
-**`make setup` fails: `python3.12: command not found`**
-Install Python 3.12 — the `arc-agi` package requires it. macOS:
-`brew install python@3.12`.
+The known private Kaggle score for v12 is **2.14**. The separate 5.04 value is
+an offline six-game, four-pass diagnostic mean, not a private-leaderboard
+result. The sidecar's private score remains unmeasured and must not be treated
+as an improvement in advance. Submit the source-equivalent safety notebook
+first, then run v20 and v21 as separate A/B experiments.
 
-**`make submit` says "edit kernel-metadata.json"**
-You haven't replaced `REPLACE_WITH_YOUR_USERNAME` in
-[`notebooks/kernel-metadata.json`](notebooks/kernel-metadata.json) yet.
+For a local, no-LLM diagnostic of the production `Pilot` path (not comparable
+to Qwen or Kaggle scoring), run:
 
-**`make submit` says `401 Unauthorized`**
-Your Kaggle token is missing or invalid. Generate a fresh one from your
-[Kaggle Settings page](https://www.kaggle.com/settings) and overwrite
-`.kaggle/access_token`.
+```powershell
+.venv\Scripts\python.exe arc3x\pilot_harness.py tn36 --budget 300
+```
 
-**`make play-local` says "Could not create environment"**
-Your machine couldn't reach the ARC-AGI API to download the game source on
-first run. Check your internet, then try again — once downloaded, games are
-cached in `environment_files/` and you're fully offline.
+It records how often the mental model has enough held-out predictive evidence,
+how often it finds an internal plan, and why it abstains. This is the correct
+place to improve observation/model learning before loosening the action gate.
 
-**My local score is 0.0**
-That's expected for the random starter agent. Your job is to make it
-non-zero. 🙂
+## Kaggle submission description (623/750 characters)
 
----
-
-## Where to go next
-
-- Read the [ARC-AGI-3 docs](https://docs.arcprize.org/) to understand the
-  benchmark.
-- `make pull-sample` to study Kaggle's reference agent (the same one
-  currently sitting on the leaderboard).
-- The competition's [discussion forum](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/discussion)
-  for community Q&A.
-
-Good luck. Looking forward to seeing what you build.
+> Architecture: a Qwen3.8 planning agent is the primary solver, wrapped by a lightweight online world-model sidecar. From action/frame history it induces movement rules, passability, click semantics (teleport, paint, widget, or inert), and masks HUD/countdown noise. It carries only stable mechanics across level boundaries while clearing board-specific state. The sidecar waits through the opening, then can take only a few single, model-verified actions toward a goal proven by an earlier level; otherwise Qwen continues unchanged. The aim is not a hard-coded game solver, but reusable causal knowledge learned during play.

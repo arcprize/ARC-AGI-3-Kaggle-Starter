@@ -1,0 +1,63 @@
+Further Reading
+Orchestrate agents across multiple games.
+Swarms
+ Copy page
+Swarms are used to orchestrate your agent across multiple games simultaneously.
+Each swarm:
+Running the Agent Swarm
+The agent swarm is executed through main.py, which manages agent execution across
+multiple games with automatic scorecard tracking.
+Swarm Command
+Creates one agent instance per 
+Runs all agents concurrently using threads
+Automatically manages  opening and closing
+Handles cleanup when all agents complete
+Provides a link to view  online
+git clone https://github.com/arcprize/ARC-AGI-3-Agents.git
+cd ARC-AGI-3-Agents
+uv run main.py --agent <agent_name> [--game <game_filter>] [--tags <tag_list>]
+game
+scorecard
+replay
+Further Reading Swarms
+7/2/26, 9:52 PM Swarms - ARC-AGI-3 Docs
+https://docs.arcprize.org/swarms 1/3
+CLI Arguments
+Argument Short Required Description
+--agent -a Yes Choose which agent to run.
+Available agents can be found in
+the agents/  directory.
+--game -g No Filter  by ID prefix. Can be
+comma-separated for multiple
+filters (e.g., ls20,ft09 ). If not
+specified, the agent plays all
+available games.
+--tags -t No Comma-separated list of tags for
+the scorecard (e.g.,
+experiment,v1.0 ). Tags help
+categorize and track different
+agent runs. Helpful when you
+want to compare different
+agents. Tags will be recorded on
+your .
+Examples
+# Run the random agent on all games
+uv run main.py --agent=random
+# Run an LLM agent on only the ls20 game
+uv run main.py --agent=llm --game=ls20
+# Run with custom tags for tracking
+uv run main.py --agent=llm --tags="experiment,gpt-4,baseline"
+# Run against an explicit list of games
+uv run main.py --agent=random --game="ls20,ft09"
+games
+scorecards
+7/2/26, 9:52 PM Swarms - ARC-AGI-3 Docs
+https://docs.arcprize.org/swarms 2/3
+Was this page helpful?
+ Yes
+ No
+ Suggest edits
+Full Play Test ARC Prize 2026
+Powered by
+7/2/26, 9:52 PM Swarms - ARC-AGI-3 Docs
+https://docs.arcprize.org/swarms 3/3

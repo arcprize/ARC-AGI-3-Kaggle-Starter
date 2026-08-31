@@ -1,0 +1,4 @@
+git status:
+  ARC3-Inference                   aa69123     DIRTY  add-kaggle-share-flag     Add flag to use shareable notebook
+  tufa-arc-agi-framework           fe9f7c4     clean  submission-share-mode-bugfix  Fix dataset mapping, spell Isaiah's name properly
+  re-arc-3                         57e46d619d  pinned  master                    (non-editable)

@@ -1,0 +1,18 @@
+{
+  "game_id": "tr87-cd924810",
+  "title": "TR87",
+  "default_fps": 10,
+  "tags": [
+    "keyboard"
+  ],
+  "baseline_actions": [
+    54,
+    58,
+    40,
+    45,
+    71,
+    146
+  ],
+  "local_dir": "environment_files/tr87/cd924810",
+  "date_downloaded": "2026-04-08T20:07:48.580272+00:00"
+}

@@ -1,0 +1,32 @@
+click probe: 25 games, 250 random actions each, clicks at uniformly random cells, predicting the last 30%
+
+  ar25   unknown( 0%)  clicks=  0/0   of 250  active=  0%  spoke=    -  exact=    -  content=    -  live=    -(0)  chrome=   0px  no clicks offered
+  bp35     paint( 6%)  clicks= 63/21  of 250  active=100%  spoke= 100%  exact=   0%  content=   0%  live= 100%(21)  chrome=   0px
+  cd82    widget(94%)  clicks= 24/10  of 250  active= 71%  spoke=   0%  exact=    -  content=    -  live=  33%(9)  chrome=   0px
+  cn04    widget(89%)  clicks= 27/8   of 250  active= 33%  spoke=   0%  exact=    -  content=    -  live=  38%(8)  chrome=   0px
+  dc22    widget(95%)  clicks= 31/18  of 250  active= 65%  spoke=   0%  exact=    -  content=    -  live=  44%(18)  chrome=   0px
+  ft09     inert(94%)  clicks=175/75  of 250  active=  6%  spoke= 100%  exact=  99%  content=  99%  live=  99%(75)  chrome=   0px
+  g50t   unknown( 0%)  clicks=  0/0   of 250  active=  0%  spoke=    -  exact=    -  content=    -  live=    -(0)  chrome=   0px  no clicks offered
+  ka59    widget(95%)  clicks= 35/10  of 250  active= 63%  spoke=   0%  exact=    -  content=    -  live=  78%(9)  chrome=   0px
+  lf52    widget(97%)  clicks= 32/12  of 250  active=100%  spoke=   0%  exact=    -  content=    -  live= 100%(12)  chrome=   0px
+  lp85     inert(98%)  clicks=175/75  of 250  active=  2%  spoke= 100%  exact=  95%  content=  95%  live= 100%(68)  chrome=   0px
+  ls20   unknown( 0%)  clicks=  0/0   of 250  active=  0%  spoke=    -  exact=    -  content=    -  live=    -(0)  chrome=   0px  no clicks offered
+  m0r0    widget(100%)  clicks= 33/10  of 250  active= 42%  spoke=   0%  exact=    -  content=    -  live=  80%(10)  chrome=   0px
+  r11l  teleport(72%)  clicks=175/75  of 250  active=100%  spoke=   0%  exact=    -  content=    -  live= 100%(74)  chrome=   0px
+  re86   unknown( 0%)  clicks=  0/0   of 250  active=  0%  spoke=    -  exact=    -  content=    -  live=    -(0)  chrome=   0px  no clicks offered
+  s5i5    widget(99%)  clicks=175/75  of 250  active=100%  spoke=   0%  exact=    -  content=    -  live= 100%(71)  chrome=   0px
+  sb26     inert(96%)  clicks= 85/31  of 250  active=  4%  spoke= 100%  exact=  90%  content=  90%  live=  89%(28)  chrome=   0px
+  sc25     inert(93%)  clicks= 30/18  of 250  active=  7%  spoke= 100%  exact=  94%  content=  94%  live= 100%(18)  chrome=   0px
+  sk48   unknown( 0%)  clicks=  0/0   of 250  active=  0%  spoke=    -  exact=    -  content=    -  live=    -(0)  chrome=   0px  no clicks offered
+  sp80    widget(100%)  clicks= 30/13  of 250  active=100%  spoke=   0%  exact=    -  content=    -  live= 100%(11)  chrome=   0px
+  su15     paint( 7%)  clicks=175/75  of 250  active= 90%  spoke= 100%  exact=   1%  content=   1%  live= 100%(73)  chrome=   0px
+  tn36    widget(97%)  clicks=175/75  of 250  active=100%  spoke=   0%  exact=    -  content=    -  live= 100%(74)  chrome=   0px
+  tr87   unknown( 0%)  clicks=  0/0   of 250  active=  0%  spoke=    -  exact=    -  content=    -  live=    -(0)  chrome=   0px  no clicks offered
+  tu93   unknown( 0%)  clicks=  0/0   of 250  active=  0%  spoke=    -  exact=    -  content=    -  live=    -(0)  chrome=   0px  no clicks offered
+  vc33    widget(100%)  clicks=175/75  of 250  active=100%  spoke=   0%  exact=    -  content=    -  live= 100%(75)  chrome=   0px
+  wa30   unknown( 0%)  clicks=  0/0   of 250  active=  0%  spoke=    -  exact=    -  content=    -  live=    -(0)  chrome=   0px  no clicks offered
+
+17 of 25 games had >= 4 training clicks
+taxonomy: widget=10  inert=4  paint=2  teleport=1
+held-out clicks: 676   spoke: 295 (44%)   exact: 65%   content: 65%
+live/dead call: 625/654 = 96%

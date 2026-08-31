@@ -1,0 +1,70 @@
+
+=== tune: 17 games ===
+  bp35   0/9 levels  score   0.00  actions   3001  charged [3001, 0, 0, 0] vs base [21, 48, 44, 38]
+         stuck on L0 for 3001 actions: steerx461,imagine:noplanx461,cover:coveredx461,frontier:pushedx460
+  lp85   1/8 levels  score   2.78  actions   3001  charged [6, 2995, 0, 0] vs base [17, 38, 31, 16]
+         stuck on L1 for 2995 actions: nosteerx83,click:progressx78,click:changex70,steerx65
+  r11l   0/6 levels  score   0.00  actions   3001  charged [3001, 0, 0, 0] vs base [22, 33, 51, 26]
+         stuck on L0 for 3001 actions: noobjectivex160,click:changex160,nosteerx151,steerx28
+  g50t   0/7 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [78, 175, 179, 230]
+         stuck on L0 for 3000 actions: steerx100,imagine:noplanx100,cover:coveredx100,frontier:pushedx99
+  dc22   0/6 levels  score   0.00  actions   3001  charged [3001, 0, 0, 0] vs base [59, 102, 67, 98]
+         stuck on L0 for 3001 actions: steerx363,imagine:noplanx363,frontier:pushedx363,cover:coveredx362
+  ar25   0/8 levels  score   0.00  actions   3001  charged [3001, 0, 0, 0] vs base [32, 50, 75, 37]
+         stuck on L0 for 3001 actions: steerx87,imagine:noplanx87,cover:coveredx87,frontier:pushedx86
+  ka59   0/7 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [28, 109, 51, 51]
+         stuck on L0 for 3000 actions: steerx1673,imagine:noplanx1673,cover:coveredx1673,frontier:pushedx1673
+  ls20   1/7 levels  score   0.24  actions   3000  charged [85, 2915, 0, 0] vs base [22, 123, 73, 84]
+         stuck on L1 for 2915 actions: steerx12,roundfailx12,goal:stuckx11,cover:coveredx11
+  sc25   0/6 levels  score   0.00  actions   3001  charged [3001, 0, 0, 0] vs base [36, 6, 32, 83]
+         stuck on L0 for 3001 actions: steerx61,imagine:noplanx61,cover:coveredx61,frontier:pushedx61
+  sb26   0/8 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [18, 28, 18, 19]
+         stuck on L0 for 3000 actions: steerx87,imagine:noplanx87,cover:coveredx87,frontier:pushedx87
+  su15   0/9 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [22, 42, 26, 115]
+         stuck on L0 for 3000 actions: nosteerx2864,noobjectivex2842,click:changex2842,click:progressx22
+  sp80   0/6 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [39, 58, 25, 148]
+         stuck on L0 for 3000 actions: steerx12,imagine:noplanx12,roundfailx12,cover:coveredx11
+  re86   0/8 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [26, 42, 86, 108]
+         stuck on L0 for 3000 actions: steerx76,imagine:noplanx76,cover:coveredx76,frontier:pushedx75
+  tr87   0/6 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [54, 58, 40, 45]
+         stuck on L0 for 3000 actions: steerx34,imagine:noplanx34,cover:coveredx34,frontier:pushedx34
+  tu93   0/9 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [19, 16, 34, 42]
+         stuck on L0 for 3000 actions: steerx24,cover:coveredx24,frontier:pushedx24,roundfailx24
+  wa30   0/9 levels  score   0.00  actions   3002  charged [3002, 0, 0, 0] vs base [71, 119, 183, 98]
+         stuck on L0 for 3002 actions: steerx25,imagine:noplanx25,cover:coveredx25,frontier:pushedx25
+  cn04   0/6 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [29, 54, 85, 300]
+         stuck on L0 for 3000 actions: steerx2648,imagine:noplanx2648,frontier:pushedx2648,cover:coveredx2647
+MEAN 0.177   over 17 games
+levels cleared:  0 lvl x15  1 lvl x2
+  reached L1+: 2/17   reached L2+: 0/17
+why the run stopped, summed over games: noobjective=8334  click:change=8274  steer=5756  imagine:noplan=5754  cover:covered=5752  frontier:pushed=5750  nosteer=3109  roundfail=462
+(179s, 10 workers, budget 3000)
+
+=== hold: 8 games ===
+  cd82   0/6 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [55, 8, 41, 21]
+         stuck on L0 for 3000 actions: nosteerx483,use:changex483,click:changex483,noobjectivex482
+  s5i5   0/8 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [20, 89, 106, 54]
+         stuck on L0 for 3000 actions: nosteerx51,click:changex41,click:progressx33,roundfailx24
+  sk48   0/8 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [61, 177, 101, 103]
+         stuck on L0 for 3000 actions: steerx42,imagine:noplanx42,cover:coveredx42,frontier:pushedx42
+  ft09   1/6 levels  score   0.01  actions   3001  charged [1128, 1873, 0, 0] vs base [43, 12, 23, 28]
+         stuck on L1 for 1873 actions: nosteerx51,click:progressx26,click:changex25,roundfailx25
+  vc33   1/7 levels  score   0.00  actions   3001  charged [441, 2560, 0, 0] vs base [7, 18, 44, 61]
+         stuck on L1 for 2560 actions: steerx23,imagine:noplanx23,goal:stuckx23,frontier:pushedx23
+  tn36   0/7 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [32, 72, 26, 40]
+         stuck on L0 for 3000 actions: nosteerx2950,noobjectivex2940,click:changex2940,click:progressx10
+  lf52   0/10 levels  score   0.00  actions   3000  charged [3000, 0, 0, 0] vs base [32, 81, 60, 71]
+         stuck on L0 for 3000 actions: click:changex65,nosteerx47,steerx41,imagine:noplanx41
+  m0r0   1/6 levels  score   0.03  actions   3001  charged [376, 2625, 0, 0] vs base [30, 111, 203, 26]
+         stuck on L1 for 2625 actions: steerx28,imagine:noplanx28,goal:stuckx28,cover:coveredx27
+MEAN 0.005   over 8 games
+levels cleared:  0 lvl x5  1 lvl x3
+  reached L1+: 3/8   reached L2+: 0/8
+why the run stopped, summed over games: click:change=3586  nosteer=3582  noobjective=3479  use:change=526  steer=157  imagine:noplan=157  cover:covered=155  frontier:pushed=153
+(109s, 10 workers, budget 3000)
+
+OVERFIT CHECK   tune 0.177   hold 0.005   ratio 0.03
+  a ratio near 1 means the mechanism is general. hold well below
+  tune means it was fitted to games it was allowed to see, and the
+  110 private games will behave like hold, not like tune.
+detail -> scratch\suite_convention.json

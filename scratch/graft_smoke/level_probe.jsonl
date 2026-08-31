@@ -1,0 +1,2 @@
+{"game_id": "probe01", "state": "gave_up", "levels_completed": 1, "number_of_levels": 4, "final_score": 10.0, "actions_per_level": [6, 2994, 0, 0], "base_actions_per_level": [17, 38, 31, 16], "wallclock_s": 0.0, "turns": 0, "generated_tokens": 1234, "note": null}
+{"game_id": "probe01", "state": "gave_up", "levels_completed": 1, "number_of_levels": 4, "final_score": 0.0, "actions_per_level": [6, 2994, 0, 0], "base_actions_per_level": null, "wallclock_s": 0.0, "turns": 0, "generated_tokens": 1234, "note": null}

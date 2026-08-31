@@ -1,0 +1,75 @@
+Get Started
+ARC-AGI-3 is an Interactive Reasoning Benchmark designed to measure an AI Agentʼs
+ability to generalize in novel, unseen environments.
+ARC-AGI-3 Quickstart
+ Copy page
+Traditionally, to measure AI, static benchmarks
+have been the yardstick. These work well for
+evaluating LLMs and AI reasoning systems.
+However, to evaluate frontier AI agent systems,
+we need new tools that measure:
+By building agents that can play ARC-AGI-3,
+youʼre directly contributing to the frontier of AI
+research.
+Learn more aboutARC-AGI-3.
+Can you build an agent to beatthis game?
+Play your first ARC-AGI-3 environment
+1. Install the 
+Exploration
+Percept →  Plan →  Action
+Memory
+Goal Acquisition
+Alignment
+uv init
+uv add arc-agi
+# or
+pip install arc-agi
+ARC-AGI Toolkit
+Get Started ARC-AGI-3 Quickstart
+7/2/26, 9:53 PM ARC-AGI-3 Quickstart - ARC-AGI-3 Docs
+https://docs.arcprize.org 1/3
+2. Set your ARC_API_KEY
+Optionally set your ARC_API_KEY. If no key is provided, an anonymous key will be used.
+However, registering for an API key will give you access to public games at release. 
+3. Play your first game
+Create a file called my-play.py:
+Run it:
+You should see the game render in your terminal and a scorecard with your results.
+🎉  Congratulations! You just played your first ARC-AGI-3 environment programatically.
+Do you feel the AGI yet?
+Next Steps
+After running your first environment:
+export ARC_API_KEY="your-api-key-here"
+# or
+echo 'ARC_API_KEY=your-api-key-here' > .env
+import arc_agi
+from arcengine import GameAction
+arc = arc_agi.Arcade()
+env = arc.make("ls20", render_mode="terminal")
+# Take a few actions
+for _ in range(10):
+    env.step(GameAction.ACTION1)
+print(arc.get_scorecard())
+python play.py
+Get an
+ARC_API_KEY
+7/2/26, 9:53 PM ARC-AGI-3 Quickstart - ARC-AGI-3 Docs
+https://docs.arcprize.org 2/3
+Was this page helpful?
+ Yes
+ No
+ Suggest edits
+API Keys
+Powered by
+1. Make it fast - Use env = arc.make("ls20") without render_mode to hit +2K FPS
+2. Try a different game - Run env = arc.make("ft09", render_mode="terminal") to play a
+another game. See a list of games available at  or via the 
+3. Use an agent - Explore  or .
+4. Explore the ARC-AGI Toolkit -  allows quick and easy integration with
+ARC-AGI Environments.
+arcprize.org/tasks ARC-AGI
+Toolkit
+agent templates create your own agent
+The ARC-AGI Toolkit
+7/2/26, 9:53 PM ARC-AGI-3 Quickstart - ARC-AGI-3 Docs
+https://docs.arcprize.org 3/3

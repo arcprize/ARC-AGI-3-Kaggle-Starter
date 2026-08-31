@@ -1,0 +1,1357 @@
+[
+ {
+  "game_id": "ar25-0c556536",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 8,
+  "actions": 3001,
+  "resets": 27,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3001,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   32,
+   50,
+   75,
+   37,
+   89,
+   159,
+   233,
+   73
+  ],
+  "notes": {
+   "0": {
+    "steer": 87,
+    "imagine:noplan": 87,
+    "cover:covered": 87,
+    "frontier:used": 1,
+    "frontier:pushed": 86,
+    "use:progress": 39,
+    "use:change": 47,
+    "click:nothing": 47,
+    "roundfail": 47,
+    "retire:stale": 2
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3001
+ },
+ {
+  "game_id": "bp35-0a0ad940",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 9,
+  "actions": 3001,
+  "resets": 49,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3001,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   21,
+   48,
+   44,
+   38,
+   33,
+   87,
+   86,
+   131,
+   163
+  ],
+  "notes": {
+   "0": {
+    "steer": 461,
+    "noobjective": 456,
+    "imagine:noplan": 461,
+    "cover:covered": 461,
+    "frontier:used": 1,
+    "frontier:pushed": 460,
+    "click:progress": 1,
+    "click:change": 449,
+    "roundfail": 13,
+    "retire:stale": 1,
+    "click:nothing": 10
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3001
+ },
+ {
+  "game_id": "cn04-2fe56bfb",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 6,
+  "actions": 3000,
+  "resets": 40,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   29,
+   54,
+   85,
+   300,
+   208,
+   113
+  ],
+  "notes": {
+   "0": {
+    "steer": 2648,
+    "imagine:noplan": 2648,
+    "cover:covered": 2647,
+    "frontier:pushed": 2648,
+    "click:progress": 3,
+    "click:change": 2644,
+    "roundfail": 2,
+    "retire:floor": 1,
+    "noobjective": 2643,
+    "cover:budget": 1,
+    "click:nothing": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "dc22-fdcac232",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 6,
+  "actions": 3001,
+  "resets": 29,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3001,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   59,
+   102,
+   67,
+   98,
+   324,
+   578
+  ],
+  "notes": {
+   "0": {
+    "steer": 363,
+    "noobjective": 343,
+    "imagine:noplan": 363,
+    "cover:covered": 362,
+    "frontier:pushed": 363,
+    "click:progress": 16,
+    "click:change": 346,
+    "roundfail": 5,
+    "retire:stale": 2,
+    "cover:budget": 1,
+    "click:nothing": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3001
+ },
+ {
+  "game_id": "g50t-5849a774",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 7,
+  "actions": 3000,
+  "resets": 50,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   78,
+   175,
+   179,
+   230,
+   96,
+   54,
+   67
+  ],
+  "notes": {
+   "0": {
+    "steer": 100,
+    "imagine:noplan": 100,
+    "cover:covered": 100,
+    "frontier:used": 1,
+    "frontier:pushed": 99,
+    "use:change": 1,
+    "roundfail": 99,
+    "idleround": 35,
+    "retire:stale": 1,
+    "noobjective": 93
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "ka59-38d34dbb",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 7,
+  "actions": 3000,
+  "resets": 30,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   28,
+   109,
+   51,
+   51,
+   33,
+   132,
+   326
+  ],
+  "notes": {
+   "0": {
+    "steer": 1673,
+    "noobjective": 1672,
+    "imagine:noplan": 1673,
+    "cover:covered": 1673,
+    "frontier:pushed": 1673,
+    "click:change": 1673,
+    "roundfail": 1,
+    "retire:floor": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "lp85-305b61c3",
+  "score": 2.7777777777777777,
+  "levels_completed": 1,
+  "n_levels": 8,
+  "actions": 3001,
+  "resets": 22,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   115.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   6,
+   2995,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   17,
+   38,
+   31,
+   16,
+   41,
+   60,
+   26,
+   159
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 5,
+    "noobjective": 5,
+    "click:change": 4,
+    "click:level": 1
+   },
+   "1": {
+    "nosteer": 83,
+    "noobjective": 34,
+    "click:change": 70,
+    "click:progress": 78,
+    "roundfail": 37,
+    "steer": 65,
+    "imagine:noplan": 65,
+    "goal:stuck": 65,
+    "cover:covered": 65,
+    "frontier:pushed": 65,
+    "retire:stale": 1
+   }
+  },
+  "stalled_on": 1,
+  "stall_cost": 2995
+ },
+ {
+  "game_id": "ls20-9607627b",
+  "score": 0.23924864063272375,
+  "levels_completed": 1,
+  "n_levels": 7,
+  "actions": 3000,
+  "resets": 49,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   6.7,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   85,
+   2915,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   22,
+   123,
+   73,
+   84,
+   96,
+   192,
+   186
+  ],
+  "notes": {
+   "0": {
+    "steer": 2,
+    "noobjective": 1,
+    "imagine:noplan": 2,
+    "cover:covered": 2,
+    "frontier:pushed": 2,
+    "roundfail": 2
+   },
+   "1": {
+    "steer": 12,
+    "imagine:budget": 1,
+    "goal:stuck": 11,
+    "cover:covered": 11,
+    "frontier:pushed": 11,
+    "roundfail": 12,
+    "retire:stale": 1,
+    "imagine:noplan": 11,
+    "noobjective": 10,
+    "goal:spent": 1,
+    "cover:budget": 1,
+    "frontier:budget": 1
+   }
+  },
+  "stalled_on": 1,
+  "stall_cost": 2915
+ },
+ {
+  "game_id": "r11l-495a7899",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 6,
+  "actions": 3001,
+  "resets": 51,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3001,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   22,
+   33,
+   51,
+   26,
+   52,
+   49
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 151,
+    "noobjective": 160,
+    "click:change": 160,
+    "click:progress": 18,
+    "retire:floor": 1,
+    "roundfail": 2,
+    "idleround": 1,
+    "steer": 28,
+    "imagine:noplan": 28,
+    "cover:covered": 28,
+    "frontier:pushed": 28,
+    "click:nothing": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3001
+ },
+ {
+  "game_id": "re86-8af5384d",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 8,
+  "actions": 3000,
+  "resets": 45,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   26,
+   42,
+   86,
+   108,
+   189,
+   139,
+   424,
+   241
+  ],
+  "notes": {
+   "0": {
+    "steer": 76,
+    "imagine:noplan": 76,
+    "cover:covered": 76,
+    "frontier:used": 1,
+    "frontier:pushed": 75,
+    "use:change": 2,
+    "roundfail": 75,
+    "noobjective": 74,
+    "idleround": 23,
+    "exhausted": 5
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "sb26-7fbdac44",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 8,
+  "actions": 3000,
+  "resets": 21,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   18,
+   28,
+   18,
+   19,
+   31,
+   23,
+   58,
+   18
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 11,
+    "noobjective": 4,
+    "use:change": 7,
+    "click:change": 41,
+    "use:progress": 45,
+    "roundfail": 38,
+    "steer": 87,
+    "imagine:noplan": 87,
+    "cover:covered": 87,
+    "frontier:pushed": 87,
+    "retire:stale": 1,
+    "click:progress": 12
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "sc25-635fd71a",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 6,
+  "actions": 3001,
+  "resets": 42,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3001,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   36,
+   6,
+   32,
+   83,
+   143,
+   50
+  ],
+  "notes": {
+   "0": {
+    "steer": 61,
+    "noobjective": 1,
+    "imagine:noplan": 61,
+    "cover:covered": 61,
+    "frontier:pushed": 61,
+    "use:progress": 6,
+    "use:change": 1,
+    "click:change": 38,
+    "roundfail": 38,
+    "retire:floor": 1,
+    "click:progress": 17
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3001
+ },
+ {
+  "game_id": "sp80-589a99af",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 6,
+  "actions": 3000,
+  "resets": 101,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   39,
+   58,
+   25,
+   148,
+   96,
+   152
+  ],
+  "notes": {
+   "0": {
+    "steer": 12,
+    "imagine:noplan": 12,
+    "cover:covered": 11,
+    "frontier:pushed": 11,
+    "use:change": 11,
+    "click:change": 11,
+    "roundfail": 12,
+    "retire:floor": 1,
+    "cover:budget": 1,
+    "frontier:budget": 1,
+    "click:nothing": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "su15-1944f8ab",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 9,
+  "actions": 3000,
+  "resets": 91,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   22,
+   42,
+   26,
+   115,
+   36,
+   31,
+   8,
+   40,
+   41
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 2864,
+    "noobjective": 2842,
+    "click:change": 2842,
+    "click:progress": 22,
+    "retire:floor": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "tr87-cd924810",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 6,
+  "actions": 3000,
+  "resets": 33,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   54,
+   58,
+   40,
+   45,
+   71,
+   146
+  ],
+  "notes": {
+   "0": {
+    "steer": 34,
+    "noobjective": 1,
+    "imagine:noplan": 34,
+    "cover:covered": 34,
+    "frontier:pushed": 34,
+    "use:progress": 2,
+    "use:change": 32,
+    "roundfail": 32,
+    "retire:floor": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "tu93-0768757b",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 9,
+  "actions": 3000,
+  "resets": 70,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   19,
+   16,
+   34,
+   42,
+   123,
+   80,
+   14,
+   23,
+   111
+  ],
+  "notes": {
+   "0": {
+    "steer": 24,
+    "imagine:noplan": 23,
+    "cover:covered": 24,
+    "frontier:pushed": 24,
+    "use:change": 2,
+    "roundfail": 24,
+    "retire:floor": 1,
+    "idleround": 1,
+    "imagine:budget": 1,
+    "retire:stale": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "wa30-ee6fef47",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 9,
+  "actions": 3002,
+  "resets": 26,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3002,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   71,
+   119,
+   183,
+   98,
+   368,
+   68,
+   79,
+   442,
+   415
+  ],
+  "notes": {
+   "0": {
+    "steer": 25,
+    "noobjective": 1,
+    "imagine:noplan": 25,
+    "cover:covered": 25,
+    "frontier:pushed": 25,
+    "roundfail": 25,
+    "use:change": 17,
+    "retire:stale": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3002
+ },
+ {
+  "game_id": "cd82-fb555c5d",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 6,
+  "actions": 3000,
+  "resets": 30,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   55,
+   8,
+   41,
+   21,
+   23,
+   23
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 483,
+    "use:change": 483,
+    "click:change": 483,
+    "noobjective": 482
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "ft09-0d8bbf25",
+  "score": 0.006919893605045257,
+  "levels_completed": 1,
+  "n_levels": 6,
+  "actions": 3001,
+  "resets": 46,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.15,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   1128,
+   1873,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   43,
+   12,
+   23,
+   28,
+   65,
+   37
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 78,
+    "noobjective": 2,
+    "click:change": 15,
+    "click:progress": 63,
+    "retire:floor": 1,
+    "roundfail": 14
+   },
+   "1": {
+    "nosteer": 51,
+    "click:progress": 26,
+    "click:change": 25,
+    "roundfail": 25
+   }
+  },
+  "stalled_on": 1,
+  "stall_cost": 1873
+ },
+ {
+  "game_id": "lf52-271a04aa",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 10,
+  "actions": 3000,
+  "resets": 55,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   32,
+   81,
+   60,
+   71,
+   205,
+   148,
+   244,
+   109,
+   164,
+   225
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 47,
+    "click:progress": 23,
+    "click:change": 65,
+    "noobjective": 39,
+    "roundfail": 26,
+    "steer": 41,
+    "retire:floor": 3,
+    "imagine:noplan": 41,
+    "cover:covered": 41,
+    "frontier:pushed": 41
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "m0r0-492f87ba",
+  "score": 0.030314298648386476,
+  "levels_completed": 1,
+  "n_levels": 6,
+  "actions": 3001,
+  "resets": 26,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.64,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   376,
+   2625,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   30,
+   111,
+   203,
+   26,
+   500,
+   237
+  ],
+  "notes": {
+   "0": {
+    "steer": 7,
+    "imagine:noplan": 7,
+    "cover:covered": 7,
+    "frontier:pushed": 6,
+    "use:change": 3,
+    "click:change": 6,
+    "roundfail": 6,
+    "frontier:level": 1
+   },
+   "1": {
+    "steer": 28,
+    "imagine:noplan": 28,
+    "goal:stuck": 28,
+    "cover:covered": 27,
+    "frontier:used": 3,
+    "frontier:pushed": 24,
+    "click:progress": 6,
+    "use:progress": 6,
+    "click:change": 12,
+    "roundfail": 13,
+    "use:change": 5,
+    "cover:budget": 1,
+    "frontier:budget": 1,
+    "click:nothing": 1
+   }
+  },
+  "stalled_on": 1,
+  "stall_cost": 2625
+ },
+ {
+  "game_id": "s5i5-18d95033",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 8,
+  "actions": 3000,
+  "resets": 60,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   20,
+   89,
+   106,
+   54,
+   162,
+   38,
+   86,
+   83
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 51,
+    "noobjective": 18,
+    "click:change": 41,
+    "click:progress": 33,
+    "roundfail": 24,
+    "steer": 23,
+    "imagine:noplan": 23,
+    "cover:covered": 23,
+    "frontier:pushed": 23,
+    "retire:stale": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "sk48-d8078629",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 8,
+  "actions": 3000,
+  "resets": 19,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   61,
+   177,
+   101,
+   103,
+   230,
+   181,
+   125,
+   92
+  ],
+  "notes": {
+   "0": {
+    "steer": 42,
+    "imagine:noplan": 42,
+    "cover:covered": 42,
+    "frontier:pushed": 42,
+    "use:progress": 4,
+    "use:change": 38,
+    "click:nothing": 38,
+    "roundfail": 38,
+    "retire:stale": 1
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "tn36-ef4dde99",
+  "score": 0.0,
+  "levels_completed": 0,
+  "n_levels": 7,
+  "actions": 3000,
+  "resets": 49,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   3000,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   32,
+   72,
+   26,
+   40,
+   30,
+   55,
+   62
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 2950,
+    "noobjective": 2940,
+    "click:change": 2940,
+    "click:progress": 10
+   }
+  },
+  "stalled_on": 0,
+  "stall_cost": 3000
+ },
+ {
+  "game_id": "vc33-5430563c",
+  "score": 0.0008998308318036208,
+  "levels_completed": 1,
+  "n_levels": 7,
+  "actions": 3001,
+  "resets": 66,
+  "state": "NOT_FINISHED",
+  "level_scores": [
+   0.03,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "level_actions": [
+   441,
+   2560,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "baselines": [
+   7,
+   18,
+   44,
+   61,
+   131,
+   34,
+   152
+  ],
+  "notes": {
+   "0": {
+    "nosteer": 101,
+    "noobjective": 18,
+    "click:change": 21,
+    "click:progress": 83,
+    "retire:floor": 1,
+    "roundfail": 4,
+    "steer": 3,
+    "imagine:noplan": 3,
+    "cover:covered": 3,
+    "frontier:pushed": 3
+   },
+   "1": {
+    "steer": 23,
+    "imagine:noplan": 23,
+    "goal:stuck": 23,
+    "cover:covered": 22,
+    "frontier:pushed": 23,
+    "click:progress": 2,
+    "click:change": 20,
+    "roundfail": 21,
+    "cover:budget": 1,
+    "click:nothing": 1
+   }
+  },
+  "stalled_on": 1,
+  "stall_cost": 2560
+ }
+]

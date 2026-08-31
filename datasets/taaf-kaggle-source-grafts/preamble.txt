@@ -1,0 +1,7 @@
+benchmark.label : anim-20260807-anim
+benchmark.solver: HarnessSolver(label='duck-harness', runtime_environment=None, job_dir=None, soft_end_time=None, minimal_diagnostics=False, model='local', analyzer_timeout=900.0, max_actions_per_game=None, max_runtime_s_per_game=7920.0, concurrency=28, save_request_logs=False, hard_noop_guard=True, animation_awareness=True, start_local_server=False, local_server_config='', local_server_api_key_file='', local_server_repo_dir='/Users/jakobbruggen/Desktop/duck-harness/ARC3-Inference', local_server_port=None, local_server_tensor_parallel_size=None, local_server_count=1, cancel_drain_timeout_s=120.0)
+benchmark.passes: 4
+benchmark.games : 6
+git status:
+  ARC3-Inference                   9158303     DIRTY  feature/animation-awareness  feat: proactively suggest animation retrieval when stuck (s…
+  tufa-arc-agi-framework           9158303     DIRTY  feature/animation-awareness  feat: proactively suggest animation retrieval when stuck (s…

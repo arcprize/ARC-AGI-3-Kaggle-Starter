@@ -1,0 +1,82 @@
+Agents
+Run repeatable agent evaluations.
+Benchmarking Tooling (BETA)
+ Copy page
+Currently in beta, our Benchmarking Agent will be the standard way to measure AI
+performance across model providers.
+ARC Harness arcagi3
+This is a developer harness for building and benchmarking agentic research workflows
+on the ARC-AGI-3 corpus of environments.
+When to use it
+Quickstart
+Prerequisites
+Compare model versions or prompt strategies on the same game set.
+Detect regressions after code or prompt changes.
+Generate official scorecards and replays for sharing.
+Experimenting with multiple custom agentic architectures.
+Python: 3.9+
+uv: recommended package manager. Install from  or curl -LsSf
+https://astral.sh/uv/install.sh | sh
+ARC-AGI-3 API key: required to talk to the ARC server. Sign up for a key 
+uv.pm
+here
+Agents Benchmarking Tooling (BETA)
+7/2/26, 9:52 PM Benchmarking Tooling (BETA) - ARC-AGI-3 Docs
+https://docs.arcprize.org/benchmarking-agent 1/4
+Install
+Clone the repository:
+From repo root:
+This creates a virtual environment (if needed) and installs the project and dependencies
+in editable mode.
+Alternatively, without uv:
+Setting up your environment
+Set the ARC API key and your provider keys. You can put them in a .env file (see
+) or export them in your shell.
+Provider key links:
+git clone git@github.com:arcprize/arc-agi-3-benchmarking.git
+cd arc-agi-3-benchmarking
+uv venv
+uv sync
+pip install -e .
+.env.example
+OpenAI
+Anthropic
+Google Gemini
+OpenRouter
+Fireworks
+Groq
+DeepSeek
+Hugging Face
+7/2/26, 9:52 PM Benchmarking Tooling (BETA) - ARC-AGI-3 Docs
+https://docs.arcprize.org/benchmarking-agent 2/4
+Check configuration:
+Select your game
+Pick your model
+Benchmark
+Scorecards
+When you run a benchmark, a scorecard is saved on the ARC server. If you are logged in,
+you can view them at .
+Learn More
+The  has more information than what is published here. Be sure
+to also reference how to  to start experimenting with new agentic
+architectures.
+uv run python -m arcagi3.runner --check
+uv run python -m arcagi3.runner --list-games
+uv run python -m arcagi3.runner --list-models
+uv run python -m arcagi3.runner \
+  --game_id ls20 \
+  --config gpt-5-2-openrouter \
+  --max_actions 3
+arcprize.org/scorecards
+benchmarking README
+create your own agent
+7/2/26, 9:52 PM Benchmarking Tooling (BETA) - ARC-AGI-3 Docs
+https://docs.arcprize.org/benchmarking-agent 3/4
+Was this page helpful?
+ Yes
+ No
+ Suggest edits
+LLM Agents AgentOps
+Powered by
+7/2/26, 9:52 PM Benchmarking Tooling (BETA) - ARC-AGI-3 Docs
+https://docs.arcprize.org/benchmarking-agent 4/4

@@ -1,0 +1,5 @@
+{
+  "efficiency_rider": "appended 541 chars to the per-turn efficiency note",
+  "family_priors": "appended 5799 chars to the agent system prompt",
+  "level_probe": "wrapped taaf.game.Game.finish_game -> D:\\AI_ARMY\\arc_agi3_solver\\scratch\\graft_smoke\\level_probe.jsonl"
+}

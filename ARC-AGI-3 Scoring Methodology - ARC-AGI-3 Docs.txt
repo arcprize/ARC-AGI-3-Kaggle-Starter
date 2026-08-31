@@ -1,0 +1,74 @@
+Scoring
+How ARC-AGI-3 scoring works
+ARC-AGI-3 Scoring Methodology
+ Copy page
+ARC-AGI-3 uses Relative Human Action Efficiency (RHAE, pronounced “ray”) to score AI
+systems.
+RHAE measures per-level action efficiency compared to a human baseline, normalized
+per game, across all games.
+What Gets Measured
+AI is scored on two criteria:
+1. Completion — How many levels did the AI complete in each game?
+2. Efficiency — How many actions did the AI take compared to humans?
+What Counts as an Action
+An action is a discrete interaction with the environment. Each turn where the agent
+submits a command, move, or input that affects the game state counts as an action.
+Internal operations that do not alter the environment (tool calls, reasoning steps, retries)
+are not counted as actions.
+Human Baseline
+Human baselines are established through controlled testing where participants play each
+ARC-AGI-3 game for the first time (having never seen the game before). For each game,
+Scoring ARC-AGI-3 Scoring Methodology
+7/2/26, 9:50 PM ARC-AGI-3 Scoring Methodology - ARC-AGI-3 Docs
+https://docs.arcprize.org/methodology 1/4
+multiple first-time players are observed, and the upper median human (by fewest
+actions) per level is recorded as the baseline.
+The upper median is used rather than the average. For an even number of players, the
+upper of the two middle entries is selected. For example, if four players complete a level,
+third place is the baseline; if five players complete it, third place is still the baseline.
+Using the upper median human per level:
+How Scoring Works
+Per-Level Scoring
+For each level the AI completes, calculate:
+Per-Level Score Cap
+The maximum score per level is capped at 1.15x human baseline. If an AI discovers a
+shortcut and completes a level faster than humans, it can receive at most 1.15.
+This ensures a single subpar level does not disproportionately drag down the overall
+score for an AI that generalizes well across an entire game.
+Per-Game Aggregation
+Reflects typical proficient human performance rather than outlier runs
+Reduces the impact of luck on any individual level
+Keeps the baseline grounded in real play, not theoretical speed-runs
+If human baseline is 10 actions and AI takes 10 →  level score is 1.0 (100%)
+If human baseline is 10 actions and AI takes 20 →  level score is 0.25 (25%)
+If human baseline is 10 actions and AI takes 1,00 →  level score is 0.01 (1%)
+level_score = (human_baseline_actions / ai_actions) ^ 2
+7/2/26, 9:50 PM ARC-AGI-3 Scoring Methodology - ARC-AGI-3 Docs
+https://docs.arcprize.org/methodology 2/4
+Was this page helpful?
+ Yes
+ No
+ Suggest edits
+Actions Scorecards
+The game score is the weighted average of all per-level scores, using the 1-indexed level
+number as the weight. This underweights the starting tutorial/easy levels and overweights
+the more difficult later levels where mastery must be demonstrated.
+The maximum game score is also determined by this weighted average structure — it is
+capped based on how many levels the AI actually completed. To unlock a maximum game
+score of 100%, the AI must complete all levels, including the final one.
+Example: A game has 5 levels and the AI completes only the first 4:
+No matter how efficiently the AI played levels 1–4, its game score cannot exceed 66.7%.
+Total Score
+Total score is the average of all game scores, resulting in a final score between 0% and
+100%.
+Score Interpretation
+Score Interpretation
+100% AI completes all games/levels while matching or surpassing human efficiency
+1-99% A mixture of level completion rates and efficiency relative to human baseline
+0% AI never completes a level across any game
+max_game_score = (1 + 2 + 3 + 4) / (1 + 2 + 3 + 4 + 5) = 10 / 15 = 66.7%
+7/2/26, 9:50 PM ARC-AGI-3 Scoring Methodology - ARC-AGI-3 Docs
+https://docs.arcprize.org/methodology 3/4
+Powered by
+7/2/26, 9:50 PM ARC-AGI-3 Scoring Methodology - ARC-AGI-3 Docs
+https://docs.arcprize.org/methodology 4/4
