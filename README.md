@@ -1,249 +1,117 @@
-# ARC Prize 2026 — Local Dev Starter
+# HypothesisWorld — Can an agent learn an unknown world by doing science?
 
-**Go from zero to your first Kaggle submission in about 10 minutes, without
-ever opening the Kaggle notebook editor.**
+HypothesisWorld is an open-source ARC-AGI-3 research agent built on the official
+[Kaggle Starter](https://github.com/arcprize/ARC-AGI-3-Kaggle-Starter) and compatible
+with the official [Agents framework](https://github.com/arcprize/ARC-AGI-3-Agents).
+It studies whether an agent can solve unfamiliar interactive environments by keeping
+competing explanations, choosing experiments that separate them, falsifying failed
+explanations, and planning with the world model that survives.
 
-This is a starter kit for the [ARC Prize 2026 — ARC-AGI-3](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3)
-competition. You'll edit one Python file on your laptop, see it actually play
-the real game environments locally, and push it to Kaggle as a submission with
-a single command.
+It is deliberately not a game-ID lookup table, a random policy presented as research,
+or an online LLM wrapper. The submission is deterministic, lightweight, and fully
+offline.
 
-No Docker. No `submission.json` to hand-write. No copy-pasting between your
-editor and a notebook.
+## Scientific loop
 
----
+```mermaid
+flowchart LR
+    O[Observe frame] --> P[Object-centric perception]
+    P --> H[Propose competing hypotheses]
+    H --> R[Predict candidate outcomes]
+    R --> E[Choose informative experiment]
+    E --> A[Act using available_actions]
+    A --> D[Observe structured state diff]
+    D --> F[Falsify, strengthen, or generate]
+    F --> W[Update compact world model]
+    W --> L[Short-horizon plan]
+    L --> R
+```
 
-## What you need before you start
+Every action is selected from the current frame's `available_actions`. Coordinate
+actions use object centroids, bounding-box corners, recent change regions, object
+boundaries, and deterministic coverage points—not uniform random clicks.
 
-- **Python 3.12** (the competition's `arc-agi` package requires it)
-  - macOS: `brew install python@3.12`
-  - Ubuntu: `sudo apt install python3.12 python3.12-venv`
-  - Windows: install from [python.org](https://www.python.org/downloads/)
-- **git** (to clone the official agent framework)
-- **A Kaggle account** with the competition rules accepted
-  ([accept here](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/rules))
+## Architecture
 
-That's it. No GPU required for the starter agent.
+| Module | Responsibility |
+|---|---|
+| `agent/perception.py` | Animation-frame normalization, background inference, connected objects, matching, motion, transformations, changes, and contacts |
+| `agent/state.py` | Immutable object-centric state, raw audit identity, abstract learning identity, and state-diff schema |
+| `agent/hypotheses.py` | Competing predictions, beliefs, support, contradictions, complexity, rejection, and hypothesis generation |
+| `agent/exploration.py` | Legal action candidates, salient coordinates, novelty, risk, and prediction-disagreement scoring |
+| `agent/world_model.py` | Online empirical state/action transition model with uncertainty |
+| `agent/memory.py` | Bounded transitions, visited states, tested actions, object persistence, rejected rules, progress, deaths, and wins |
+| `agent/planner.py` | Transition- and representation-confidence-gated short-horizon action values |
+| `agent/my_agent.py` | Official `Agent` interface adapter, lifecycle handling, and readable instrumentation |
+| `agent/config.py` | One-codepath ablation configuration |
 
----
+The architecture re-plans after each observation. Exploration remains active whenever
+the model is uncertain or competing predictions disagree.
 
-## Quick start
+## Ablations
+
+Set `HYPOTHESISWORLD_ABLATION` to:
+
+| Value | Variant |
+|---|---|
+| `A` | Random legal-action baseline; coordinates still remain valid |
+| `B` | Novelty and action-statistics exploration |
+| `C` | Empirical world model without explicit hypotheses |
+| `D` | Explicit hypotheses without information-gain selection |
+| `E` | Hypotheses plus prediction-disagreement experiments |
+| `F` | Full system: hypotheses, active experiments, memory, world model, and planning |
+
+Run a controlled sweep with:
 
 ```bash
-# 1.  Clone this repo and step in
-git clone https://github.com/arcprize/ARC-AGI-3-Kaggle-Starter.git
-cd ARC-AGI-3-Kaggle-Starter
+.venv/bin/python experiments/run_ablations.py --games ls20,vc33 --steps 100 --seeds 0,1,2
+```
 
-# 2.  Drop your Kaggle API token (kaggle.com → Settings → Create New Token)
-#     into the project-local .kaggle/ folder (NOT your home directory)
-mkdir -p .kaggle && echo "KGAT_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" > .kaggle/access_token
-chmod 600 .kaggle/access_token
+The state representation keeps a full-frame fingerprint for auditing and an
+object-centric fingerprint for learning. Border-connected components are treated as
+possible interface noise in the learning key but remain visible to perception and
+action generation. Raw-to-abstract alias counts reduce planning confidence when that
+assumption merges too many distinct screens.
 
-# 3.  One-time setup: venv, dependencies, framework
+The first controlled pilot and its limitations are recorded in
+[`experiments/reports/2026-09-15-stable-state-pilot.md`](experiments/reports/2026-09-15-stable-state-pilot.md).
+
+## Setup and verification
+
+Python 3.12 is required. The starter's original workflow remains intact:
+
+```bash
 make setup
-
-# 4.  Open agent/my_agent.py to see the random-action starter, then edit
-#     it to make a better submission. This is the only file you change.
-
-# 5.  Run it locally against every game in the competition (takes seconds)
-make play-local
-
-# 6.  Push it to Kaggle as a submission notebook
-make submit
-
-# 7.  Watch the run
-make status
-
-# 8.  When status shows "complete", open the notebook on kaggle.com,
-#     find your kernel, click "Submit to Competition" in the top
-#     right, and pick `submission.parquet` from the Output File
-#     dropdown. That's one of your 5 daily submissions.
+make test
+make verify-local
+make play-local GAME=ls20 STEPS=200
+make notebook
 ```
 
-That's the entire loop. Steps 4–7 are what you'll repeat as you iterate;
-step 8 is the deliberate moment when you spend a daily submission.
+`make submit` and `make status` retain the official Kaggle workflow. Before submitting,
+put your token in `.kaggle/access_token`, accept the competition rules, and replace
+`REPLACE_WITH_YOUR_USERNAME` in `notebooks/kernel-metadata.json`.
 
----
+`make notebook` embeds every Python file in `agent/` into the generated notebook and
+copies the package into the Kaggle framework at runtime. It installs only wheels from
+the competition dataset and makes no internet calls during evaluation.
 
-## The one file you edit: `agent/my_agent.py`
+## Instrumentation
 
-This is the only file you normally touch. It defines a class called `MyAgent`
-with two methods:
+Each step emits two structured `HYPOTHESISWORLD` log records:
 
-```python
-class MyAgent(Agent):
-    def is_done(self, frames, latest_frame) -> bool:
-        """Return True when your agent wants to stop playing."""
-        ...
+- `selection`: compact state, top beliefs, candidate predictions, information,
+  novelty, expected progress, risk, planning value, and selected experiment.
+- `outcome`: actual structured transition plus strengthened, falsified, and newly
+  generated hypotheses.
 
-    def choose_action(self, frames, latest_frame) -> GameAction:
-        """Look at the game state and return the next action."""
-        ...
-```
+The same concise record is attached to `GameAction.reasoning`, so official recordings
+retain the reason for each action.
 
-The starter version picks random actions — a baseline that proves your whole
-pipeline works end-to-end. Replace the body of `choose_action` with your
-strategy. Everything else (Kaggle plumbing, submission file format, game
-orchestration) is handled for you.
+## Research boundaries
 
----
-
-## What happens when you run `make submit`
-
-The competition is a *code* competition: you submit a notebook, Kaggle runs it
-twice.
-
-```diagram
-   make submit
-       │
-       ▼
-   ┌─────────────────────────────────────┐
-   │  Kaggle Phase A: Save & Run All     │
-   │  ─ Runs your notebook in their      │
-   │    real environment                 │
-   │  ─ Validates that your code         │
-   │    executes without errors          │
-   │  ─ make status shows "complete"     │
-   └─────────────────┬───────────────────┘
-                     │
-                     │  You click "Submit to Competition"
-                     │  on the kernel page
-                     ▼
-   ┌─────────────────────────────────────┐
-   │  Kaggle Phase B: Competition Rerun  │
-   │  ─ Your agent actually plays the    │
-   │    hidden game set                  │
-   │  ─ Your leaderboard score appears   │
-   └─────────────────────────────────────┘
-```
-
-`make submit` builds and uploads the notebook (Phase A). After
-`make status` reports `complete`, open the kernel on kaggle.com and click
-**"Submit to Competition"** to enter Phase B and get a leaderboard score.
-
-> **You only get 5 official submissions per day**, so it pays to be
-> confident before you submit: get `make play-local` passing, then submit.
-
-> **Heads up:** Before your first `make submit`, open
-> [`notebooks/kernel-metadata.json`](notebooks/kernel-metadata.json) and
-> replace `REPLACE_WITH_YOUR_USERNAME` with your Kaggle handle. The Makefile
-> will refuse to push until you do.
-
-### Choosing an accelerator
-
-The notebook is generated with a **T4 GPU** by default (matches Kaggle's
-sample submission). To change it, open
-[`scripts/build_notebook.py`](scripts/build_notebook.py) and edit **one
-line** near the top:
-
-```python
-ACCELERATOR = "t4"     # change "t4" to one of: cpu, t4, p100, rtx6000
-```
-
-Then re-run `make submit`. That's it — both the notebook metadata and
-[`notebooks/kernel-metadata.json`](notebooks/kernel-metadata.json) get
-updated automatically.
-
-| Value | Hardware | When to use |
-|---|---|---|
-| `"cpu"` | No GPU | The random starter, or any non-ML agent |
-| `"t4"` | Nvidia T4 ×2 | **Default.** Small models, fast iteration |
-| `"p100"` | Nvidia P100 | Single big-memory GPU |
-| `"rtx6000"` | Nvidia RTX 6000 (`g4-standard-48`) | Heavy ML; **ARC-AGI-3 exclusive**, burns GPU quota faster |
-
-RTX 6000 is reserved for ARC-AGI-3 notebooks only — don't use it for early
-iteration. All accelerated Kaggle sessions have internet disabled, which is
-already the default in this kit.
-
----
-
-## All the commands
-
-| Command | What it does |
-|---|---|
-| `make setup` | One-time install: Python venv, `arc-agi`, `kaggle` CLI, clones the framework |
-| `make play-local` | Runs your agent against every game in the dataset, locally |
-| `make play-local GAME=ls20` | Same, but only one game (faster while debugging) |
-| `make verify-local` | 30-second smoke test on two games |
-| `make list-games` | Print every game id available |
-| `make pull-sample` | Download the official sample agent for reference |
-| `make notebook` | Build the Kaggle notebook from your agent (no push) |
-| `make submit` | Build the notebook **and** push it to Kaggle |
-| `make status` | Check the status of your most recent Kaggle run |
-| `make clean` | Remove the venv, downloads, and generated notebook |
-
----
-
-## Why this setup, instead of editing in the Kaggle notebook?
-
-Three reasons:
-
-1. **Iteration speed.** Editing in your normal IDE, then `make play-local`,
-   gives you a real-game-engine feedback loop in seconds. The Kaggle editor's
-   loop is *minutes* per change.
-2. **No environment surprises.** The local `arc-agi` PyPI package hosts the
-   same game engine the Kaggle gateway runs. If it works locally, it works on
-   Kaggle.
-3. **Your code stays in git.** Notebooks are awful for diffs and code review.
-   Here your real work lives in [`agent/my_agent.py`](agent/my_agent.py); the
-   notebook is just an auto-generated deployment artifact.
-
----
-
-## Project layout
-
-```
-.
-├── agent/
-│   └── my_agent.py             ★ The file you edit
-├── scripts/
-│   ├── play_local.py           Runs your agent against real games
-│   ├── build_notebook.py       Packages your agent into a Kaggle notebook
-│   └── slim_framework.py       Trims framework deps so install is light
-├── notebooks/
-│   ├── kernel-metadata.json    Edit once: your Kaggle username
-│   └── submission.ipynb        Auto-generated, never edit by hand
-├── vendor/                     Cloned framework (gitignored)
-├── .venv/                      Python 3.12 venv (gitignored)
-├── .kaggle/                    Your project-local Kaggle token (gitignored)
-└── Makefile
-```
-
----
-
-## Troubleshooting
-
-**`make setup` fails: `python3.12: command not found`**
-Install Python 3.12 — the `arc-agi` package requires it. macOS:
-`brew install python@3.12`.
-
-**`make submit` says "edit kernel-metadata.json"**
-You haven't replaced `REPLACE_WITH_YOUR_USERNAME` in
-[`notebooks/kernel-metadata.json`](notebooks/kernel-metadata.json) yet.
-
-**`make submit` says `401 Unauthorized`**
-Your Kaggle token is missing or invalid. Generate a fresh one from your
-[Kaggle Settings page](https://www.kaggle.com/settings) and overwrite
-`.kaggle/access_token`.
-
-**`make play-local` says "Could not create environment"**
-Your machine couldn't reach the ARC-AGI API to download the game source on
-first run. Check your internet, then try again — once downloaded, games are
-cached in `environment_files/` and you're fully offline.
-
-**My local score is 0.0**
-That's expected for the random starter agent. Your job is to make it
-non-zero. 🙂
-
----
-
-## Where to go next
-
-- Read the [ARC-AGI-3 docs](https://docs.arcprize.org/) to understand the
-  benchmark.
-- `make pull-sample` to study Kaggle's reference agent (the same one
-  currently sitting on the leaderboard).
-- The competition's [discussion forum](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/discussion)
-  for community Q&A.
-
-Good luck. Looking forward to seeing what you build.
+Current hypotheses describe observable transition outcomes. They are genuine explicit,
+falsifiable alternatives, but they do not yet induce relational programs or causal
+latent-state machines. Likewise, the planner uses learned empirical transitions rather
+than a full symbolic simulator. These limitations are the main research frontier, not
+hidden behind claims of solved general intelligence. See [RESEARCH_PLAN.md](RESEARCH_PLAN.md).

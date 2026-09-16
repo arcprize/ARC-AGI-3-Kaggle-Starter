@@ -1,10 +1,10 @@
-"""Splice the current `agent/my_agent.py` into `notebooks/submission.ipynb`.
+"""Package the modular `agent/` implementation into a submission notebook.
 
 The notebook follows the exact pattern used by Kaggle's official sample
 ("ARC3 Sample Submission - Stochastic Goose"):
 
   Cell 1: install the `arc-agi` wheel from the offline competition dataset.
-  Cell 2: write `my_agent.py` to /kaggle/working/ — its body is THIS file.
+  Cell 2+: write the HypothesisWorld package under /tmp/.
   Cell 3: if running inside the Kaggle competition rerun, wait for the
           gateway sidecar, copy the framework into /kaggle/working/, register
           MyAgent, and run `python main.py --agent myagent`.
@@ -13,6 +13,7 @@ The notebook follows the exact pattern used by Kaggle's official sample
 
 You don't normally need to call this directly — `make submit` runs it for you.
 """
+
 from __future__ import annotations
 
 import json
@@ -32,14 +33,14 @@ ACCELERATOR = "t4"
 
 # Internal mapping; don't edit unless Kaggle adds new options.
 _ACCELERATORS = {
-    "cpu":     {"name": "none",            "gpu": False},
-    "t4":      {"name": "nvidiaTeslaT4",   "gpu": True},
-    "p100":    {"name": "nvidiaTeslaP100", "gpu": True},
-    "rtx6000": {"name": "nvidiaRtx6000",   "gpu": True},
+    "cpu": {"name": "none", "gpu": False},
+    "t4": {"name": "nvidiaTeslaT4", "gpu": True},
+    "p100": {"name": "nvidiaTeslaP100", "gpu": True},
+    "rtx6000": {"name": "nvidiaRtx6000", "gpu": True},
 }
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENT_SRC = ROOT / "agent" / "my_agent.py"
+AGENT_DIR = ROOT / "agent"
 NOTEBOOK_PATH = ROOT / "notebooks" / "submission.ipynb"
 METADATA_PATH = ROOT / "notebooks" / "kernel-metadata.json"
 
@@ -59,9 +60,9 @@ def markdown_cell(source: str) -> dict:
 
 
 def build() -> dict:
-    if not AGENT_SRC.exists():
-        raise SystemExit(f"Could not find {AGENT_SRC}")
-    agent_body = AGENT_SRC.read_text()
+    agent_files = sorted(AGENT_DIR.glob("*.py"))
+    if not agent_files or not (AGENT_DIR / "my_agent.py").exists():
+        raise SystemExit(f"Could not find modular agent package at {AGENT_DIR}")
 
     install_cell = code_cell(
         "!pip install --no-index --find-links \\\n"
@@ -73,8 +74,10 @@ def build() -> dict:
     # as a notebook output. Otherwise the "Submit to Competition" UI would
     # offer it as a candidate submission file alongside submission.parquet,
     # and an unlucky default selection rejects the submission.
-    write_agent_cell = code_cell(
-        "%%writefile /tmp/my_agent.py\n" + agent_body
+    write_agent_cells = [code_cell("!mkdir -p /tmp/hypothesisworld")]
+    write_agent_cells.extend(
+        code_cell(f"%%writefile /tmp/hypothesisworld/{path.name}\n" + path.read_text())
+        for path in agent_files
     )
 
     run_cell_source = dedent(
@@ -90,9 +93,12 @@ def build() -> dict:
             !cp -r /kaggle/input/competitions/arc-prize-2026-arc-agi-3/ARC-AGI-3-Agents \\
                    /kaggle/working/ARC-AGI-3-Agents
 
-            # Drop our agent in as a framework template.
-            !cp /tmp/my_agent.py \\
-                /kaggle/working/ARC-AGI-3-Agents/agents/templates/my_agent.py
+            # Copy the complete offline package and add a framework adapter.
+            !cp -r /tmp/hypothesisworld \\
+                /kaggle/working/ARC-AGI-3-Agents/hypothesisworld
+            adapter = '/kaggle/working/ARC-AGI-3-Agents/agents/templates/my_agent.py'
+            with open(adapter, 'w') as f:
+                f.write('from hypothesisworld.my_agent import MyAgent\\n')
 
             # Register MyAgent in the framework's agent registry. We rewrite
             # __init__.py because the upstream version eagerly imports
@@ -153,8 +159,7 @@ def build() -> dict:
 
     if ACCELERATOR not in _ACCELERATORS:
         raise SystemExit(
-            f"Unknown ACCELERATOR={ACCELERATOR!r}. Pick one of: "
-            f"{sorted(_ACCELERATORS)}"
+            f"Unknown ACCELERATOR={ACCELERATOR!r}. Pick one of: {sorted(_ACCELERATORS)}"
         )
     accel = _ACCELERATORS[ACCELERATOR]
 
@@ -189,7 +194,7 @@ def build() -> dict:
                 "`make submit`."
             ),
             install_cell,
-            write_agent_cell,
+            *write_agent_cells,
             run_cell,
             dummy_submission_cell,
         ],
@@ -200,8 +205,10 @@ def build() -> dict:
 def main() -> None:
     NOTEBOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
     NOTEBOOK_PATH.write_text(json.dumps(build(), indent=1))
-    print(f"[build_notebook] Wrote {NOTEBOOK_PATH.relative_to(ROOT)}  "
-          f"(accelerator: {ACCELERATOR})")
+    print(
+        f"[build_notebook] Wrote {NOTEBOOK_PATH.relative_to(ROOT)}  "
+        f"(accelerator: {ACCELERATOR})"
+    )
 
     # Keep notebooks/kernel-metadata.json in sync so the user never has to
     # edit it just to flip CPU ↔ GPU.
@@ -211,8 +218,10 @@ def main() -> None:
         if meta.get("enable_gpu") != wanted:
             meta["enable_gpu"] = wanted
             METADATA_PATH.write_text(json.dumps(meta, indent=2) + "\n")
-            print(f"[build_notebook] Synced enable_gpu={wanted} in "
-                  f"{METADATA_PATH.relative_to(ROOT)}")
+            print(
+                f"[build_notebook] Synced enable_gpu={wanted} in "
+                f"{METADATA_PATH.relative_to(ROOT)}"
+            )
 
 
 if __name__ == "__main__":

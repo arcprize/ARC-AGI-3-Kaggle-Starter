@@ -1,87 +1,262 @@
-"""Your ARC-AGI-3 agent. This is the *only* file you should normally edit.
+"""Official-framework adapter for the HypothesisWorld research architecture."""
 
-`scripts/build_notebook.py` splices the contents of this file into the
-Kaggle submission notebook, so your local dev loop and your Kaggle
-submission stay in lock-step:
-
-    [edit my_agent.py] → [make play-local] → [make submit]
-
-The default body below is a port of the Stochastic Goose / random_agent
-sample — a known-good baseline that produces a valid submission and
-proves your end-to-end pipeline works. Replace `choose_action` with your
-real strategy.
-
-Contract (enforced by the ARC-AGI-3-Agents framework):
-  - Subclass `agents.agent.Agent`.
-  - Class must be named `MyAgent` (the notebook's __init__.py registers it).
-  - Implement `is_done(frames, latest_frame) -> bool`.
-  - Implement `choose_action(frames, latest_frame) -> GameAction`.
-"""
 from __future__ import annotations
 
+import json
+import logging
 import random
-import time
+from hashlib import blake2b
 from typing import Any
 
+from agents.agent import Agent
 from arcengine import FrameData, GameAction, GameState
 
-# When run inside the ARC-AGI-3-Agents framework (locally or on Kaggle)
-# the `agents` package is on sys.path, so this import resolves.
-from agents.agent import Agent
+from .config import AgentConfig
+from .exploration import (
+    ActionCandidate,
+    CandidateScore,
+    ExperimentSelector,
+    generate_candidates,
+)
+from .hypotheses import ActionKey, HypothesisEngine, HypothesisUpdate
+from .memory import CompactMemory
+from .perception import diff_states, perceive
+from .planner import ShortHorizonPlanner
+from .state import StateDiff, StructuredState
+from .world_model import WorldModel
+
+logger = logging.getLogger("hypothesisworld")
 
 
 class MyAgent(Agent):
-    """Picks legal actions uniformly at random. Replace with your strategy."""
+    """Learn by proposing, testing, and falsifying compact world rules."""
 
-    # Upper bound on actions per game; the framework also enforces global limits.
-    MAX_ACTIONS = 80
+    MAX_ACTIONS = 200
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Seed per game_id so replays from the same game are reproducible but
-        # different games explore independently.
-        seed = int(time.time() * 1_000_000) + hash(self.game_id) % 1_000_000
-        random.seed(seed)
+        self.config = AgentConfig.from_env()
+        self.MAX_ACTIONS = min(self.MAX_ACTIONS, self.config.max_actions)
+        seed_bytes = blake2b(
+            f"{self.game_id}:{self.config.random_seed}".encode(), digest_size=8
+        ).digest()
+        self.rng = random.Random(int.from_bytes(seed_bytes, "big"))
+        self.memory = CompactMemory(self.config.max_transitions)
+        self.hypotheses = HypothesisEngine(self.config.max_hypotheses_per_action)
+        self.world_model = WorldModel()
+        self.planner = ShortHorizonPlanner(
+            self.world_model,
+            self.memory,
+            self.config.planning_horizon,
+            self.config.planning_confidence,
+        )
+        self.selector = ExperimentSelector(
+            self.config,
+            self.memory,
+            self.hypotheses,
+            self.world_model,
+            self.planner,
+            self.rng,
+        )
+        self._previous_state: StructuredState | None = None
+        self._previous_levels = 0
+        self._pending_action: ActionKey | None = None
+        self._previous_diff: StateDiff | None = None
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}"
+        return f"{super().name}.hypothesisworld-{self.config.ablation.value}.{self.MAX_ACTIONS}"
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        # Stop once we win. Don't stop on GAME_OVER — we want to RESET and retry.
-        return latest_frame.state is GameState.WIN
+        return latest_frame.state is GameState.WIN or self.action_counter >= self.MAX_ACTIONS
 
-    def choose_action(
-        self, frames: list[FrameData], latest_frame: FrameData
-    ) -> GameAction:
-        # First call or after a death → reset the level.
+    @staticmethod
+    def _state_name(frame: FrameData) -> str:
+        return getattr(frame.state, "name", str(frame.state).split(".")[-1])
+
+    @staticmethod
+    def _legal_action_ids(frame: FrameData) -> list[int]:
+        ids: list[int] = []
+        for raw in frame.available_actions or []:
+            value = getattr(raw, "value", raw)
+            try:
+                action_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if action_id not in ids and action_id != 0:
+                ids.append(action_id)
+        return ids
+
+    def _observe_transition(
+        self, current: StructuredState, latest_frame: FrameData
+    ) -> HypothesisUpdate | None:
+        self.memory.observe_state(current, self.action_counter)
+        if self._previous_state is None or self._pending_action is None:
+            return None
+        progress_delta = int(latest_frame.levels_completed or 0) - self._previous_levels
+        diff = diff_states(
+            self._previous_state,
+            current,
+            progress_delta=progress_delta,
+            terminal=self._state_name(latest_frame),
+        )
+        self._previous_diff = diff
+        self.memory.record_transition(
+            self.action_counter,
+            self._previous_state,
+            self._pending_action,
+            current,
+            diff,
+        )
+        if self.config.uses_world_model:
+            self.world_model.update(self._previous_state, self._pending_action, current, diff)
+        update = None
+        if self.config.uses_hypotheses:
+            update = self.hypotheses.update(self._pending_action, diff, self.action_counter)
+            self.memory.remember_rejected(update.falsified, self.action_counter)
+        logger.info(
+            "HYPOTHESISWORLD %s",
+            json.dumps(
+                {
+                    "event": "outcome",
+                    "game_id": self.game_id,
+                    "ablation": self.config.ablation.value,
+                    "seed": self.config.random_seed,
+                    "step": self.action_counter,
+                    "action": self._pending_action.compact(),
+                    "actual": diff.compact(),
+                    "strengthened": list(update.strengthened) if update else [],
+                    "falsified": list(update.falsified) if update else [],
+                    "generated": list(update.generated) if update else [],
+                    "progress": latest_frame.levels_completed,
+                },
+                separators=(",", ":"),
+            ),
+        )
+        return update
+
+    def _reasoning(
+        self,
+        state: StructuredState,
+        ranking: list[CandidateScore],
+        selected: ActionCandidate,
+    ) -> dict[str, object]:
+        top_hypotheses = [
+            {
+                "id": hypothesis.hypothesis_id,
+                "belief": round(hypothesis.effective_belief, 3),
+                "description": hypothesis.description,
+            }
+            for hypothesis in self.hypotheses.top(self.config.log_top_hypotheses)
+        ]
+        candidates = [
+            {
+                "action": score.candidate.compact(),
+                "value": round(score.total, 3),
+                "progress": round(score.progress, 3),
+                "information": round(score.information, 3),
+                "novelty": round(score.novelty, 3),
+                "risk": round(score.risk, 3),
+                "planning": round(score.planning, 3),
+                "predictions": [
+                    {
+                        "outcome": prediction.label(),
+                        "belief": round(weight, 3),
+                        "hypothesis": hypothesis_id,
+                    }
+                    for prediction, weight, hypothesis_id in self.hypotheses.predict(
+                        score.candidate.key
+                    )[:4]
+                ]
+                if self.config.uses_hypotheses
+                else [],
+            }
+            for score in ranking[:8]
+        ]
+        return {
+            "agent": "HypothesisWorld",
+            "game_id": self.game_id,
+            "ablation": self.config.ablation.value,
+            "seed": self.config.random_seed,
+            "step": self.action_counter,
+            "state": {
+                "fingerprint": state.fingerprint,
+                "raw_fingerprint": state.raw_fingerprint,
+                "objects": len(state.objects),
+                "visited": self.memory.visited_states[state.fingerprint],
+                "unique_abstract_states": len(self.memory.visited_states),
+                "unique_raw_states": len(self.memory.raw_states),
+                "raw_aliases": len(self.memory.state_aliases[state.fingerprint]),
+                "persistent_object_types": len(self.memory.persistent_object_signatures()),
+                "transient_object_types": len(self.memory.transient_object_signatures),
+            },
+            "hypotheses": top_hypotheses,
+            "candidates": candidates,
+            "selected": selected.compact(),
+        }
+
+    def _reset(self, reason: str) -> GameAction:
+        self._previous_state = None
+        self._pending_action = None
+        self._previous_diff = None
+        action = GameAction.RESET
+        action.reasoning = {
+            "agent": "HypothesisWorld",
+            "selected": "RESET",
+            "why": reason,
+        }
+        return action
+
+    def append_frame(self, frame: FrameData) -> None:
+        """Consume outcomes immediately, including terminal WIN transitions."""
+        super().append_frame(frame)
+        if self._previous_state is None or self._pending_action is None:
+            return
+        current = perceive(frame)
+        self._observe_transition(current, frame)
+        self._previous_state = current
+        self._previous_levels = int(frame.levels_completed or 0)
+        self._pending_action = None
+
+    def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
+        state_name = self._state_name(latest_frame)
+        current = perceive(latest_frame)
+        if self._previous_state is None and current.width and current.height:
+            self.memory.observe_state(current, self.action_counter)
+
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            return GameAction.RESET
+            return self._reset(f"required by state {state_name}")
 
-        # ── Per-game strategy fork ───────────────────────────────────────────
-        # By default every game uses the same uniformly-random strategy in the
-        # `else` branch below. This `if` shows ONE example of giving a single
-        # game its own heuristic: on LS20 we bias the random pick so ACTION4
-        # is twice as likely as any other action. Add more `elif` branches to
-        # specialize other games.
-        #
-        # `self.game_id` is set by the framework. It may be the short id
-        # ("ls20") or include a version suffix ("ls20-9607627b"), so we
-        # compare on the prefix to be safe.
-        candidate_actions = [a for a in GameAction if a is not GameAction.RESET]
-        if self.game_id.split("-")[0] == "ls20":
-            weights = [2 if a is GameAction.ACTION4 else 1 for a in candidate_actions]
-            action = random.choices(candidate_actions, weights=weights, k=1)[0]
-        else:
-            action = random.choice(candidate_actions)
-        # ────────────────────────────────────────────────────────────────────
+        legal_ids = self._legal_action_ids(latest_frame)
+        if not legal_ids:
+            # The interface requires an action. RESET is the only safe recovery
+            # when a nonterminal frame unexpectedly exposes no legal actions.
+            return self._reset("no available_actions were exposed")
 
-        if action.is_complex():
-            # ACTION6 takes (x, y) coordinates on a 64×64 grid.
-            action.set_data(
-                {"x": random.randint(0, 63), "y": random.randint(0, 63)}
-            )
-            action.reasoning = {"why": "random complex action"}
-        else:
-            action.reasoning = f"random simple action: {action.value}"
+        candidates = generate_candidates(
+            legal_ids,
+            current,
+            self.memory,
+            self._previous_diff,
+            self.config.max_coordinate_candidates,
+        )
+        ranking = self.selector.rank(current, candidates)
+        if not ranking:
+            return self._reset("available_actions produced no candidates")
+        selected = ranking[0].candidate
+        reasoning = self._reasoning(current, ranking, selected)
+        logger.info(
+            "HYPOTHESISWORLD %s",
+            json.dumps({"event": "selection", **reasoning}, separators=(",", ":")),
+        )
+
+        action = GameAction.from_id(selected.key.action_id)
+        if selected.coordinates is not None:
+            x, y = selected.coordinates
+            action.set_data({"x": x, "y": y})
+        action.reasoning = reasoning
+
+        self._previous_state = current
+        self._previous_levels = int(latest_frame.levels_completed or 0)
+        self._pending_action = selected.key
         return action

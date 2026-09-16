@@ -20,7 +20,7 @@ COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup play-local pull-sample notebook submit status verify-local clean _check-kaggle
+.PHONY: help setup test format play-local pull-sample notebook submit status verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -38,7 +38,7 @@ help:
 setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 	$(PYTHON) -m venv $(VENV)
 	$(VENV_PIP) install --upgrade pip
-	$(VENV_PIP) install "arc-agi>=0.9.6" "kaggle>=2.2" python-dotenv pandas pyarrow
+	$(VENV_PIP) install "arc-agi>=0.9.6" "kaggle>=2.2" python-dotenv pandas pyarrow pytest ruff
 	@if [ ! -d "$(FRAMEWORK_DIR)/.git" ]; then \
 	    mkdir -p vendor && git clone --depth 1 $(FRAMEWORK_REPO) $(FRAMEWORK_DIR); \
 	else \
@@ -49,6 +49,13 @@ setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 	@$(VENV_PY) scripts/slim_framework.py
 	@echo ""
 	@echo "Setup complete. Try:  make play-local"
+
+test: ## Run HypothesisWorld's synthetic unit tests
+	$(VENV_PY) -m pytest
+
+format: ## Format and lint the research agent and tests
+	$(VENV_PY) -m ruff format agent tests scripts
+	$(VENV_PY) -m ruff check --fix agent tests scripts
 
 play-local: ## Run agent/my_agent.py against ALL games (or GAME=ls20 for a single one)
 	$(VENV_PY) scripts/play_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS)

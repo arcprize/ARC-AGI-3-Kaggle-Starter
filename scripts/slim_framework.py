@@ -9,6 +9,7 @@ This is the *exact same* slimming trick the official Kaggle sample
 ("ARC3 Sample Submission - Stochastic Goose") performs on Kaggle at run time
 — we just do it once locally so `make play-local` works out of the box.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

@@ -9,10 +9,10 @@ Usage:
     .venv/bin/python scripts/play_local.py --game ls20 --max-steps 200
     .venv/bin/python scripts/play_local.py --list
 """
+
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import logging
 import sys
 from pathlib import Path
@@ -25,36 +25,39 @@ if not VENDOR.exists():
     raise SystemExit(f"Framework not found at {VENDOR}. Run `make setup` first.")
 sys.path.insert(0, str(VENDOR))
 
-import arc_agi
-from arc_agi import OperationMode
+import arc_agi  # noqa: E402
+from arc_agi import OperationMode  # noqa: E402
 
 
 def load_my_agent_class():
-    """Import MyAgent from agent/my_agent.py via importlib."""
-    spec = importlib.util.spec_from_file_location(
-        "user_agent_module", ROOT / "agent" / "my_agent.py"
-    )
-    if spec is None or spec.loader is None:
-        raise SystemExit("Could not load agent/my_agent.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if not hasattr(module, "MyAgent"):
-        raise SystemExit("agent/my_agent.py must define a class named `MyAgent`")
-    return module.MyAgent
+    """Import the package so modular imports match notebook execution."""
+    from agent.my_agent import MyAgent
+
+    return MyAgent
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--game", default=None,
-                   help="Game id to play. If omitted, plays ALL available games "
-                        "(mirrors what Kaggle does in competition rerun). "
-                        "Comma-separated list also accepted, e.g. ls20,vc33.")
-    p.add_argument("--max-steps", type=int, default=200,
-                   help="Per-game cap on actions (overrides MyAgent.MAX_ACTIONS).")
-    p.add_argument("--list", action="store_true",
-                   help="List available games and exit.")
-    p.add_argument("--render", default=None, choices=[None, "terminal"],
-                   help="Optional terminal rendering each step.")
+    p.add_argument(
+        "--game",
+        default=None,
+        help="Game id to play. If omitted, plays ALL available games "
+        "(mirrors what Kaggle does in competition rerun). "
+        "Comma-separated list also accepted, e.g. ls20,vc33.",
+    )
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=200,
+        help="Per-game cap on actions (overrides MyAgent.MAX_ACTIONS).",
+    )
+    p.add_argument("--list", action="store_true", help="List available games and exit.")
+    p.add_argument(
+        "--render",
+        default=None,
+        choices=[None, "terminal"],
+        help="Optional terminal rendering each step.",
+    )
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -75,15 +78,18 @@ def main() -> None:
     # version suffix ("ls20-9607627b"), so we normalize to short ids.
     if args.game:
         wanted = {g.strip().split("-")[0] for g in args.game.split(",")}
-        game_ids = [e.game_id.split("-")[0] for e in all_envs
-                    if e.game_id.split("-")[0] in wanted]
+        game_ids = [
+            e.game_id.split("-")[0] for e in all_envs if e.game_id.split("-")[0] in wanted
+        ]
         missing = wanted - set(game_ids)
         if missing:
             raise SystemExit(f"Unknown game id(s): {sorted(missing)}. Run --list.")
     else:
         game_ids = [e.game_id.split("-")[0] for e in all_envs]
-        print(f"No --game specified; playing all {len(game_ids)} games "
-              f"(this is what Kaggle does in competition rerun).\n")
+        print(
+            f"No --game specified; playing all {len(game_ids)} games "
+            f"(this is what Kaggle does in competition rerun).\n"
+        )
 
     MyAgentCls = load_my_agent_class()
     if hasattr(MyAgentCls, "MAX_ACTIONS"):
@@ -109,10 +115,11 @@ def main() -> None:
         agent.main()
 
         final = agent.frames[-1]
-        per_game.append((game_id, final.state, final.levels_completed,
-                         agent.action_counter))
-        print(f"  → state={final.state}, levels_completed={final.levels_completed}, "
-              f"actions={agent.action_counter}")
+        per_game.append((game_id, final.state, final.levels_completed, agent.action_counter))
+        print(
+            f"  → state={final.state}, levels_completed={final.levels_completed}, "
+            f"actions={agent.action_counter}"
+        )
 
     sc = arc.get_scorecard()
     print("\n========= SUMMARY =========")
