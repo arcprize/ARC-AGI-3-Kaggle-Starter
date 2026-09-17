@@ -1,14 +1,14 @@
-"""Splice the current `agent/my_agent.py` into `notebooks/submission.ipynb`.
+"""Package the local `agent/` sources into `notebooks/submission.ipynb`.
 
 The notebook follows the exact pattern used by Kaggle's official sample
 ("ARC3 Sample Submission - Stochastic Goose"):
 
   Cell 1: install the `arc-agi` wheel from the offline competition dataset.
-  Cell 2: write `my_agent.py` to /kaggle/working/ — its body is THIS file.
-  Cell 3: if running inside the Kaggle competition rerun, wait for the
+  Cell 2+: write `agent/*.py` to a temporary Python package.
+  Next cell: if running inside the Kaggle competition rerun, wait for the
           gateway sidecar, copy the framework into /kaggle/working/, register
           MyAgent, and run `python main.py --agent myagent`.
-  Cell 4: otherwise (during commit / save-and-run-all), write a dummy
+  Final cell: otherwise (during commit / save-and-run-all), write a dummy
           submission.parquet so Kaggle accepts the commit.
 
 You don't normally need to call this directly — `make submit` runs it for you.
@@ -35,11 +35,11 @@ _ACCELERATORS = {
     "cpu":     {"name": "none",            "gpu": False},
     "t4":      {"name": "nvidiaTeslaT4",   "gpu": True},
     "p100":    {"name": "nvidiaTeslaP100", "gpu": True},
-    "rtx6000": {"name": "nvidiaRtx6000",   "gpu": True},
+    "rtx6000": {"name": "nvidiaRtx6000", "gpu": True},
 }
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENT_SRC = ROOT / "agent" / "my_agent.py"
+AGENT_DIR = ROOT / "agent"
 NOTEBOOK_PATH = ROOT / "notebooks" / "submission.ipynb"
 METADATA_PATH = ROOT / "notebooks" / "kernel-metadata.json"
 
@@ -59,9 +59,9 @@ def markdown_cell(source: str) -> dict:
 
 
 def build() -> dict:
-    if not AGENT_SRC.exists():
-        raise SystemExit(f"Could not find {AGENT_SRC}")
-    agent_body = AGENT_SRC.read_text()
+    agent_files = sorted(AGENT_DIR.glob("*.py"))
+    if not (AGENT_DIR / "my_agent.py").exists():
+        raise SystemExit(f"Could not find {AGENT_DIR / 'my_agent.py'}")
 
     install_cell = code_cell(
         "!pip install --no-index --find-links \\\n"
@@ -69,12 +69,17 @@ def build() -> dict:
         "    arc-agi python-dotenv"
     )
 
-    # We write the agent to /tmp/ (not /kaggle/working/) so it does NOT appear
-    # as a notebook output. Otherwise the "Submit to Competition" UI would
-    # offer it as a candidate submission file alongside submission.parquet,
-    # and an unlucky default selection rejects the submission.
-    write_agent_cell = code_cell(
-        "%%writefile /tmp/my_agent.py\n" + agent_body
+    # Write sources to /tmp/ (not /kaggle/working/) so they do NOT appear as
+    # notebook outputs. Otherwise the "Submit to Competition" UI may offer
+    # them alongside submission.parquet, and selecting one rejects the run.
+    write_agent_cells = [code_cell("!mkdir -p /tmp/submission_agent")]
+    if not (AGENT_DIR / "__init__.py").exists():
+        write_agent_cells.append(
+            code_cell("%%writefile /tmp/submission_agent/__init__.py\n")
+        )
+    write_agent_cells.extend(
+        code_cell(f"%%writefile /tmp/submission_agent/{path.name}\n" + path.read_text())
+        for path in agent_files
     )
 
     run_cell_source = dedent(
@@ -90,9 +95,11 @@ def build() -> dict:
             !cp -r /kaggle/input/competitions/arc-prize-2026-arc-agi-3/ARC-AGI-3-Agents \\
                    /kaggle/working/ARC-AGI-3-Agents
 
-            # Drop our agent in as a framework template.
-            !cp /tmp/my_agent.py \\
-                /kaggle/working/ARC-AGI-3-Agents/agents/templates/my_agent.py
+            # Copy the agent package and add a minimal framework adapter.
+            !cp -r /tmp/submission_agent \\
+                /kaggle/working/ARC-AGI-3-Agents/submission_agent
+            with open('/kaggle/working/ARC-AGI-3-Agents/agents/templates/my_agent.py', 'w') as f:
+                f.write('from submission_agent.my_agent import MyAgent\\n')
 
             # Register MyAgent in the framework's agent registry. We rewrite
             # __init__.py because the upstream version eagerly imports
@@ -184,12 +191,12 @@ def build() -> dict:
         "cells": [
             markdown_cell(
                 "# ARC Prize 2026 — ARC-AGI-3 Submission\n\n"
-                "Built from `agent/my_agent.py` via `scripts/build_notebook.py`. "
-                "Do not edit cells directly — edit the source file and re-run "
+                "Built from `agent/*.py` via `scripts/build_notebook.py`. "
+                "Do not edit cells directly — edit the source files and re-run "
                 "`make submit`."
             ),
             install_cell,
-            write_agent_cell,
+            *write_agent_cells,
             run_cell,
             dummy_submission_cell,
         ],

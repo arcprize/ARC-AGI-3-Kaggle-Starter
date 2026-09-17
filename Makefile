@@ -20,7 +20,7 @@ COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup play-local pull-sample notebook submit status verify-local clean _check-kaggle
+.PHONY: help setup test play-local pull-sample notebook submit status verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -49,6 +49,9 @@ setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 	@$(VENV_PY) scripts/slim_framework.py
 	@echo ""
 	@echo "Setup complete. Try:  make play-local"
+
+test: ## Run starter-kit unit tests
+	$(PYTHON) -m unittest discover -s tests
 
 play-local: ## Run agent/my_agent.py against ALL games (or GAME=ls20 for a single one)
 	$(VENV_PY) scripts/play_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS)

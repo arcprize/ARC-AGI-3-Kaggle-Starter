@@ -43,7 +43,7 @@ chmod 600 .kaggle/access_token
 make setup
 
 # 4.  Open agent/my_agent.py to see the random-action starter, then edit
-#     it to make a better submission. This is the only file you change.
+#     it to make a better submission. Add more agent/*.py modules if needed.
 
 # 5.  Run it locally against every game in the competition (takes seconds)
 make play-local
@@ -85,6 +85,11 @@ The starter version picks random actions — a baseline that proves your whole
 pipeline works end-to-end. Replace the body of `choose_action` with your
 strategy. Everything else (Kaggle plumbing, submission file format, game
 orchestration) is handled for you.
+
+For larger agents, place supporting Python modules beside `my_agent.py` and
+use package-relative imports, for example `from .memory import Memory`. The
+notebook builder packages every `agent/*.py` file into an offline
+`submission_agent` package while retaining the same `MyAgent` entry point.
 
 ---
 
@@ -195,7 +200,8 @@ Three reasons:
 ```
 .
 ├── agent/
-│   └── my_agent.py             ★ The file you edit
+│   ├── my_agent.py             ★ Required MyAgent entry point
+│   └── *.py                    Optional supporting modules
 ├── scripts/
 │   ├── play_local.py           Runs your agent against real games
 │   ├── build_notebook.py       Packages your agent into a Kaggle notebook
